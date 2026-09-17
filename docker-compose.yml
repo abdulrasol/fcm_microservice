@@ -1,4 +1,3 @@
-version: "3.8"
 services:
   fcm_microservice:
     build: .

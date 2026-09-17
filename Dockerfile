@@ -1,20 +1,29 @@
 # Build stage
-FROM rust:alpine AS builder
+FROM rust:1.80-slim-bookworm AS builder
 WORKDIR /app
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev
+
+# Install OpenSSL and pkg-config required by dependencies
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
 COPY Cargo.toml ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
+
+# Use sparse registry for faster and lighter index fetching
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
 RUN cargo build --release
 RUN rm -rf src
+
 COPY src src
-# update timestamp to force rebuild
 RUN touch src/main.rs && cargo build --release
 
 # Runtime stage
-FROM alpine:latest
+FROM debian:bookworm-slim
 WORKDIR /app
-# We need ca-certificates for reqwest to verify HTTPS connections to Google
-RUN apk add --no-cache ca-certificates openssl
+
+# Install ca-certificates for HTTPS
+RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /app/target/release/fcm_microservice /usr/local/bin/fcm_microservice
 
 ENV PORT=8080
