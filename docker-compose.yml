@@ -1,0 +1,11 @@
+version: "3.8"
+services:
+  fcm_microservice:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./service-account.json:/app/service-account.json:ro
+    env_file:
+      - .env
+    restart: unless-stopped
