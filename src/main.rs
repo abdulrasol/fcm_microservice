@@ -5,14 +5,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use hyper::client::HttpConnector;
+use hyper_rustls::HttpsConnector;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use yup_oauth2::{ServiceAccountAuthenticator, authenticator::Authenticator};
-use hyper::client::HttpConnector;
-use hyper_rustls::HttpsConnector;
+use yup_oauth2::{authenticator::Authenticator, ServiceAccountAuthenticator};
 
 struct AppState {
     api_key: String,
@@ -98,11 +98,12 @@ async fn send_notification(
 
     // 3. Get OAuth2 Token for FCM
     let scopes = &["https://www.googleapis.com/auth/firebase.messaging"];
-    let token = state
-        .auth
-        .token(scopes)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Auth Error: {}", e)))?;
+    let token = state.auth.token(scopes).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Auth Error: {}", e),
+        )
+    })?;
 
     // 4. Construct FCM v1 Payload
     let mut message = json!({
@@ -117,7 +118,7 @@ async fn send_notification(
     if let Some(image) = payload.image {
         message["notification"]["image"] = json!(image);
     }
-    
+
     // Ensure data values are strings
     if let Some(data) = payload.data {
         if let Some(obj) = data.as_object() {
@@ -156,7 +157,12 @@ async fn send_notification(
         .json(&fcm_payload)
         .send()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Network Error: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Network Error: {}", e),
+            )
+        })?;
 
     let status = res.status();
     let body_text = res
@@ -165,11 +171,11 @@ async fn send_notification(
         .unwrap_or_else(|_| "Failed to read response body".to_string());
 
     if status.is_success() {
-        Ok((StatusCode::OK, Json(json!({ "status": "success", "response": body_text }))))
-    } else {
-        Err((
-            StatusCode::BAD_GATEWAY,
-            format!("FCM Error: {}", body_text),
+        Ok((
+            StatusCode::OK,
+            Json(json!({ "status": "success", "response": body_text })),
         ))
+    } else {
+        Err((StatusCode::BAD_GATEWAY, format!("FCM Error: {}", body_text)))
     }
 }
