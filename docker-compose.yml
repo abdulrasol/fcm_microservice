@@ -1,5 +1,6 @@
 services:
   fcm_microservice:
+    container_name: fcm_microservice
     build: .
     ports:
       - "8080:8080"
