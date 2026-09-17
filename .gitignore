@@ -17,3 +17,4 @@ Cargo.lock
 *.json
 !package.json
 service-account.json
+test.sh
