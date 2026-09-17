@@ -159,17 +159,17 @@ async fn send_notification(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Network Error: {}", e)))?;
 
     let status = res.status();
-    let bodyText = res
+    let body_text = res
         .text()
         .await
         .unwrap_or_else(|_| "Failed to read response body".to_string());
 
     if status.is_success() {
-        Ok((StatusCode::OK, Json(json!({ "status": "success", "response": bodyText }))))
+        Ok((StatusCode::OK, Json(json!({ "status": "success", "response": body_text }))))
     } else {
         Err((
             StatusCode::BAD_GATEWAY,
-            format!("FCM Error: {}", bodyText),
+            format!("FCM Error: {}", body_text),
         ))
     }
 }
