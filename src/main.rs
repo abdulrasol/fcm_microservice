@@ -10,13 +10,14 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use yup_oauth2::{ServiceAccountAuthenticator, ServiceAccountKey};
+use yup_oauth2::{ServiceAccountAuthenticator, authenticator::Authenticator};
+use hyper::client::HttpConnector;
+use hyper_rustls::HttpsConnector;
 
-#[derive(Clone)]
 struct AppState {
     api_key: String,
     project_id: String,
-    auth: ServiceAccountAuthenticator,
+    auth: Authenticator<HttpsConnector<HttpConnector>>,
     client: Client,
 }
 
@@ -62,7 +63,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/api/v1/send", post(send_notification))
-        .route("/api/v1/notification/send-topic", post(send_notification)) // backward compatibility with your app
+        .route("/api/v1/notification/send-topic", post(send_notification)) // backward compatibility
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -117,7 +118,7 @@ async fn send_notification(
         message["notification"]["image"] = json!(image);
     }
     
-    // Ensure data values are strings (FCM requirement for 'data' payload)
+    // Ensure data values are strings
     if let Some(data) = payload.data {
         if let Some(obj) = data.as_object() {
             let mut string_map = serde_json::Map::new();
@@ -151,7 +152,7 @@ async fn send_notification(
     let res = state
         .client
         .post(&url)
-        .bearer_auth(token.as_str())
+        .bearer_auth(token.token().unwrap())
         .json(&fcm_payload)
         .send()
         .await
