@@ -30,6 +30,7 @@ struct SendNotificationRequest {
     body: Option<String>,
     image: Option<String>,
     data: Option<serde_json::Value>,
+    analytics_label: Option<String>,
 }
 
 #[tokio::main]
@@ -132,6 +133,10 @@ async fn send_notification(
             }
             message["data"] = serde_json::Value::Object(string_map);
         }
+    }
+
+    if let Some(label) = payload.analytics_label {
+        message["fcm_options"] = json!({"analytics_label": label});
     }
 
     if let Some(topic) = payload.topic {
