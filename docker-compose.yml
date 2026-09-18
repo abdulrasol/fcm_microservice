@@ -3,7 +3,7 @@ services:
     container_name: fcm_microservice
     build: .
     ports:
-      - "8040:8080"
+      - "8084:8080"
     volumes:
       - ./service-account.json:/app/service-account.json:ro
     env_file:
