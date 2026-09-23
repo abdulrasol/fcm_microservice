@@ -1,3 +1,5 @@
+mod topics;
+
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -62,6 +64,8 @@ async fn main() {
     });
 
     let app = Router::new()
+        .route("/api/v1/topics/subscribe", post(topics::subscribe))
+        .route("/api/v1/topics/unsubscribe", post(topics::unsubscribe))
         .route("/health", get(|| async { "OK" }))
         .route("/api/v1/send", post(send_notification))
         .route("/api/v1/notification/send-topic", post(send_notification)) // backward compatibility
