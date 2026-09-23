@@ -13,7 +13,7 @@ Generating these tokens directly on client apps (iOS/Android/Web) is a massive s
 - **Secure:** Endpoint is protected by an `Authorization: Bearer <API_KEY>`.
 - **Automatic Token Management:** Automatically generates and caches the OAuth2 token for Firebase using `yup-oauth2`.
 - **Topic management:** Subscribe/unsubscribe up to 1000 tokens and inspect per-token results.
-- **Optional browser access:** Configure explicit allowed origins with `CORS_ALLOWED_ORIGINS`.
+- **CORS Enabled:** Fully supports Cross-Origin Resource Sharing (CORS) out of the box.
 - **Flexible Targeting:** Send notifications to a `topic`, a specific `token`, or a `condition`.
 - **Smart Data Mapping:** Automatically formats custom `data` payloads to string-only values to comply with FCM v1 strict rules.
 
