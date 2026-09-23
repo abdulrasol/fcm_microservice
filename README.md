@@ -9,9 +9,11 @@ Generating these tokens directly on client apps (iOS/Android/Web) is a massive s
 - This service handles Google OAuth2 authentication, securely generates the Bearer token, maps your payload to the FCM v1 format, and dispatches the notification to Firebase.
 
 ## 🚀 Features
-- **Ultra-lightweight:** The Docker image size is incredibly small (~15MB) and consumes less than 10MB of RAM.
+- **Docker deployment:** Build and run the service using the included Dockerfile and Compose configuration.
 - **Secure:** Endpoint is protected by an `Authorization: Bearer <API_KEY>`.
 - **Automatic Token Management:** Automatically generates and caches the OAuth2 token for Firebase using `yup-oauth2`.
+- **Topic management:** Subscribe/unsubscribe up to 1000 tokens and inspect per-token results.
+- **Optional browser access:** Configure explicit allowed origins with `CORS_ALLOWED_ORIGINS`.
 - **Flexible Targeting:** Send notifications to a `topic`, a specific `token`, or a `condition`.
 - **Smart Data Mapping:** Automatically formats custom `data` payloads to string-only values to comply with FCM v1 strict rules.
 
@@ -30,7 +32,7 @@ Generating these tokens directly on client apps (iOS/Android/Web) is a massive s
 4. Rename the downloaded file to `service-account.json` and place it in the root directory of this project.
 
 ### 3. Configure the Environment
-Copy the example environment file and create your own `.env`:
+If `.env` does not exist, copy the example file once (keep existing credentials when updating):
 ```bash
 cp .env.example .env
 ```
@@ -40,12 +42,13 @@ PORT=8080
 API_KEY=my_super_secret_api_key_123   # Create a secure password here
 FIREBASE_PROJECT_ID=your-project-id   # Find this in your Firebase Console
 GOOGLE_APPLICATION_CREDENTIALS=/app/service-account.json
+CORS_ALLOWED_ORIGINS=https://your-app.example.com,http://localhost:62120
 ```
 
 ### 4. Run the Service (Docker)
 Start the service using Docker Compose. It will build the multi-stage Alpine Rust image and start the server.
 ```bash
-docker-compose up -d --build
+docker compose up -d --build
 ```
 *Your service is now running on port 8080!*
 
@@ -236,6 +239,11 @@ HTTP 200 can include per-token failures:
 }
 ```
 
+Cache subscription success only after the requested token is acknowledged
+(`success_count: 1`, `failure_count: 0` for one token). A timeout, network error,
+or failed token result must not create a successful local cache entry. Delete
+the subscription cache only after successful unsubscription.
+
 Always inspect `failure_count`. Remove stale tokens for `NOT_FOUND`; investigate
 `INVALID_ARGUMENT` rather than repeatedly retrying it. Retry transient errors
 such as `INTERNAL` or `RESOURCE_EXHAUSTED` with bounded exponential backoff.
@@ -290,8 +298,9 @@ authorized device-token targeting for sensitive user/admin messages.
    messages need your own background display/processing logic.
 
 Flutter's browser implementation cannot directly call `subscribeToTopic`.
-CORS on this microservice is intentionally not opened for direct browser access:
-configure browser CORS/session handling on **your application backend** instead.
+Browser access can be enabled with `CORS_ALLOWED_ORIGINS`; it is disabled by
+default. See [Browser access and CORS configuration](#browser-access-and-cors_allowed_origins)
+below. CORS does not replace application authentication or admin authorization.
 
 ### Deployment and verification
 
@@ -313,5 +322,142 @@ configure browser CORS/session handling on **your application backend** instead.
   Unit tests do not contact Firebase; live delivery requires your own credentials
   and test device/browser.
 
+## Browser access and `CORS_ALLOWED_ORIGINS`
+
+### Where to put it
+
+Add this variable to **`.env` in the root of this service**, alongside
+`Cargo.toml` and `docker-compose.yml`. It is not a Flutter setting and does not go
+in `src/main.rs`. Example project layout:
+
+```text
+fcm_microservice/
+├── .env
+├── .env.example
+├── Cargo.toml
+├── docker-compose.yml
+└── src/
+```
+
+On your deployed server, edit the `.env` inside that server's checkout of this
+project. Editing your Mac's file alone does not change the deployed service.
+If your hosting platform manages environment variables, set the same variable
+in the service's environment settings instead.
+
+If `.env` does not exist, copy `.env.example` once. Do not overwrite an existing
+`.env` containing your credentials. Keep the other existing values and add:
+
+```env
+# Production browser application
+CORS_ALLOWED_ORIGINS=https://your-app.example.com
+```
+
+For production plus local development:
+
+```env
+CORS_ALLOWED_ORIGINS=https://your-app.example.com,http://localhost:62120
+```
+
+These domains are examples: anyone deploying this service should substitute
+**their frontend origins**, not the notification API's domain. An origin consists
+of scheme + hostname + optional port. Do not include routes such as `/login`,
+query strings, or fragments. Use a comma-separated list, without a wildcard `*`.
+`http://localhost:62120` and `http://localhost:50122` are different origins;
+`127.0.0.1` and `localhost` are also different hosts.
+
+For Flutter local testing, fix the port to match the example:
+
+```bash
+flutter run -d chrome --web-port=62120
+```
+
+When the variable is absent or empty, cross-origin browser access is not enabled.
+Server-to-server requests and curl do not require CORS permission.
+
+### Complete Docker environment example
+
+```env
+PORT=8080
+API_KEY=replace_with_your_private_api_key
+FIREBASE_PROJECT_ID=your-firebase-project-id
+GOOGLE_APPLICATION_CREDENTIALS=/app/service-account.json
+CORS_ALLOWED_ORIGINS=https://your-app.example.com,http://localhost:62120
+```
+
+The Compose file already loads `.env` using `env_file`. Keep the credentials path
+above for Docker: the read-only volume mounts your local `service-account.json`
+at that container path. Never publish your `.env` or service account credentials.
+
+### Apply the change
+
+Run from the service's directory on the deployment server:
+
+```bash
+docker compose up -d --build --force-recreate fcm_microservice
+docker compose logs --tail=50 fcm_microservice
+```
+
+Recreating the container loads the updated environment; a plain container restart
+does not update its configured environment. Rebuilding also includes the new Rust
+CORS and subscription code. The current Compose mapping is `8080:8080`: both
+the host and container use port **8080**, matching all localhost curl examples.
+If you change the host mapping (for example to `8084:8080`), use that host port
+in your curl commands and reverse-proxy configuration. Keep `PORT=8080` inside
+the container unless you also update the container port in Compose.
+
+For a direct Rust run, set `GOOGLE_APPLICATION_CREDENTIALS` to your actual local
+JSON path in `.env`, stop the previous process, then run from the project root:
+
+```bash
+cargo run --release
+```
+
+The app loads `.env` at startup. Existing process environment variables take
+precedence over `.env`; update them too if your service manager sets them.
+
+### Verify browser preflight
+
+Test the deployed endpoint (substitute your own domains):
+
+```bash
+curl -i -X OPTIONS https://notifications.example.com/api/v1/topics/subscribe \
+  -H "Origin: https://your-app.example.com" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization,content-type"
+```
+
+The response should include `Access-Control-Allow-Origin` matching the supplied
+allowed origin, plus allowed methods containing POST and allowed headers
+containing authorization and content-type. Preflight does not need an API key;
+the subsequent POST still needs `Authorization: Bearer <API_KEY>`.
+
+The CORS configuration applies to:
+
+- `POST /api/v1/send`
+- `POST /api/v1/notification/send-topic` (existing alias)
+- `POST /api/v1/topics/subscribe`
+- `POST /api/v1/topics/unsubscribe`
+
+The middleware handles OPTIONS and allows GET/POST with Authorization and
+Content-Type. Do not add unrelated custom headers to browser requests unless
+you also deliberately add them to the server's allowed headers.
+
+If it still fails, check the browser's actual Origin (including its local port),
+confirm you recreated the deployed container, and check the reverse proxy.
+The proxy must forward OPTIONS and must not add duplicate/conflicting CORS
+headers. An HTTP 401 on POST means the API key was rejected; it is not fixed by
+adding more allowed origins. Invalid origin configuration causes startup to fail
+with a CORS configuration message in the logs.
+
+### CORS and admin permissions are separate
+
+CORS permits a browser origin to read responses. It does **not** verify the
+logged-in user, enforce an admin role, or protect an API key embedded in Flutter
+Web. Anyone who obtains the service key can send and manage topics. For an
+admin-only production feature, keep the key in your application backend, verify
+the user's session/role there, and let that backend call this general service.
+
+
 ## 💖 Contributing
+
 Feel free to open issues and pull requests to improve the microservice.
