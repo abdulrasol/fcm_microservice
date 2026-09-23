@@ -1,3 +1,5 @@
+mod topics;
+
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -61,11 +63,46 @@ async fn main() {
         client: Client::new(),
     });
 
+    // Empty by default: operators must explicitly allow browser origins.
+    let origins = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
+    let origins: Vec<axum::http::HeaderValue> = origins
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(|origin| {
+            let url = reqwest::Url::parse(origin).expect("Invalid CORS origin URL");
+            assert!(
+                matches!(url.scheme(), "https" | "http")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none(),
+                "CORS origins must be http(s) origins without paths or credentials"
+            );
+            url.origin()
+                .ascii_serialization()
+                .parse()
+                .expect("Invalid CORS header")
+        })
+        .collect();
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::AllowOrigin::list(origins))
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ]);
+
     let app = Router::new()
+        .route("/api/v1/topics/subscribe", post(topics::subscribe))
+        .route("/api/v1/topics/unsubscribe", post(topics::unsubscribe))
         .route("/health", get(|| async { "OK" }))
         .route("/api/v1/send", post(send_notification))
         .route("/api/v1/notification/send-topic", post(send_notification)) // backward compatibility
-        .with_state(state);
+        .with_state(state)
+        .layer(cors);
 
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await.unwrap();
