@@ -63,37 +63,14 @@ async fn main() {
         client: Client::new(),
     });
 
-    // Empty by default: operators must explicitly allow browser origins.
-    let origins = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
-    let origins: Vec<axum::http::HeaderValue> = origins
-        .split(',')
-        .map(str::trim)
-        .filter(|origin| !origin.is_empty())
-        .map(|origin| {
-            let url = reqwest::Url::parse(origin).expect("Invalid CORS origin URL");
-            assert!(
-                matches!(url.scheme(), "https" | "http")
-                    && url.host_str().is_some()
-                    && url.username().is_empty()
-                    && url.password().is_none()
-                    && url.path() == "/"
-                    && url.query().is_none()
-                    && url.fragment().is_none(),
-                "CORS origins must be http(s) origins without paths or credentials"
-            );
-            url.origin()
-                .ascii_serialization()
-                .parse()
-                .expect("Invalid CORS header")
-        })
-        .collect();
     let cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::AllowOrigin::list(origins))
-        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-        ]);
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers(tower_http::cors::Any);
 
     let app = Router::new()
         .route("/api/v1/topics/subscribe", post(topics::subscribe))
