@@ -13,12 +13,16 @@ type ApiError = (StatusCode, String);
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TopicRequest {
+    app: String,
     topic: String,
     tokens: Vec<String>,
 }
 
 impl TopicRequest {
     fn validate(&self) -> Result<(), ApiError> {
+        if self.app.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "app field is required".into()));
+        }
         if self.topic.is_empty()
             || self.topic.len() > 900
             || !self
@@ -70,8 +74,21 @@ async fn manage(
         return Err((StatusCode::UNAUTHORIZED, "Invalid API Key".into()));
     }
     body.validate()?;
-    let token = state
-        .auth
+
+    let auth = {
+        let am = state.auth_map.read().await;
+        match am.get(&body.app) {
+            Some(a) => a.clone(),
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("App '{}' not found in credentials folder.", body.app),
+                ));
+            }
+        }
+    };
+
+    let token = auth
         .token(&["https://www.googleapis.com/auth/firebase.messaging"])
         .await
         .map_err(|_| {
@@ -147,6 +164,7 @@ mod tests {
     #[test]
     fn validates_topic_and_batch_boundaries() {
         let valid = || TopicRequest {
+            app: "app".into(),
             topic: "news-1_.~%".into(),
             tokens: vec!["token".into()],
         };

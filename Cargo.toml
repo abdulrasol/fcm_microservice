@@ -15,4 +15,6 @@ hyper-rustls = "0.24"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-tower-http = { version = "0.5.2", features = ["trace", "cors"] }
+tower-http = { version = "0.5.2", features = ["trace", "cors", "fs"] }
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls"] }
+notify = { version = "6.1" }
