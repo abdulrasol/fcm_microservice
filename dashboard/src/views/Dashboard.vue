@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import api from '../api'
 
@@ -25,17 +25,36 @@ const logout = () => {
   router.push('/login')
 }
 
+const fetchTopics = async (appName) => {
+  if (!appName) {
+    topicsList.value = []
+    return
+  }
+  try {
+    const res = await api.get(`/topics?app=${appName}`)
+    topicsList.value = res.data
+  } catch (err) {
+    console.error('Failed to fetch topics', err)
+  }
+}
+
+watch(() => form.value.app, (newApp) => {
+  fetchTopics(newApp)
+})
+
 const fetchData = async () => {
   try {
-    const [appsRes, historyRes, topicsRes] = await Promise.all([
+    const [appsRes, historyRes] = await Promise.all([
       api.get('/apps'),
-      api.get('/history'),
-      api.get('/topics')
+      api.get('/history')
     ])
     apps.value = appsRes.data
     history.value = historyRes.data
-    topicsList.value = topicsRes.data
-    if (apps.value.length > 0) form.value.app = apps.value[0]
+    if (apps.value.length > 0 && !form.value.app) {
+      form.value.app = apps.value[0]
+    } else if (form.value.app) {
+      fetchTopics(form.value.app)
+    }
   } catch (err) {
     if (err.response?.status === 401) logout()
   }
@@ -59,6 +78,26 @@ const sendNotification = async () => {
     message.value = { type: 'error', text: err.response?.data?.error || err.response?.data || 'Failed to send' }
   } finally {
     loading.value = false
+  }
+}
+
+const populateForm = (item) => {
+  if (!item.payload) return
+  
+  try {
+    const payload = JSON.parse(item.payload)
+    form.value.app = item.app
+    form.value.title = payload.title || payload.notification?.title || ''
+    form.value.body = payload.body || payload.notification?.body || ''
+    form.value.image = payload.image || payload.notification?.image || ''
+    form.value.analytics_label = payload.analytics_label || payload.fcm_options?.analytics_label || ''
+    
+    // Fallback to item.target if topic isn't clearly in the payload
+    form.value.topic = payload.topic || payload.token || payload.condition || item.target
+    
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  } catch (err) {
+    console.error("Failed to parse history payload", err)
   }
 }
 
@@ -123,10 +162,10 @@ onMounted(() => {
 
       <!-- Right Column: History -->
       <div class="flex-1 bg-white p-6 shadow rounded-lg">
-        <h2 class="text-lg font-medium mb-4 text-gray-800">History</h2>
+        <h2 class="text-lg font-medium mb-4 text-gray-800">History (Click to reuse)</h2>
         <div class="overflow-y-auto max-h-[600px]">
           <ul class="divide-y divide-gray-200">
-            <li v-for="item in history" :key="item.id" class="py-3">
+            <li v-for="item in history" :key="item.id" class="py-3 cursor-pointer hover:bg-gray-50 transition-colors duration-150 ease-in-out px-2 rounded" @click="populateForm(item)" title="Click to fill form">
               <div class="flex items-center space-x-4">
                 <div class="flex-1 min-w-0">
                   <p class="text-sm font-medium text-gray-900 truncate">

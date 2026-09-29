@@ -24,7 +24,8 @@ pub async fn init_db() -> Result<SqlitePool, sqlx::Error> {
             title TEXT NOT NULL,
             status TEXT NOT NULL,
             response TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            payload TEXT
         );
         "#,
     )
@@ -35,12 +36,18 @@ pub async fn init_db() -> Result<SqlitePool, sqlx::Error> {
         r#"
         CREATE TABLE IF NOT EXISTS topics (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL
+            app TEXT NOT NULL,
+            name TEXT NOT NULL,
+            UNIQUE(app, name)
         );
         "#,
     )
     .execute(&pool)
     .await?;
+
+    // Safe migrations for existing databases
+    let _ = sqlx::query("ALTER TABLE notifications_history ADD COLUMN payload TEXT").execute(&pool).await;
+    let _ = sqlx::query("ALTER TABLE topics ADD COLUMN app TEXT DEFAULT ''").execute(&pool).await;
 
     Ok(pool)
 }
@@ -52,22 +59,25 @@ pub async fn log_notification(
     title: &str,
     status: &str,
     response: &str,
+    payload: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO notifications_history (app, target, title, status, response) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO notifications_history (app, target, title, status, response, payload) VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(app)
     .bind(target)
     .bind(title)
     .bind(status)
     .bind(response)
+    .bind(payload)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn save_topic(pool: &SqlitePool, name: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT OR IGNORE INTO topics (name) VALUES (?)")
+pub async fn save_topic(pool: &SqlitePool, app: &str, name: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT OR IGNORE INTO topics (app, name) VALUES (?, ?)")
+        .bind(app)
         .bind(name)
         .execute(pool)
         .await?;

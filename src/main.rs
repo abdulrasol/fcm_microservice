@@ -3,14 +3,14 @@ mod db;
 mod topics;
 
 use axum::{
-    extract::State,
+    extract::{State, Query},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ struct AppState {
     client: Client,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 struct SendNotificationRequest {
     app: String,
     topic: Option<String>,
@@ -51,6 +51,7 @@ struct LoginRequest {
 
 #[derive(Deserialize)]
 struct TopicRequest {
+    app: String,
     name: String,
 }
 
@@ -180,9 +181,8 @@ async fn get_history(
     if !verify_api_key(&headers, &state.api_key) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid API Key".to_string()));
     }
-    // Fetch top 100 history items
     let rows = sqlx::query(
-        "SELECT id, app, target, title, status, created_at FROM notifications_history ORDER BY id DESC LIMIT 100"
+        "SELECT id, app, target, title, status, created_at, payload FROM notifications_history ORDER BY id DESC LIMIT 100"
     )
     .fetch_all(&state.db)
     .await
@@ -196,29 +196,46 @@ async fn get_history(
         let title: String = row.get("title");
         let status: String = row.get("status");
         let created_at: String = row.get("created_at");
+        let payload: Option<String> = row.try_get("payload").unwrap_or(None);
         result.push(json!({
             "id": id,
             "app": app,
             "target": target,
             "title": title,
             "status": status,
-            "created_at": created_at
+            "created_at": created_at,
+            "payload": payload
         }));
     }
     Ok((StatusCode::OK, Json(result)))
 }
 
+#[derive(Deserialize)]
+struct TopicQuery {
+    app: Option<String>,
+}
+
 async fn get_topics(
     headers: HeaderMap,
+    Query(query): Query<TopicQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if !verify_api_key(&headers, &state.api_key) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid API Key".to_string()));
     }
-    let rows = sqlx::query("SELECT id, name FROM topics ORDER BY name ASC")
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    let rows = if let Some(app_name) = query.app {
+        sqlx::query("SELECT id, name FROM topics WHERE app = ? ORDER BY name ASC")
+            .bind(app_name)
+            .fetch_all(&state.db)
+            .await
+    } else {
+        sqlx::query("SELECT id, name FROM topics ORDER BY name ASC")
+            .fetch_all(&state.db)
+            .await
+    };
+
+    let rows = rows.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut result = Vec::new();
     for row in rows {
@@ -236,7 +253,7 @@ async fn add_topic(
     if !verify_api_key(&headers, &state.api_key) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid API Key".to_string()));
     }
-    db::save_topic(&state.db, &payload.name)
+    db::save_topic(&state.db, &payload.app, &payload.name)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((StatusCode::OK, Json(json!({"status": "success"}))))
@@ -258,6 +275,8 @@ async fn send_notification(
         ));
     }
 
+    let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+
     let target = payload.topic.clone().unwrap_or_else(|| {
         payload.token.clone().unwrap_or_else(|| {
             payload.condition.clone().unwrap_or_default()
@@ -269,7 +288,7 @@ async fn send_notification(
         match pm.get(&payload.app) {
             Some(pid) => pid.clone(),
             None => {
-                let _ = db::log_notification(&state.db, &payload.app, &target, &payload.title, "failed", "App not found").await;
+                let _ = db::log_notification(&state.db, &payload.app, &target, &payload.title, "failed", "App not found", &payload_str).await;
                 return Err((
                     StatusCode::NOT_FOUND,
                     format!("App '{}' not found in credentials folder.", payload.app),
@@ -324,7 +343,7 @@ async fn send_notification(
     if let Some(topic) = &payload.topic {
         message["topic"] = json!(topic);
         // Automatically save topic to DB
-        let _ = db::save_topic(&state.db, topic).await;
+        let _ = db::save_topic(&state.db, &payload.app, topic).await;
     } else if let Some(token) = &payload.token {
         message["token"] = json!(token);
     } else if let Some(condition) = &payload.condition {
@@ -358,13 +377,13 @@ async fn send_notification(
         .unwrap_or_else(|_| "Failed to read response body".to_string());
 
     if status.is_success() {
-        let _ = db::log_notification(&state.db, &payload.app, &target, &payload.title, "success", &body_text).await;
+        let _ = db::log_notification(&state.db, &payload.app, &target, &payload.title, "success", &body_text, &payload_str).await;
         Ok((
             StatusCode::OK,
             Json(json!({ "status": "success", "response": body_text })),
         ))
     } else {
-        let _ = db::log_notification(&state.db, &payload.app, &target, &payload.title, "failed", &body_text).await;
+        let _ = db::log_notification(&state.db, &payload.app, &target, &payload.title, "failed", &body_text, &payload_str).await;
         Err((StatusCode::BAD_GATEWAY, format!("FCM Error: {}", body_text)))
     }
 }
