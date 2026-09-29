@@ -79,14 +79,34 @@ async fn main() {
         client: Client::new(),
     });
 
-    let cors = CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::OPTIONS,
-        ])
-        .allow_headers(tower_http::cors::Any);
+    use tower_http::cors::{AllowOrigin, Any};
+    use axum::http::HeaderValue;
+
+    let cors_env = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
+    let cors = if cors_env.trim().is_empty() {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers(Any)
+    } else {
+        let origins: Vec<HeaderValue> = cors_env
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers(Any)
+    };
 
     // Serve static files from "dist", fallback to index.html for SPA routing
     let serve_dir = ServeDir::new("dist").not_found_service(ServeFile::new("dist/index.html"));
