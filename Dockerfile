@@ -25,6 +25,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/fcm_microservice /usr/local/bin/fcm_microservice
+COPY dist /app/dist
 
 ENV PORT=8080
 EXPOSE 8080

@@ -1,3 +1,5 @@
+mod credentials;
+mod db;
 mod topics;
 
 use axum::{
@@ -7,24 +9,30 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use hyper::client::HttpConnector;
-use hyper_rustls::HttpsConnector;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use yup_oauth2::{authenticator::Authenticator, ServiceAccountAuthenticator};
+use tokio::sync::RwLock;
+use tower_http::services::{ServeDir, ServeFile};
+use tower_http::cors::CorsLayer;
+
+use credentials::{AuthMap, ProjectIdMap};
 
 struct AppState {
     api_key: String,
-    project_id: String,
-    auth: Authenticator<HttpsConnector<HttpConnector>>,
+    db: sqlx::SqlitePool,
+    auth_map: AuthMap,
+    project_map: ProjectIdMap,
     client: Client,
 }
 
 #[derive(Deserialize, Debug)]
 struct SendNotificationRequest {
+    app: String,
     topic: Option<String>,
     token: Option<String>,
     condition: Option<String>,
@@ -35,35 +43,43 @@ struct SendNotificationRequest {
     analytics_label: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct LoginRequest {
+    email: Option<String>,
+    password: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TopicRequest {
+    name: String,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
     let _ = dotenvy::dotenv();
 
     let api_key = std::env::var("API_KEY").expect("API_KEY must be set");
-    let project_id = std::env::var("FIREBASE_PROJECT_ID").expect("FIREBASE_PROJECT_ID must be set");
-    let credentials_path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
-        .unwrap_or_else(|_| "service-account.json".to_string());
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
 
-    tracing::info!("Loading Service Account from: {}", credentials_path);
-    let secret = yup_oauth2::read_service_account_key(&credentials_path)
-        .await
-        .expect("Failed to read service account key");
+    let db_pool = db::init_db().await.expect("Failed to initialize database");
 
-    let auth = ServiceAccountAuthenticator::builder(secret)
-        .build()
-        .await
-        .expect("Failed to create authenticator");
+    let auth_map: AuthMap = Arc::new(RwLock::new(HashMap::new()));
+    let project_map: ProjectIdMap = Arc::new(RwLock::new(HashMap::new()));
+
+    let creds_dir = PathBuf::from("credentials");
+    credentials::scan_credentials_dir(&creds_dir, auth_map.clone(), project_map.clone()).await;
+    credentials::watch_credentials_dir(creds_dir.clone(), auth_map.clone(), project_map.clone());
 
     let state = Arc::new(AppState {
         api_key,
-        project_id,
-        auth,
+        db: db_pool,
+        auth_map,
+        project_map,
         client: Client::new(),
     });
 
-    let cors = tower_http::cors::CorsLayer::new()
+    let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods([
             axum::http::Method::GET,
@@ -72,13 +88,23 @@ async fn main() {
         ])
         .allow_headers(tower_http::cors::Any);
 
+    // Serve static files from "dist", fallback to index.html for SPA routing
+    let serve_dir = ServeDir::new("dist").not_found_service(ServeFile::new("dist/index.html"));
+
+    let api_routes = Router::new()
+        .route("/auth/login", post(login))
+        .route("/apps", get(list_apps))
+        .route("/history", get(get_history))
+        .route("/topics", get(get_topics).post(add_topic))
+        .route("/send", post(send_notification))
+        .route("/topics/subscribe", post(topics::subscribe)) // Original functionality
+        .route("/topics/unsubscribe", post(topics::unsubscribe)) // Original functionality
+        .with_state(state.clone());
+
     let app = Router::new()
-        .route("/api/v1/topics/subscribe", post(topics::subscribe))
-        .route("/api/v1/topics/unsubscribe", post(topics::unsubscribe))
+        .nest("/api/v1", api_routes)
         .route("/health", get(|| async { "OK" }))
-        .route("/api/v1/send", post(send_notification))
-        .route("/api/v1/notification/send-topic", post(send_notification)) // backward compatibility
-        .with_state(state)
+        .fallback_service(serve_dir)
         .layer(cors);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -87,23 +113,124 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+// Authentication Middleware Logic (Helper)
+fn verify_api_key(headers: &HeaderMap, expected_key: &str) -> bool {
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    let expected = format!("Bearer {}", expected_key);
+    auth_header == expected
+}
+
+async fn login(
+    Json(payload): Json<LoginRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let expected_email = std::env::var("DASHBOARD_EMAIL").unwrap_or_default();
+    let expected_password = std::env::var("DASHBOARD_PASSWORD").unwrap_or_default();
+
+    if payload.email.as_deref() == Some(&expected_email)
+        && payload.password.as_deref() == Some(&expected_password)
+    {
+        let api_key = std::env::var("API_KEY").unwrap_or_default();
+        Ok((StatusCode::OK, Json(json!({ "token": api_key }))))
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()))
+    }
+}
+
+async fn list_apps(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !verify_api_key(&headers, &state.api_key) {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid API Key".to_string()));
+    }
+    let map = state.auth_map.read().await;
+    let apps: Vec<String> = map.keys().cloned().collect();
+    Ok((StatusCode::OK, Json(apps)))
+}
+
+use sqlx::Row;
+
+async fn get_history(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !verify_api_key(&headers, &state.api_key) {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid API Key".to_string()));
+    }
+    // Fetch top 100 history items
+    let rows = sqlx::query(
+        "SELECT id, app, target, title, status, created_at FROM notifications_history ORDER BY id DESC LIMIT 100"
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        let id: i64 = row.get("id");
+        let app: String = row.get("app");
+        let target: String = row.get("target");
+        let title: String = row.get("title");
+        let status: String = row.get("status");
+        let created_at: String = row.get("created_at");
+        result.push(json!({
+            "id": id,
+            "app": app,
+            "target": target,
+            "title": title,
+            "status": status,
+            "created_at": created_at
+        }));
+    }
+    Ok((StatusCode::OK, Json(result)))
+}
+
+async fn get_topics(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !verify_api_key(&headers, &state.api_key) {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid API Key".to_string()));
+    }
+    let rows = sqlx::query("SELECT id, name FROM topics ORDER BY name ASC")
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        let name: String = row.get("name");
+        result.push(name);
+    }
+    Ok((StatusCode::OK, Json(result)))
+}
+
+async fn add_topic(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<TopicRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !verify_api_key(&headers, &state.api_key) {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid API Key".to_string()));
+    }
+    db::save_topic(&state.db, &payload.name)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((StatusCode::OK, Json(json!({"status": "success"}))))
+}
+
 async fn send_notification(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SendNotificationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // 1. Verify API Key
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-
-    let expected_header = format!("Bearer {}", state.api_key);
-    if auth_header != expected_header {
+    if !verify_api_key(&headers, &state.api_key) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid API Key".to_string()));
     }
 
-    // 2. Validate Target
     if payload.topic.is_none() && payload.token.is_none() && payload.condition.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -111,31 +238,52 @@ async fn send_notification(
         ));
     }
 
-    // 3. Get OAuth2 Token for FCM
-    let scopes = &["https://www.googleapis.com/auth/firebase.messaging"];
-    let token = state.auth.token(scopes).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Auth Error: {}", e),
-        )
-    })?;
+    let target = payload.topic.clone().unwrap_or_else(|| {
+        payload.token.clone().unwrap_or_else(|| {
+            payload.condition.clone().unwrap_or_default()
+        })
+    });
 
-    // 4. Construct FCM v1 Payload
+    let project_id = {
+        let pm = state.project_map.read().await;
+        match pm.get(&payload.app) {
+            Some(pid) => pid.clone(),
+            None => {
+                let _ = db::log_notification(&state.db, &payload.app, &target, &payload.title, "failed", "App not found").await;
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("App '{}' not found in credentials folder.", payload.app),
+                ));
+            }
+        }
+    };
+
+    let token = {
+        let am = state.auth_map.read().await;
+        let auth = am.get(&payload.app).unwrap();
+        let scopes = &["https://www.googleapis.com/auth/firebase.messaging"];
+        auth.token(scopes).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Auth Error: {}", e),
+            )
+        })?
+    };
+
     let mut message = json!({
         "notification": {
             "title": payload.title,
         }
     });
 
-    if let Some(body) = payload.body {
+    if let Some(body) = &payload.body {
         message["notification"]["body"] = json!(body);
     }
-    if let Some(image) = payload.image {
+    if let Some(image) = &payload.image {
         message["notification"]["image"] = json!(image);
     }
 
-    // Ensure data values are strings
-    if let Some(data) = payload.data {
+    if let Some(data) = &payload.data {
         if let Some(obj) = data.as_object() {
             let mut string_map = serde_json::Map::new();
             for (k, v) in obj {
@@ -149,24 +297,24 @@ async fn send_notification(
         }
     }
 
-    if let Some(label) = payload.analytics_label {
+    if let Some(label) = &payload.analytics_label {
         message["fcm_options"] = json!({"analytics_label": label});
     }
 
-    if let Some(topic) = payload.topic {
+    if let Some(topic) = &payload.topic {
         message["topic"] = json!(topic);
-    } else if let Some(token) = payload.token {
+        // Automatically save topic to DB
+        let _ = db::save_topic(&state.db, topic).await;
+    } else if let Some(token) = &payload.token {
         message["token"] = json!(token);
-    } else if let Some(condition) = payload.condition {
+    } else if let Some(condition) = &payload.condition {
         message["condition"] = json!(condition);
     }
 
     let fcm_payload = json!({ "message": message });
-
-    // 5. Send to FCM
     let url = format!(
         "https://fcm.googleapis.com/v1/projects/{}/messages:send",
-        state.project_id
+        project_id
     );
 
     let res = state
@@ -190,11 +338,13 @@ async fn send_notification(
         .unwrap_or_else(|_| "Failed to read response body".to_string());
 
     if status.is_success() {
+        let _ = db::log_notification(&state.db, &payload.app, &target, &payload.title, "success", &body_text).await;
         Ok((
             StatusCode::OK,
             Json(json!({ "status": "success", "response": body_text })),
         ))
     } else {
+        let _ = db::log_notification(&state.db, &payload.app, &target, &payload.title, "failed", &body_text).await;
         Err((StatusCode::BAD_GATEWAY, format!("FCM Error: {}", body_text)))
     }
 }
