@@ -15,20 +15,6 @@ Authorization: Bearer <YOUR_API_KEY>
 
 ---
 
-## Firebase Setup & Credentials
-To use this microservice, you need to provide Firebase Service Account credentials for each app you want to manage.
-
-1. Go to the [Firebase Console](https://console.firebase.google.com/).
-2. Select your Firebase project.
-3. Navigate to **Project Settings** (the gear icon) > **Service accounts**.
-4. Click **Generate new private key** and download the JSON file.
-5. Rename the downloaded file to something short and identifiable (e.g., `create_app.json`). **The filename (without `.json`) will be used as the `app` identifier in all API requests.**
-6. Place this file inside the `credentials/` folder in the root of this project.
-
-*You can add as many service account JSON files as you want to the `credentials/` folder. The system will automatically detect them.*
-
----
-
 ## 1. Send Notification
 **Endpoint:** `POST /send`  
 **Description:** Sends a push notification to a specific Firebase project (app). It automatically logs the notification to the SQLite history database.

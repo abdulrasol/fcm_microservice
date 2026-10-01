@@ -174,19 +174,56 @@ async fn list_apps(
 
 use sqlx::Row;
 
+#[derive(Deserialize)]
+struct HistoryQuery {
+    app: Option<String>,
+    topic: Option<String>,
+    search: Option<String>,
+    limit: Option<i64>,
+}
+
 async fn get_history(
     headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if !verify_api_key(&headers, &state.api_key) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid API Key".to_string()));
     }
-    let rows = sqlx::query(
-        "SELECT id, app, target, title, status, created_at, payload FROM notifications_history ORDER BY id DESC LIMIT 100"
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut qb = sqlx::QueryBuilder::new("SELECT id, app, target, title, status, created_at, payload FROM notifications_history WHERE 1=1");
+
+    if let Some(app) = &query.app {
+        if !app.trim().is_empty() {
+            qb.push(" AND app = ");
+            qb.push_bind(app.trim().to_string());
+        }
+    }
+    
+    if let Some(topic) = &query.topic {
+        if !topic.trim().is_empty() {
+            qb.push(" AND target LIKE ");
+            qb.push_bind(format!("%{}%", topic.trim()));
+        }
+    }
+
+    if let Some(search) = &query.search {
+        if !search.trim().is_empty() {
+            qb.push(" AND (title LIKE ");
+            qb.push_bind(format!("%{}%", search.trim()));
+            qb.push(" OR payload LIKE ");
+            qb.push_bind(format!("%{}%", search.trim()));
+            qb.push(")");
+        }
+    }
+
+    qb.push(" ORDER BY id DESC LIMIT ");
+    qb.push_bind(query.limit.unwrap_or(100));
+
+    let query_exec = qb.build();
+    let rows = query_exec.fetch_all(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut result = Vec::new();
     for row in rows {
