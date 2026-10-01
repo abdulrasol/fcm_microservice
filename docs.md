@@ -141,3 +141,65 @@ Authorization: Bearer <YOUR_API_KEY>
 **Endpoint:** `POST /topics`  
 **Description:** Saves a new topic to the SQLite database.
 **Payload:** `{"name": "promo_users"}`
+
+---
+
+## 6. Subscribe to Topic
+**Endpoint:** `POST /topics/subscribe`  
+**Description:** Subscribes one or more FCM device tokens to a specific topic.
+
+### Request Payload (JSON)
+```json
+{
+  "app": "create_app",
+  "topic": "promo_users",
+  "tokens": [
+    "device_token_1",
+    "device_token_2"
+  ]
+}
+```
+- `app` (String, **Required**): The exact name of the target app's credentials file (without `.json`).
+- `topic` (String, **Required**): The topic name (without `/topics/` prefix, max 900 characters).
+- `tokens` (Array of Strings, **Required**): List of device registration tokens to subscribe (up to 1000 tokens per request).
+
+### Example Response
+**200 OK**
+```json
+{
+  "success_count": 2,
+  "failure_count": 0,
+  "errors": []
+}
+```
+
+---
+
+## 7. Unsubscribe from Topic
+**Endpoint:** `POST /topics/unsubscribe`  
+**Description:** Unsubscribes one or more FCM device tokens from a specific topic.
+
+### Request Payload (JSON)
+```json
+{
+  "app": "create_app",
+  "topic": "promo_users",
+  "tokens": [
+    "device_token_1",
+    "device_token_2"
+  ]
+}
+```
+- `app` (String, **Required**): The exact name of the target app's credentials file (without `.json`).
+- `topic` (String, **Required**): The topic name (without `/topics/` prefix).
+- `tokens` (Array of Strings, **Required**): List of device registration tokens to unsubscribe (up to 1000 tokens per request).
+
+### Example Response
+**200 OK**
+```json
+{
+  "success_count": 2,
+  "failure_count": 0,
+  "errors": []
+}
+```
