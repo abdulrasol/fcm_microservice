@@ -17,6 +17,13 @@ const form = ref({
   analytics_label: '',
 })
 
+const historyFilters = ref({
+  app: '',
+  topic: '',
+  search: '',
+  limit: 100
+})
+
 const loading = ref(false)
 const message = ref({ type: '', text: '' })
 
@@ -38,18 +45,40 @@ const fetchTopics = async (appName) => {
   }
 }
 
+const fetchHistory = async () => {
+  try {
+    const params = new URLSearchParams()
+    if (historyFilters.value.app) params.append('app', historyFilters.value.app)
+    if (historyFilters.value.topic) params.append('topic', historyFilters.value.topic)
+    if (historyFilters.value.search) params.append('search', historyFilters.value.search)
+    if (historyFilters.value.limit) params.append('limit', historyFilters.value.limit)
+    
+    const res = await api.get(`/history?${params.toString()}`)
+    history.value = res.data
+  } catch (err) {
+    if (err.response?.status === 401) logout()
+  }
+}
+
+let timeoutId = null
+watch(historyFilters, () => {
+  clearTimeout(timeoutId)
+  timeoutId = setTimeout(() => {
+    fetchHistory()
+  }, 300) // debounce
+}, { deep: true })
+
 watch(() => form.value.app, (newApp) => {
   fetchTopics(newApp)
 })
 
 const fetchData = async () => {
   try {
-    const [appsRes, historyRes] = await Promise.all([
+    const [appsRes] = await Promise.all([
       api.get('/apps'),
-      api.get('/history')
+      fetchHistory() // History is fetched here with initial filters
     ])
     apps.value = appsRes.data
-    history.value = historyRes.data
     if (apps.value.length > 0 && !form.value.app) {
       form.value.app = apps.value[0]
     } else if (form.value.app) {
@@ -161,9 +190,21 @@ onMounted(() => {
       </div>
 
       <!-- Right Column: History -->
-      <div class="flex-1 bg-white p-6 shadow rounded-lg">
+      <div class="flex-1 bg-white p-6 shadow rounded-lg flex flex-col">
         <h2 class="text-lg font-medium mb-4 text-gray-800">History (Click to reuse)</h2>
-        <div class="overflow-y-auto max-h-[600px]">
+        
+        <!-- Filters -->
+        <div class="flex flex-col md:flex-row gap-2 mb-4">
+          <select v-model="historyFilters.app" class="border rounded-md p-1.5 text-sm flex-1 focus:ring-indigo-500 focus:border-indigo-500">
+            <option value="">All Apps</option>
+            <option v-for="app in apps" :key="app" :value="app">{{ app }}</option>
+          </select>
+          <input type="text" v-model="historyFilters.topic" placeholder="Topic..." class="border rounded-md p-1.5 text-sm flex-1 focus:ring-indigo-500 focus:border-indigo-500" />
+          <input type="text" v-model="historyFilters.search" placeholder="Search title/body..." class="border rounded-md p-1.5 text-sm flex-1 focus:ring-indigo-500 focus:border-indigo-500" />
+          <input type="number" v-model="historyFilters.limit" title="Rows to fetch" placeholder="Limit" class="border rounded-md p-1.5 text-sm w-20 focus:ring-indigo-500 focus:border-indigo-500" />
+        </div>
+
+        <div class="overflow-y-auto max-h-[600px] flex-1">
           <ul class="divide-y divide-gray-200">
             <li v-for="item in history" :key="item.id" class="py-3 cursor-pointer hover:bg-gray-50 transition-colors duration-150 ease-in-out px-2 rounded" @click="populateForm(item)" title="Click to fill form">
               <div class="flex items-center space-x-4">

@@ -19,11 +19,8 @@ For a comprehensive guide on how to interact with the API, required payloads, an
 
 1. Clone the repository.
 2. Copy `.env.example` to `.env` and fill in your details.
-3. **Firebase Setup**:
-   - Go to the [Firebase Console](https://console.firebase.google.com/).
-   - Navigate to **Project Settings** > **Service accounts** and click **Generate new private key**.
-   - Place the downloaded JSON file inside the `credentials/` directory.
-   - Rename it to something short (e.g., `create_app.json`). **The filename (without `.json`) will be used as the `app` identifier in all requests.**
+3. Place your Firebase service account JSON files inside the `credentials/` directory.
+   - Example: `credentials/create_app.json`
 4. Run the server using Docker or `cargo run`.
 
 ## Docker Deployment
