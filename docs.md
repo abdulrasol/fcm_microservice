@@ -3,8 +3,12 @@
 Welcome to the documentation for the FCM (Firebase Cloud Messaging) Microservice. This service allows you to send push notifications to multiple Firebase projects from a single unified API, track notification history, and manage the system via an integrated web dashboard.
 
 ## Base URL
-All API endpoints are prefixed with `/api/v1`.
-If running locally, the base URL is `http://localhost:8080/api/v1`.
+All API endpoints support both `/api` and `/api/v1` prefixes.
+- **V1 (Recommended):** `http://localhost:8080/api/v1`
+- **Standard:** `http://localhost:8080/api`
+
+For production deployment (e.g. `https://fcm.subultech.top`):
+- `https://fcm.subultech.top/api/v1` or `https://fcm.subultech.top/api`
 
 ## Authentication
 All API endpoints (except `/auth/login` and static dashboard files) are protected and require a Bearer token.
@@ -30,7 +34,7 @@ To use this microservice, you need to provide Firebase Service Account credentia
 ---
 
 ## 1. Send Notification
-**Endpoint:** `POST /send`  
+**Endpoints:** `POST /api/v1/send` or `POST /api/send`  
 **Description:** Sends a push notification to a specific Firebase project (app). It automatically logs the notification to the SQLite history database.
 
 ### Request Payload (JSON)
@@ -90,7 +94,7 @@ To use this microservice, you need to provide Firebase Service Account credentia
 ---
 
 ## 2. List Available Apps
-**Endpoint:** `GET /apps`  
+**Endpoints:** `GET /api/v1/apps` or `GET /api/apps`  
 **Description:** Returns a list of all Firebase projects registered with the system. It dynamically reads the `credentials/` directory.
 
 ### Example Response
@@ -106,7 +110,7 @@ To use this microservice, you need to provide Firebase Service Account credentia
 ---
 
 ## 3. Login (Dashboard Use)
-**Endpoint:** `POST /auth/login`  
+**Endpoints:** `POST /api/v1/auth/login` or `POST /api/auth/login`  
 **Description:** Validates dashboard admin credentials against the `.env` file and returns the `API_KEY`.
 
 ### Request Payload (JSON)
@@ -128,8 +132,21 @@ To use this microservice, you need to provide Firebase Service Account credentia
 ---
 
 ## 4. Get Notification History
-**Endpoint:** `GET /history`  
-**Description:** Retrieves the log of previously sent notifications from the SQLite database.
+**Endpoints:** `GET /api/v1/history` or `GET /api/history`  
+**Description:** Retrieves the log of previously sent notifications from the SQLite database with optional filtering and pagination limits.
+
+### Query Parameters
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `app` | String | No | Filter history records by specific app (e.g., `?app=watt`). |
+| `topic` | String | No | Filter by target topic or token substring (e.g., `?topic=admins`). |
+| `search` | String | No | Search keyword matched against notification `title` or `payload` body (e.g., `?search=Order`). |
+| `limit` | Integer | No | Max number of history items to return (default: `100`). |
+
+### Example Request
+```
+GET /api/v1/history?app=watt&topic=admins&limit=50
+```
 
 ### Example Response
 **200 OK**
@@ -138,10 +155,11 @@ To use this microservice, you need to provide Firebase Service Account credentia
   {
     "id": 1,
     "app": "create_app",
-    "target": "topic:all",
+    "target": "admins",
     "title": "Welcome!",
     "status": "success",
-    "created_at": "2026-09-29T10:00:00Z"
+    "created_at": "2026-10-13 10:00:00",
+    "payload": "{\"app\":\"create_app\",\"topic\":\"admins\",\"title\":\"Welcome!\"}"
   }
 ]
 ```
@@ -149,12 +167,21 @@ To use this microservice, you need to provide Firebase Service Account credentia
 ---
 
 ## 5. Manage Topics
-**Endpoint:** `GET /topics`  
-**Description:** Retrieves saved topics for quick access in the dashboard.
+**Endpoints:** `GET /api/v1/topics` or `GET /api/topics`  
+**Description:** Retrieves saved topics for quick access in the dashboard, optionally filtered by app.
 
-**Endpoint:** `POST /topics`  
-**Description:** Saves a new topic to the SQLite database.
-**Payload:** `{"name": "promo_users"}`
+### Query Parameters
+- `app` (String, Optional): Filter topics for a specific app (e.g., `?app=watt`).
+
+**Endpoints:** `POST /api/v1/topics` or `POST /api/topics`  
+**Description:** Saves a new topic for a specific app to the SQLite database.
+### Request Payload
+```json
+{
+  "app": "create_app",
+  "name": "promo_users"
+}
+```
 
 ---
 
