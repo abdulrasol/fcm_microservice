@@ -13,7 +13,8 @@ A fully integrated, ultra-lightweight Push Notification Management System built 
 
 ## Documentation
 
-For a comprehensive guide on how to interact with the API, required payloads, and responses, please refer to the [API Documentation](docs.md).
+- [API Documentation](docs.md): Comprehensive guide on endpoints, payloads, filtering, and setup.
+- [Condition Targeting Guide](condition_guide.md): Guide with examples on using FCM boolean topic expressions (`&&`, `||`, `!`).
 
 ## Getting Started
 

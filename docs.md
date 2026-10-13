@@ -43,14 +43,14 @@ To use this microservice, you need to provide Firebase Service Account credentia
 | `app` | String | **Yes** | The exact name of the target app's credentials file (without the `.json` extension) located in the `credentials/` folder. Example: `create_app`. |
 | `topic` | String | No* | The FCM topic to send the notification to. |
 | `token` | String | No* | A specific device FCM token to send to. |
-| `condition` | String | No* | FCM condition for sending (e.g., `'TopicA' in topics`). |
+| `condition` | String | No* | FCM condition for boolean topic targeting (e.g., `'TopicA' in topics && 'TopicB' in topics`). See [Condition Guide](condition_guide.md) for full syntax & examples. |
 | `title` | String | **Yes** | The title of the notification. |
 | `body` | String | No | The body text of the notification. |
 | `image` | String | No | URL of an image to display in the notification. |
 | `data` | Object | No | Custom key-value pairs to send silently to the app. |
 | `analytics_label` | String | No | Label used for Firebase Analytics. |
 
-*\*Note: You must provide exactly one of `topic`, `token`, or `condition`.*
+*\*Note: You must provide exactly one of `topic`, `token`, or `condition`. For details on building multi-topic conditions, check [condition_guide.md](condition_guide.md).*
 
 ### Example Request
 ```json
