@@ -8,9 +8,12 @@ const apps = ref([])
 const history = ref([])
 const topicsList = ref([])
 
+const targetType = ref('topic') // 'topic' or 'token'
+
 const form = ref({
   app: '',
   topic: '',
+  token: '',
   title: '',
   body: '',
   image: '',
@@ -76,7 +79,7 @@ const fetchData = async () => {
   try {
     const [appsRes] = await Promise.all([
       api.get('/apps'),
-      fetchHistory() // History is fetched here with initial filters
+      fetchHistory()
     ])
     apps.value = appsRes.data
     if (apps.value.length > 0 && !form.value.app) {
@@ -93,10 +96,20 @@ const sendNotification = async () => {
   loading.value = true
   message.value = { type: '', text: '' }
   try {
-    const payload = { ...form.value }
-    if (!payload.body) delete payload.body
-    if (!payload.image) delete payload.image
-    if (!payload.analytics_label) delete payload.analytics_label
+    const payload = {
+      app: form.value.app,
+      title: form.value.title,
+    }
+
+    if (targetType.value === 'token') {
+      payload.token = form.value.token
+    } else {
+      payload.topic = form.value.topic
+    }
+
+    if (form.value.body) payload.body = form.value.body
+    if (form.value.image) payload.image = form.value.image
+    if (form.value.analytics_label) payload.analytics_label = form.value.analytics_label
 
     await api.post('/send', payload)
     message.value = { type: 'success', text: 'Notification sent successfully!' }
@@ -111,23 +124,37 @@ const sendNotification = async () => {
 }
 
 const populateForm = (item) => {
-  if (!item.payload) return
-  
-  try {
-    const payload = JSON.parse(item.payload)
-    form.value.app = item.app
-    form.value.title = payload.title || payload.notification?.title || ''
-    form.value.body = payload.body || payload.notification?.body || ''
-    form.value.image = payload.image || payload.notification?.image || ''
-    form.value.analytics_label = payload.analytics_label || payload.fcm_options?.analytics_label || ''
-    
-    // Fallback to item.target if topic isn't clearly in the payload
-    form.value.topic = payload.topic || payload.token || payload.condition || item.target
-    
-    window.scrollTo({ top: 0, behavior: 'smooth' })
-  } catch (err) {
-    console.error("Failed to parse history payload", err)
+  form.value.app = item.app
+  form.value.title = item.title || ''
+
+  if (item.payload) {
+    try {
+      const payload = JSON.parse(item.payload)
+      form.value.title = payload.title || payload.notification?.title || item.title || ''
+      form.value.body = payload.body || payload.notification?.body || ''
+      form.value.image = payload.image || payload.notification?.image || ''
+      form.value.analytics_label = payload.analytics_label || payload.fcm_options?.analytics_label || ''
+
+      if (payload.token) {
+        targetType.value = 'token'
+        form.value.token = payload.token
+        form.value.topic = ''
+      } else {
+        targetType.value = 'topic'
+        form.value.topic = payload.topic || payload.condition || item.target || ''
+        form.value.token = ''
+      }
+    } catch (err) {
+      console.error("Failed to parse history payload", err)
+      targetType.value = 'topic'
+      form.value.topic = item.target || ''
+    }
+  } else {
+    targetType.value = 'topic'
+    form.value.topic = item.target || ''
   }
+
+  window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
 onMounted(() => {
@@ -139,7 +166,7 @@ onMounted(() => {
   <div class="min-h-screen bg-gray-100">
     <nav class="bg-indigo-600 px-4 py-3 flex justify-between items-center shadow-md">
       <h1 class="text-white text-xl font-bold">FCM Dashboard</h1>
-      <button @click="logout" class="text-white hover:bg-indigo-700 px-3 py-1 rounded">Logout</button>
+      <button @click="logout" class="text-white hover:bg-indigo-700 px-3 py-1 rounded text-sm font-medium">Logout</button>
     </nav>
 
     <div class="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8 flex flex-col md:flex-row gap-6">
@@ -151,14 +178,29 @@ onMounted(() => {
         <form @submit.prevent="sendNotification" class="space-y-4">
           <div>
             <label class="block text-sm font-medium text-gray-700">Target App</label>
-            <select v-model="form.app" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 border">
+            <select v-model="form.app" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 border bg-white">
               <option v-for="app in apps" :key="app" :value="app">{{ app }}</option>
             </select>
           </div>
 
           <div>
-            <label class="block text-sm font-medium text-gray-700">Topic / Token</label>
-            <input type="text" v-model="form.topic" required placeholder="e.g. all" list="saved-topics" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 border">
+            <div class="flex justify-between items-center mb-1">
+              <label class="block text-sm font-medium text-gray-700">Target</label>
+              <div class="flex items-center gap-3 text-xs">
+                <label class="inline-flex items-center cursor-pointer">
+                  <input type="radio" v-model="targetType" value="topic" class="text-indigo-600 focus:ring-indigo-500">
+                  <span class="ml-1 text-gray-700 font-medium">Topic</span>
+                </label>
+                <label class="inline-flex items-center cursor-pointer">
+                  <input type="radio" v-model="targetType" value="token" class="text-indigo-600 focus:ring-indigo-500">
+                  <span class="ml-1 text-gray-700 font-medium">Device Token</span>
+                </label>
+              </div>
+            </div>
+            
+            <input v-if="targetType === 'topic'" type="text" v-model="form.topic" required placeholder="e.g. all or admins" list="saved-topics" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 border">
+            <input v-else type="text" v-model="form.token" required placeholder="Paste device FCM registration token..." class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 border font-mono text-xs">
+            
             <datalist id="saved-topics">
               <option v-for="t in topicsList" :key="t" :value="t"></option>
             </datalist>
@@ -179,6 +221,11 @@ onMounted(() => {
             <input type="url" v-model="form.image" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 border">
           </div>
 
+          <div>
+            <label class="block text-sm font-medium text-gray-700">Analytics Label (Optional)</label>
+            <input type="text" v-model="form.analytics_label" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 border">
+          </div>
+
           <div v-if="message.text" :class="message.type === 'success' ? 'text-green-600' : 'text-red-600'" class="text-sm font-medium">
             {{ message.text }}
           </div>
@@ -193,37 +240,51 @@ onMounted(() => {
       <div class="flex-1 bg-white p-6 shadow rounded-lg flex flex-col">
         <h2 class="text-lg font-medium mb-4 text-gray-800">History (Click to reuse)</h2>
         
-        <!-- Filters -->
-        <div class="flex flex-col md:flex-row gap-2 mb-4">
-          <select v-model="historyFilters.app" class="border rounded-md p-1.5 text-sm flex-1 focus:ring-indigo-500 focus:border-indigo-500">
+        <!-- Filters in a clean responsive grid -->
+        <div class="grid grid-cols-1 sm:grid-cols-4 gap-2 mb-4">
+          <select v-model="historyFilters.app" class="border rounded-md p-2 text-sm focus:ring-indigo-500 focus:border-indigo-500 bg-white">
             <option value="">All Apps</option>
             <option v-for="app in apps" :key="app" :value="app">{{ app }}</option>
           </select>
-          <input type="text" v-model="historyFilters.topic" placeholder="Topic..." class="border rounded-md p-1.5 text-sm flex-1 focus:ring-indigo-500 focus:border-indigo-500" />
-          <input type="text" v-model="historyFilters.search" placeholder="Search title/body..." class="border rounded-md p-1.5 text-sm flex-1 focus:ring-indigo-500 focus:border-indigo-500" />
-          <input type="number" v-model="historyFilters.limit" title="Rows to fetch" placeholder="Limit" class="border rounded-md p-1.5 text-sm w-20 focus:ring-indigo-500 focus:border-indigo-500" />
+          <input type="text" v-model="historyFilters.topic" placeholder="Topic / Token..." class="border rounded-md p-2 text-sm focus:ring-indigo-500 focus:border-indigo-500" />
+          <input type="text" v-model="historyFilters.search" placeholder="Search title / body..." class="border rounded-md p-2 text-sm focus:ring-indigo-500 focus:border-indigo-500" />
+          <div class="flex items-center border rounded-md px-2 bg-white focus-within:ring-1 focus-within:ring-indigo-500">
+            <span class="text-xs text-gray-500 shrink-0 mr-1.5">Limit:</span>
+            <input type="number" v-model="historyFilters.limit" title="Rows to fetch" placeholder="100" class="w-full text-sm py-1.5 focus:outline-none" />
+          </div>
         </div>
 
         <div class="overflow-y-auto max-h-[600px] flex-1">
-          <ul class="divide-y divide-gray-200">
-            <li v-for="item in history" :key="item.id" class="py-3 cursor-pointer hover:bg-gray-50 transition-colors duration-150 ease-in-out px-2 rounded" @click="populateForm(item)" title="Click to fill form">
-              <div class="flex items-center space-x-4">
+          <ul class="divide-y divide-gray-100">
+            <li v-for="item in history" :key="item.id" class="py-3 px-2 cursor-pointer hover:bg-gray-50 transition-colors duration-150 ease-in-out rounded-lg border border-transparent hover:border-gray-200" @click="populateForm(item)" title="Click to reuse notification">
+              <div class="flex items-start justify-between gap-3">
                 <div class="flex-1 min-w-0">
-                  <p class="text-sm font-medium text-gray-900 truncate">
-                    {{ item.title }}
-                  </p>
-                  <p class="text-sm text-gray-500 truncate">
-                    {{ item.app }} &rarr; {{ item.target }}
+                  <div class="flex items-center gap-2 flex-wrap">
+                    <span class="text-sm font-semibold text-gray-900 truncate">
+                      {{ item.title }}
+                    </span>
+                    <span v-if="item.created_at" class="text-[11px] text-gray-400 shrink-0">
+                      {{ item.created_at }}
+                    </span>
+                  </div>
+                  <p class="text-xs text-gray-500 truncate mt-1 flex items-center gap-1.5">
+                    <span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-700 font-medium rounded text-[11px] shrink-0">
+                      {{ item.app }}
+                    </span>
+                    <span class="text-gray-400">&rarr;</span>
+                    <span class="truncate font-mono text-[11px] text-gray-600">
+                      {{ item.target }}
+                    </span>
                   </p>
                 </div>
-                <div>
-                  <span :class="item.status === 'success' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'" class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium">
+                <div class="shrink-0 flex items-center pt-0.5">
+                  <span :class="item.status === 'success' ? 'bg-green-100 text-green-800 border-green-200' : 'bg-red-100 text-red-800 border-red-200'" class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold border shrink-0">
                     {{ item.status }}
                   </span>
                 </div>
               </div>
             </li>
-            <li v-if="history.length === 0" class="text-sm text-gray-500 py-3">No notifications sent yet.</li>
+            <li v-if="history.length === 0" class="text-sm text-gray-500 py-3 text-center">No notifications found.</li>
           </ul>
         </div>
       </div>

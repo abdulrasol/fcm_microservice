@@ -123,7 +123,8 @@ async fn main() {
         .with_state(state.clone());
 
     let app = Router::new()
-        .nest("/api/v1", api_routes)
+        .nest("/api/v1", api_routes.clone())
+        .nest("/api", api_routes)
         .route("/health", get(|| async { "OK" }))
         .fallback_service(serve_dir)
         .layer(cors);
