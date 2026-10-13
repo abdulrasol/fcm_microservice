@@ -118,13 +118,15 @@ async fn main() {
         .route("/history", get(get_history))
         .route("/topics", get(get_topics).post(add_topic))
         .route("/send", post(send_notification))
-        .route("/topics/subscribe", post(topics::subscribe)) // Original functionality
-        .route("/topics/unsubscribe", post(topics::unsubscribe)) // Original functionality
+        .route("/topics/subscribe", post(topics::subscribe))
+        .route("/topics/unsubscribe", post(topics::unsubscribe))
+        .fallback(api_fallback)
         .with_state(state.clone());
 
     let app = Router::new()
-        .nest("/api/v1", api_routes.clone())
-        .nest("/api", api_routes)
+        .nest("/api/v1", api_routes)
+        .route("/api", axum::routing::any(api_fallback))
+        .route("/api/*path", axum::routing::any(api_fallback))
         .route("/health", get(|| async { "OK" }))
         .fallback_service(serve_dir)
         .layer(cors);
@@ -133,6 +135,65 @@ async fn main() {
     let listener = TcpListener::bind(&addr).await.unwrap();
     tracing::info!("Server listening on {}", addr);
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn api_fallback(
+    uri: axum::http::Uri,
+) -> impl IntoResponse {
+    let response_body = json!({
+        "error": "Endpoint not found",
+        "requested_path": uri.path(),
+        "hint": "All API endpoints are under /api/v1. Available endpoints are listed below:",
+        "available_endpoints": [
+            {
+                "method": "POST",
+                "endpoint": "/api/v1/send",
+                "description": "Send FCM push notification to topic, token, or condition"
+            },
+            {
+                "method": "GET",
+                "endpoint": "/api/v1/apps",
+                "description": "List all registered Firebase apps"
+            },
+            {
+                "method": "GET",
+                "endpoint": "/api/v1/history",
+                "description": "Get notification history (supports query params: ?app=, ?topic=, ?search=, ?limit=)"
+            },
+            {
+                "method": "GET",
+                "endpoint": "/api/v1/topics",
+                "description": "Get saved topics (supports query param: ?app=)"
+            },
+            {
+                "method": "POST",
+                "endpoint": "/api/v1/topics",
+                "description": "Save a new topic (payload: {\"app\": \"...\", \"name\": \"...\"})"
+            },
+            {
+                "method": "POST",
+                "endpoint": "/api/v1/topics/subscribe",
+                "description": "Subscribe device tokens to a topic (payload: {\"app\": \"...\", \"topic\": \"...\", \"tokens\": [...]})"
+            },
+            {
+                "method": "POST",
+                "endpoint": "/api/v1/topics/unsubscribe",
+                "description": "Unsubscribe device tokens from a topic (payload: {\"app\": \"...\", \"topic\": \"...\", \"tokens\": [...]})"
+            },
+            {
+                "method": "POST",
+                "endpoint": "/api/v1/auth/login",
+                "description": "Dashboard login and token generation"
+            },
+            {
+                "method": "GET",
+                "endpoint": "/health",
+                "description": "Service health check"
+            }
+        ]
+    });
+
+    (StatusCode::NOT_FOUND, Json(response_body))
 }
 
 // Authentication Middleware Logic (Helper)

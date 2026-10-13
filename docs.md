@@ -3,12 +3,11 @@
 Welcome to the documentation for the FCM (Firebase Cloud Messaging) Microservice. This service allows you to send push notifications to multiple Firebase projects from a single unified API, track notification history, and manage the system via an integrated web dashboard.
 
 ## Base URL
-All API endpoints support both `/api` and `/api/v1` prefixes.
-- **V1 (Recommended):** `http://localhost:8080/api/v1`
-- **Standard:** `http://localhost:8080/api`
+All API endpoints are strictly served under `/api/v1`:
+- **Local:** `http://localhost:8080/api/v1`
+- **Production:** `https://fcm.subultech.top/api/v1`
 
-For production deployment (e.g. `https://fcm.subultech.top`):
-- `https://fcm.subultech.top/api/v1` or `https://fcm.subultech.top/api`
+> **Smart Fallback:** If any invalid or non-existent endpoint is requested under `/api/*` or `/api/v1/*`, the API responds with a helpful `404 Not Found` JSON containing the full directory of available endpoints, their HTTP methods, and descriptions.
 
 ## Authentication
 All API endpoints (except `/auth/login` and static dashboard files) are protected and require a Bearer token.
@@ -186,7 +185,7 @@ GET /api/v1/history?app=watt&topic=admins&limit=50
 ---
 
 ## 6. Subscribe to Topic
-**Endpoint:** `POST /topics/subscribe`  
+**Endpoints:** `POST /topics/subscribe`, `POST /api/topics/subscribe`, or `POST /api/v1/topics/subscribe`  
 **Description:** Subscribes one or more FCM device tokens to a specific topic.
 
 ### Request Payload (JSON)
@@ -217,7 +216,7 @@ GET /api/v1/history?app=watt&topic=admins&limit=50
 ---
 
 ## 7. Unsubscribe from Topic
-**Endpoint:** `POST /topics/unsubscribe`  
+**Endpoints:** `POST /topics/unsubscribe`, `POST /api/topics/unsubscribe`, or `POST /api/v1/topics/unsubscribe`  
 **Description:** Unsubscribes one or more FCM device tokens from a specific topic.
 
 ### Request Payload (JSON)

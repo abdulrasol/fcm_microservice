@@ -169,10 +169,10 @@ onMounted(() => {
       <button @click="logout" class="text-white hover:bg-indigo-700 px-3 py-1 rounded text-sm font-medium">Logout</button>
     </nav>
 
-    <div class="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8 flex flex-col md:flex-row gap-6">
+    <div class="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8 flex flex-col lg:flex-row gap-6 items-start">
       
-      <!-- Left Column: Send Notification Form -->
-      <div class="flex-1 bg-white p-6 shadow rounded-lg h-fit">
+      <!-- Left Column: Send Notification Form (Fixed width: never shrinks) -->
+      <div class="w-full lg:w-[460px] shrink-0 bg-white p-6 shadow rounded-lg">
         <h2 class="text-lg font-medium mb-4 text-gray-800">Send Notification</h2>
         
         <form @submit.prevent="sendNotification" class="space-y-4">
@@ -236,12 +236,12 @@ onMounted(() => {
         </form>
       </div>
 
-      <!-- Right Column: History -->
-      <div class="flex-1 bg-white p-6 shadow rounded-lg flex flex-col">
+      <!-- Right Column: History (Fills remaining width, min-w-0 prevents overflow) -->
+      <div class="w-full flex-1 min-w-0 bg-white p-6 shadow rounded-lg flex flex-col">
         <h2 class="text-lg font-medium mb-4 text-gray-800">History (Click to reuse)</h2>
         
         <!-- Filters in a clean responsive grid -->
-        <div class="grid grid-cols-1 sm:grid-cols-4 gap-2 mb-4">
+        <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2 mb-4">
           <select v-model="historyFilters.app" class="border rounded-md p-2 text-sm focus:ring-indigo-500 focus:border-indigo-500 bg-white">
             <option value="">All Apps</option>
             <option v-for="app in apps" :key="app" :value="app">{{ app }}</option>
