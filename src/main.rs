@@ -483,6 +483,19 @@ async fn send_notification(
         ))
     } else {
         let _ = db::log_notification(&state.db, &payload.app, &target, &payload.title, "failed", &body_text, &payload_str).await;
-        Err((StatusCode::BAD_GATEWAY, format!("FCM Error: {}", body_text)))
+        let parsed_error: serde_json::Value = serde_json::from_str(&body_text).unwrap_or_else(|_| json!(body_text));
+        let client_status = if status.as_u16() >= 400 && status.as_u16() < 500 {
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_REQUEST)
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        Ok((
+            client_status,
+            Json(json!({
+                "status": "failed",
+                "error": "fcm_error",
+                "response": parsed_error
+            })),
+        ))
     }
 }

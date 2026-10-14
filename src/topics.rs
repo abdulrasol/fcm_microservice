@@ -117,9 +117,16 @@ async fn manage(
             )
         })?;
     if !response.status().is_success() {
+        let status = response.status();
+        let client_status = if status.as_u16() >= 400 && status.as_u16() < 500 {
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_REQUEST)
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        let err_text = response.text().await.unwrap_or_default();
         return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("Firebase topic request returned HTTP {}", response.status()),
+            client_status,
+            format!("Firebase topic request returned HTTP {}: {}", status, err_text),
         ));
     }
     let payload: Value = response
