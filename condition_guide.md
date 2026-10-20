@@ -88,11 +88,11 @@ Target customers in Iraq or Jordan who have enabled VIP offers:
 
 ## 4. How to Send via API
 
-Make a `POST` request to `/api/v1/send` (or `/api/send`):
+Make a `POST` request to `/api/v1/send`:
 
 ```bash
 curl -X POST "https://fcm.subultech.top/api/v1/send" \
-  -H "Authorization: Bearer <YOUR_API_KEY>" \
+  -H "Authorization: Bearer <FIREBASE_ID_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{
     "app": "watt",
@@ -101,3 +101,34 @@ curl -X POST "https://fcm.subultech.top/api/v1/send" \
     "body": "Stay safe on the road!"
   }'
 ```
+
+`/send` requires an admin ID token for the target `app`, or the `SERVICE_API_KEY`.
+The old `API_KEY` works only while `LEGACY_API_KEY_ENABLED=true` and only on this route.
+
+## 5. Validation Rules (server-side)
+
+| Rule | Value |
+|---|---|
+| Condition length | max 500 characters |
+| Allowed characters | `a-z A-Z 0-9`, space, `_ ' " ( ) | & ! . ~ - %` |
+| Quotes | single and double quotes must be balanced |
+| Topics per condition | max 5 (`'<topic>' in topics` references) |
+| Topic name | `^[A-Za-z0-9\-_.~%]{1,200}$` |
+| Title | max 200 characters, non-empty |
+| Body | max 4000 characters |
+| Request body | max 64 KB |
+
+Invalid conditions return `400 Bad Request` with a clear message before anything is
+sent to Firebase. Conditions must still be valid FCM expressions; the server checks
+length, characters, quote balance and topic count, not full FCM grammar.
+
+## 6. Subscribing devices to topics
+
+`POST /api/v1/topics/subscribe` accepts 1–10 device tokens per request.
+
+- Anonymous callers (no token or an invalid/ignored token) may subscribe only to
+  `all`, `country_XX` and `lang_XX`.
+- A valid Firebase ID token may also use `users`, `companies` and `technicals`.
+- `admins` and custom topics require an admin ID token or the service key.
+- The legacy `API_KEY` is never accepted on subscribe/unsubscribe.
+

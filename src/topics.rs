@@ -1,11 +1,14 @@
+use crate::auth::{self, AuthError};
+use crate::validation;
 use crate::AppState;
 use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, State},
+    http::{header, HeaderMap, StatusCode},
     Json,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 type ApiError = (StatusCode, String);
@@ -20,73 +23,88 @@ pub(crate) struct TopicRequest {
 
 impl TopicRequest {
     fn validate(&self) -> Result<(), ApiError> {
-        if self.app.is_empty() {
+        if self.app.trim().is_empty() {
             return Err((StatusCode::BAD_REQUEST, "app field is required".into()));
         }
-        if self.topic.is_empty()
-            || self.topic.len() > 900
-            || !self
-                .topic
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"-_.~%".contains(&c))
-        {
-            return Err((StatusCode::BAD_REQUEST, "topic must be 1-900 ASCII characters: letters, digits, - _ . ~ % (no /topics/ prefix)".into()));
-        }
-        if self.tokens.is_empty()
-            || self.tokens.len() > 1000
-            || self
-                .tokens
-                .iter()
-                .any(|t| t.trim().is_empty() || t.chars().any(char::is_whitespace))
-        {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "tokens must contain 1-1000 nonempty registration tokens without whitespace".into(),
-            ));
-        }
+        validation::validate_topic_name(&self.topic).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        validation::validate_subscribe_tokens(&self.tokens)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         Ok(())
     }
 }
 
 pub(crate) async fn subscribe(
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<TopicRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    manage(headers, state, body, "batchAdd").await
+    manage(headers, peer, state, body, "batchAdd").await
 }
+
 pub(crate) async fn unsubscribe(
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<TopicRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    manage(headers, state, body, "batchRemove").await
+    manage(headers, peer, state, body, "batchRemove").await
 }
 
 async fn manage(
     headers: HeaderMap,
+    peer: SocketAddr,
     state: Arc<AppState>,
     body: TopicRequest,
     operation: &str,
 ) -> Result<Json<Value>, ApiError> {
-    let expected = format!("Bearer {}", state.api_key);
-    if headers.get("Authorization").and_then(|h| h.to_str().ok()) != Some(expected.as_str()) {
-        return Err((StatusCode::UNAUTHORIZED, "Invalid API Key".into()));
-    }
     body.validate()?;
 
-    let auth = {
-        let am = state.auth_map.read().await;
-        match am.get(&body.app) {
-            Some(a) => a.clone(),
-            None => {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    format!("App '{}' not found in credentials folder.", body.app),
-                ));
+    let app_exists = {
+        let map = state.project_map.read().await;
+        map.contains_key(&body.app)
+    };
+    if !app_exists {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("App '{}' not found in credentials folder.", body.app),
+        ));
+    }
+
+    check_ip_limit(&state, &headers, peer)?;
+
+    let resolved = state
+        .auth
+        .authorize_topic(&headers, &body.app, &body.topic)
+        .await;
+    let (_, user) = match resolved {
+        Ok(value) => value,
+        Err(error) => {
+            if matches!(error, AuthError::Unauthorized(_) | AuthError::Forbidden(_))
+                && headers.contains_key(header::AUTHORIZATION)
+                && !state.auth_fail_limiter.check(&format!(
+                    "ip:{}",
+                    auth::client_ip(&headers, Some(peer), state.trust_proxy)
+                ))
+            {
+                return Err(too_many_requests());
             }
+            return Err(error.into_response());
         }
     };
+
+    if let Some(user) = user {
+        check_uid_limit(&state, &user.uid)?;
+    }
+
+    let auth = {
+        let map = state.auth_map.read().await;
+        map.get(&body.app).cloned()
+    }
+    .ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Service account for this app is not loaded".to_string(),
+    ))?;
 
     let token = auth
         .token(&["https://www.googleapis.com/auth/firebase.messaging"])
@@ -126,7 +144,10 @@ async fn manage(
         let err_text = response.text().await.unwrap_or_default();
         return Err((
             client_status,
-            format!("Firebase topic request returned HTTP {}: {}", status, err_text),
+            format!(
+                "Firebase topic request returned HTTP {}: {}",
+                status, err_text
+            ),
         ));
     }
     let payload: Value = response
@@ -134,6 +155,34 @@ async fn manage(
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Invalid Firebase response".into()))?;
     summarize(&payload, body.tokens.len()).map(Json)
+}
+
+pub(crate) fn check_ip_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<(), ApiError> {
+    let ip = auth::client_ip(headers, Some(peer), state.trust_proxy);
+    if state.topics_limiter.check(&format!("ip:{ip}")) {
+        Ok(())
+    } else {
+        Err(too_many_requests())
+    }
+}
+
+pub(crate) fn check_uid_limit(state: &AppState, uid: &str) -> Result<(), ApiError> {
+    if state.topics_limiter.check(&format!("uid:{uid}")) {
+        Ok(())
+    } else {
+        Err(too_many_requests())
+    }
+}
+
+pub(crate) fn too_many_requests() -> ApiError {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many requests; retry later".to_string(),
+    )
 }
 
 fn summarize(payload: &Value, expected: usize) -> Result<Value, ApiError> {
@@ -168,6 +217,7 @@ fn summarize(payload: &Value, expected: usize) -> Result<Value, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn validates_topic_and_batch_boundaries() {
         let valid = || TopicRequest {
@@ -176,7 +226,7 @@ mod tests {
             tokens: vec!["token".into()],
         };
         assert!(valid().validate().is_ok());
-        for name in ["", "/topics/all", "a b", "عربي"] {
+        for name in ["", "/topics/all", "a b", "عربي", "a/b"] {
             assert!(TopicRequest {
                 topic: name.into(),
                 ..valid()
@@ -185,25 +235,37 @@ mod tests {
             .is_err());
         }
         assert!(TopicRequest {
+            topic: "a".repeat(validation::MAX_TOPIC_LENGTH + 1),
+            ..valid()
+        }
+        .validate()
+        .is_err());
+        assert!(TopicRequest {
             tokens: vec![],
             ..valid()
         }
         .validate()
         .is_err());
         assert!(TopicRequest {
-            tokens: vec!["token".into(); 1000],
+            tokens: vec!["token".into(); validation::MAX_SUBSCRIBE_TOKENS],
             ..valid()
         }
         .validate()
         .is_ok());
         assert!(TopicRequest {
-            tokens: vec!["token".into(); 1001],
+            tokens: vec!["token".into(); validation::MAX_SUBSCRIBE_TOKENS + 1],
             ..valid()
         }
         .validate()
         .is_err());
         assert!(TopicRequest {
             tokens: vec![" ".into()],
+            ..valid()
+        }
+        .validate()
+        .is_err());
+        assert!(TopicRequest {
+            tokens: vec!["x".repeat(validation::MAX_DEVICE_TOKEN_LENGTH + 1)],
             ..valid()
         }
         .validate()
