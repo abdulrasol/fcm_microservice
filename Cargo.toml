@@ -15,6 +15,15 @@ hyper-rustls = "0.24"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-tower-http = { version = "0.5.2", features = ["trace", "cors", "fs"] }
+tower-http = { version = "0.5.2", features = ["trace", "cors", "fs", "limit"] }
 sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls"] }
 notify = { version = "6.1" }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+subtle = "2"
+async-trait = "0.1"
+sha2 = "0.10"
+
+[dev-dependencies]
+base64 = "0.22"
+rand = "0.8"
+rsa = "0.9"
