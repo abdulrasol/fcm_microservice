@@ -1,35 +1,39 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import Login from './views/Login.vue'
 import Dashboard from './views/Dashboard.vue'
+import { waitForAuth } from './firebase'
 
 const routes = [
   {
     path: '/login',
     name: 'Login',
-    component: Login
+    component: Login,
   },
   {
     path: '/',
     name: 'Dashboard',
     component: Dashboard,
-    meta: { requiresAuth: true }
-  }
+    meta: { requiresAuth: true },
+  },
 ]
 
 const router = createRouter({
   history: createWebHistory(),
-  routes
+  routes,
 })
 
-router.beforeEach((to, from, next) => {
-  const isAuthenticated = !!localStorage.getItem('fcm_api_key');
-  if (to.meta.requiresAuth && !isAuthenticated) {
-    next('/login');
-  } else if (to.path === '/login' && isAuthenticated) {
-    next('/');
-  } else {
-    next();
+router.beforeEach(async (to) => {
+  const user = await waitForAuth()
+
+  if (to.meta.requiresAuth && !user) {
+    return { name: 'Login', query: { redirect: to.fullPath } }
   }
+
+  if (to.name === 'Login' && user) {
+    return { name: 'Dashboard' }
+  }
+
+  return true
 })
 
-export default router;
+export default router
