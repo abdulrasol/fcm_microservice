@@ -11,7 +11,7 @@ A fully integrated, ultra-lightweight Push Notification Management System built 
 - **Ultra Lightweight**: Built with `axum` and `tokio`. Minimal RAM and CPU consumption.
 - **Integrated SQLite Database**: Automatically tracks notification history (including sender identity) and saved topics.
 - **Hot-Reloading Credentials**: Automatically detects new credentials added to the folder without a server restart.
-- **Web Dashboard**: An integrated UI to manually send notifications and view history. Firebase sign-in is added in SEC2-B.
+- **Web Dashboard**: An integrated UI with Firebase Auth email/password sign-in, app-scoped admin access, sending and history.
 
 ## Documentation
 
@@ -29,6 +29,12 @@ A fully integrated, ultra-lightweight Push Notification Management System built 
    - Grant the service account `roles/datastore.viewer` (or broader) so the admin role lookup can read Firestore.
    - Make sure admin users have `role: "admin"` in the Firestore `users/{uid}` document.
 4. Run the server using Docker or `cargo run`.
+5. **Dashboard Setup**: read [dashboard/README.md](dashboard/README.md). Copy
+   `dashboard/.env.example` to `dashboard/.env.local`, set the public Firebase Web
+   App config and `VITE_DEFAULT_APP`, then run `npm run build` from `dashboard/`
+   to regenerate the tracked root `dist/` folder. If the dashboard is served from
+   a different origin than the API, add that exact origin to
+   `CORS_ALLOWED_ORIGINS`.
 
 ## Authentication in one paragraph
 
@@ -52,10 +58,13 @@ docker run -d -p 8080:8080 -v $(pwd)/credentials:/app/credentials -v $(pwd)/data
 ## Deployment plan (short)
 
 1. Deploy with `LEGACY_API_KEY_ENABLED=true` so the existing admin client keeps using `/send`.
-2. Update the admin app and dashboard to send Firebase ID tokens (dashboard sign-in lands in SEC2-B).
+2. Build and deploy the dashboard with its Firebase Web App configuration, then
+   verify admin sign-in and the app-scoped `/apps`, `/history`, `/topics` and
+   `/send` calls.
 3. Set `LEGACY_API_KEY_ENABLED=false`, remove the old `API_KEY`, and generate new
    `API_KEY` / `SERVICE_API_KEY` values outside any repository or client bundle.
 
-> Note: The previous email/password dashboard sign-in has been removed. The
-> pre-SEC2-B dashboard login screen will not work until it is migrated to Firebase
-> Authentication.
+> The dashboard signs in with Firebase Authentication and sends ID tokens; the
+> old `/auth/login` endpoint and the `fcm_api_key` browser storage key are gone.
+> `CORS_ALLOWED_ORIGINS` remains mandatory and must include the dashboard origin
+> whenever it is not served from the same origin as the API.

@@ -356,8 +356,31 @@ The client IP is the TCP peer address. `X-Forwarded-For` is used **only** when
 | `PORT` | No | `8080` | Listen port. |
 | `DATABASE_URL` | No | `sqlite://data.db` | SQLite database URL. |
 
-The dashboard email/password variables and login endpoint have been removed.
-The dashboard will authenticate with Firebase in SEC2-B.
+The dashboard email/password variables (`DASHBOARD_EMAIL`, `DASHBOARD_PASSWORD`)
+and the `/auth/login` endpoint have been removed.
+
+### Dashboard authentication
+
+The dashboard uses the Firebase Web SDK:
+
+- Build-time variables: `VITE_FIREBASE_CONFIGS` (JSON map of app name to public
+  Firebase Web App config) and `VITE_DEFAULT_APP` (project used for sign-in).
+  See [dashboard/README.md](dashboard/README.md) and
+  [dashboard/.env.example](dashboard/.env.example).
+- Every API request sends `Authorization: Bearer <Firebase ID token>`. The token
+  is refreshed by the SDK; application code does not store it in
+  `localStorage`.
+- On `401`, the client force-refreshes once and retries, then returns to
+  `/login`.
+- On `403`, it shows `هذا الحساب ليس أدمن لهذا التطبيق` without signing out.
+- On `503`, it shows `تعذر التحقق من الصلاحية، حاول لاحقاً` without signing out.
+- `/apps` returns only apps where the signed-in user is an admin. If exactly one
+  app is returned, the dashboard selects it automatically.
+- The Firebase Web App configuration is public and is embedded at build time.
+  Never place a service-account private key or `SERVICE_API_KEY` in the dashboard.
+- If the dashboard is served from a different origin than the API, add its exact
+  origin to `CORS_ALLOWED_ORIGINS`. Rebuild `dist/` after changing `VITE_*`
+  values; the root `dist/` directory is tracked in git.
 
 ---
 
@@ -381,11 +404,13 @@ The dashboard will authenticate with Firebase in SEC2-B.
    Set `LEGACY_API_KEY_ENABLED=true`, keep the current `API_KEY`, and set
    `CORS_ALLOWED_ORIGINS` to the explicit dashboard origin. This keeps `/send`
    working for the old admin client while the new authentication is rolled out.
-2. **Update the admin application and dashboard.**
-   Switch clients to Firebase Auth ID tokens (`Authorization: Bearer <id_token>`)
-   and add Firebase sign-in to the dashboard (SEC2-B). Ensure admins have
-   `role: "admin"` in Firestore `users/{uid}` and that each app service account can
-   read Firestore.
+2. **Update the admin application and deploy the dashboard.**
+   Switch the remaining admin client to Firebase Auth ID tokens
+   (`Authorization: Bearer <id_token>`). The dashboard already signs in with
+   Firebase Auth; build it with the public Firebase Web App configuration and
+   `VITE_DEFAULT_APP`, and add its exact origin to `CORS_ALLOWED_ORIGINS` when it
+   is not served by the Rust service. Ensure admins have `role: "admin"` in
+   Firestore `users/{uid}` and that each app service account can read Firestore.
 3. **Disable the legacy path and rotate keys.**
    Set `LEGACY_API_KEY_ENABLED=false`, remove `API_KEY`, and generate new
    `SERVICE_API_KEY` / `API_KEY` values outside any repository or client bundle.
@@ -397,3 +422,6 @@ The dashboard will authenticate with Firebase in SEC2-B.
   leaked and rotated. No shared secret should be shipped to clients.
 - Never commit `.env`, service account JSON files or generated keys.
 - Device tokens and authorization headers are never written to logs or history.
+- The dashboard stores no API key or ID token in application code. Firebase Auth
+  manages its own session; only the public Firebase Web App configuration is
+  embedded in the built bundle.
