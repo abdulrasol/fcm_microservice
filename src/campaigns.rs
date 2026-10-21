@@ -15,7 +15,8 @@ use regex::Regex;
 use serde_json::{json, Value};
 
 use crate::config::validate::{is_image_host, is_param_name, is_reserved_data_key};
-use crate::config::{Audience, Campaigns, Review};
+use crate::config::{Audience, Campaigns, Quota};
+use crate::datasource::DataError;
 use crate::db::{self, NewCampaign};
 use crate::send::{self, FcmOutcome};
 use crate::template::{self, RenderError, Sender, Snippet, SnippetMode};
@@ -38,14 +39,14 @@ fn bad(message: impl Into<String>) -> CampaignError {
     CampaignError::BadRequest(message.into())
 }
 
-fn content_error(error: RenderError) -> CampaignError {
+pub(crate) fn render_error(error: RenderError) -> CampaignError {
     match error {
         RenderError::BadRequest(message) => CampaignError::BadRequest(message),
         RenderError::Forbidden => CampaignError::Forbidden,
     }
 }
 
-fn storage_error(error: sqlx::Error) -> CampaignError {
+pub(crate) fn storage_error(error: sqlx::Error) -> CampaignError {
     // The SQL error never contains campaign content or a token.
     tracing::error!(error = %error, "campaign storage failed");
     CampaignError::Internal
@@ -232,7 +233,7 @@ pub fn prepare_content(
 
     let action_params =
         template::validate_param_map(&action.params, input.action_params.unwrap_or(&Value::Null))
-            .map_err(content_error)?;
+            .map_err(render_error)?;
 
     let mut params = action_params;
     params.insert(campaigns.entity.param.clone(), entity_id.to_string());
@@ -244,7 +245,7 @@ pub fn prepare_content(
     };
 
     let prefix = template::render_snippet(&content.title_prefix, &snippet, SnippetMode::Text)
-        .map_err(content_error)?;
+        .map_err(render_error)?;
     let title = format!("{prefix}{}", input.title);
 
     let mut data = BTreeMap::new();
@@ -253,14 +254,14 @@ pub fn prepare_content(
             return Err(bad(format!("data key '{key}' is reserved")));
         }
         let value = template::render_snippet(definition, &snippet, SnippetMode::Text)
-            .map_err(content_error)?;
+            .map_err(render_error)?;
         data.insert(key.clone(), value);
     }
 
     let check = match &action.check {
         Some(check) => {
             let path = template::render_snippet(&check.doc, &snippet, SnippetMode::Path)
-                .map_err(content_error)?;
+                .map_err(render_error)?;
             Some((path, check.require.clone()))
         }
         None => None,
@@ -338,6 +339,123 @@ fn validate_image(image: &str, hosts: &[String]) -> Result<(), CampaignError> {
         return Err(bad("image host is not allowed"));
     }
     Ok(())
+}
+
+// ---------- entity and action checks ----------
+
+/// Resolves the entity document and applies `entity.require`.
+///
+/// A missing document and a failed requirement are the same uniform
+/// [`CampaignError::Forbidden`]. The trusted service sender skips only the
+/// requirement fields computed from `{sender.*}`; a missing entity is still an
+/// error because the entity name is needed in the title.
+pub async fn resolve_entity(
+    state: &AppState,
+    app: &str,
+    campaigns: &Campaigns,
+    sender: &Sender,
+    is_service: bool,
+    entity_id: &str,
+) -> Result<Value, CampaignError> {
+    if !is_entity_id(entity_id) {
+        return Err(bad("entity_id must match ^[A-Za-z0-9_-]{1,64}$"));
+    }
+
+    let mut params = BTreeMap::new();
+    params.insert(campaigns.entity.param.clone(), entity_id.to_string());
+    let snippet = Snippet {
+        params: &params,
+        sender,
+        doc: None,
+        entity: None,
+    };
+    let path = template::render_snippet(&campaigns.entity.doc, &snippet, SnippetMode::Path)
+        .map_err(render_error)?;
+
+    let source = state
+        .datasource
+        .source_for(app)
+        .await
+        .map_err(|_| CampaignError::Unavailable)?;
+    let doc = match source.get_doc(&path).await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => return Err(CampaignError::Forbidden),
+        Err(DataError::Unavailable(_)) => return Err(CampaignError::Unavailable),
+        Err(DataError::InvalidPath(message)) => return Err(CampaignError::BadRequest(message)),
+    };
+
+    let require: BTreeMap<String, String> = if is_service {
+        campaigns
+            .entity
+            .require
+            .iter()
+            .filter(|(_, value)| !value.contains("{sender."))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    } else {
+        campaigns.entity.require.clone()
+    };
+    let check = Snippet {
+        params: &params,
+        sender,
+        doc: Some(&doc),
+        entity: None,
+    };
+    template::check_require_map(&require, &check, Some(&doc)).map_err(render_error)?;
+    Ok(doc)
+}
+
+/// Reads and checks an action's `check.doc`, when the action has one.
+pub async fn check_action(
+    state: &AppState,
+    app: &str,
+    sender: &Sender,
+    entity: &Value,
+    prepared: &PreparedContent,
+) -> Result<(), CampaignError> {
+    let (path, require) = match &prepared.check {
+        Some(check) => check,
+        None => return Ok(()),
+    };
+
+    let source = state
+        .datasource
+        .source_for(app)
+        .await
+        .map_err(|_| CampaignError::Unavailable)?;
+    let doc = match source.get_doc(path).await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => return Err(CampaignError::Forbidden),
+        Err(DataError::Unavailable(_)) => return Err(CampaignError::Unavailable),
+        Err(DataError::InvalidPath(message)) => return Err(CampaignError::BadRequest(message)),
+    };
+
+    let snippet = Snippet {
+        params: &prepared.params,
+        sender,
+        doc: Some(&doc),
+        entity: Some(entity),
+    };
+    template::check_require_map(require, &snippet, Some(&doc)).map_err(render_error)
+}
+
+/// Runs the quota check and the insert, mapping storage errors for the route.
+pub async fn insert_campaign(
+    state: &AppState,
+    new: &NewCampaign,
+    limits: &Quota,
+    now: i64,
+) -> Result<db::Inserted, CampaignError> {
+    db::insert_campaign_checked(&state.db, new, limits, now)
+        .await
+        .map_err(|error| match error {
+            db::InsertError::QuotaExceeded {
+                retry_after_seconds,
+            } => CampaignError::QuotaExceeded {
+                retry_after_seconds,
+            },
+            db::InsertError::Database(error) => storage_error(error),
+        })
 }
 
 // ---------- delivery ----------
@@ -431,35 +549,6 @@ pub async fn dispatch_campaign(
     .await;
 
     Ok(outcome)
-}
-
-/// Builds the insert row from prepared content. Kept here so the route stays
-/// short and the mapping is testable.
-pub fn new_campaign_row(
-    app: &str,
-    entity_id: &str,
-    sender: &Sender,
-    prepared: PreparedContent,
-    audience: Value,
-    condition: &str,
-    review: &Review,
-    sender_is_service: bool,
-) -> Result<NewCampaign, CampaignError> {
-    let data = serde_json::to_string(&prepared.data).map_err(|_| CampaignError::Internal)?;
-    let audience = serde_json::to_string(&audience).map_err(|_| CampaignError::Internal)?;
-    Ok(NewCampaign {
-        app: app.to_string(),
-        entity_id: entity_id.to_string(),
-        sender_uid: sender.uid.clone(),
-        title: prepared.title,
-        body: prepared.body,
-        image: prepared.image,
-        data,
-        audience,
-        condition: condition.to_string(),
-        review: review.clone(),
-        sender_is_service,
-    })
 }
 
 #[cfg(test)]

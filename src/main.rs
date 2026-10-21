@@ -17,7 +17,7 @@ mod validation;
 
 use auth::{AdminIdentity, AuthConfig, AuthError, AuthService};
 use axum::{
-    extract::{rejection::JsonRejection, ConnectInfo, Query, State},
+    extract::{rejection::JsonRejection, ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -107,6 +107,41 @@ struct SendTemplateRequest {
     template: String,
     #[serde(default)]
     params: serde_json::Value,
+}
+
+/// A company campaign (T9). `audience` is groups of topics, never a condition.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateCampaignRequest {
+    app: String,
+    entity_id: String,
+    title: String,
+    body: String,
+    image: Option<String>,
+    action: String,
+    #[serde(default)]
+    action_params: Option<serde_json::Value>,
+    audience: CampaignAudienceRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignAudienceRequest {
+    groups: Vec<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelCampaignRequest {
+    app: String,
+}
+
+#[derive(Deserialize)]
+struct ListCampaignsQuery {
+    app: String,
+    entity_id: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -265,6 +300,11 @@ async fn main() {
         .route("/topics", get(get_topics).post(add_topic))
         .route("/send", post(send_notification))
         .route("/send/template", post(send_template))
+        .route(
+            "/campaigns",
+            get(list_campaigns_route).post(create_campaign),
+        )
+        .route("/campaigns/:id/cancel", post(cancel_campaign))
         .route("/topics/subscribe", post(topics::subscribe))
         .route("/topics/unsubscribe", post(topics::unsubscribe))
         .route("/devices/register", post(register_device))
@@ -1269,6 +1309,385 @@ async fn deliver(
         dead_tokens,
         empty_audience: false,
     })
+}
+
+// ---------- company campaigns (T9) ----------
+
+/// Errors of the campaign routes. Quota is the plan's only JSON error body; the
+/// other variants keep the service's plain-text convention.
+enum CampaignHttpError {
+    Message(StatusCode, String),
+    Quota { retry_after_seconds: i64 },
+}
+
+impl From<campaigns::CampaignError> for CampaignHttpError {
+    fn from(error: campaigns::CampaignError) -> Self {
+        match error {
+            campaigns::CampaignError::BadRequest(message) => {
+                CampaignHttpError::Message(StatusCode::BAD_REQUEST, message)
+            }
+            campaigns::CampaignError::Forbidden => {
+                CampaignHttpError::Message(StatusCode::FORBIDDEN, "Forbidden".to_string())
+            }
+            campaigns::CampaignError::Unavailable => CampaignHttpError::Message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the data source is unavailable".to_string(),
+            ),
+            campaigns::CampaignError::NotFound => {
+                CampaignHttpError::Message(StatusCode::NOT_FOUND, "Campaign not found".to_string())
+            }
+            campaigns::CampaignError::Conflict => CampaignHttpError::Message(
+                StatusCode::CONFLICT,
+                "Campaign is not pending review".to_string(),
+            ),
+            campaigns::CampaignError::QuotaExceeded {
+                retry_after_seconds,
+            } => CampaignHttpError::Quota {
+                retry_after_seconds,
+            },
+            campaigns::CampaignError::Internal => CampaignHttpError::Message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "campaign storage failed".to_string(),
+            ),
+        }
+    }
+}
+
+impl From<(StatusCode, String)> for CampaignHttpError {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        CampaignHttpError::Message(status, message)
+    }
+}
+
+impl IntoResponse for CampaignHttpError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            CampaignHttpError::Message(status, message) => (status, message).into_response(),
+            CampaignHttpError::Quota {
+                retry_after_seconds,
+            } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "quota_exceeded",
+                    "retry_after": retry_after_seconds,
+                })),
+            )
+                .into_response(),
+        }
+    }
+}
+
+fn campaigns_disabled() -> CampaignHttpError {
+    CampaignHttpError::Message(
+        StatusCode::NOT_FOUND,
+        "Campaigns are not enabled".to_string(),
+    )
+}
+
+/// Steps 1-2 shared by the three campaign routes: a known app, the IP limit and
+/// the service key or a verified identity with its resolved role.
+async fn authorize_campaign_sender(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    app: &str,
+) -> Result<(template::Sender, Option<String>, bool), CampaignHttpError> {
+    ensure_known_app(state, app).await?;
+    topics::check_ip_limit(state, headers, peer)?;
+
+    if state.auth.verify_service_key(headers) {
+        return Ok((
+            template::Sender {
+                uid: "service".to_string(),
+                name: None,
+                role: None,
+            },
+            None,
+            true,
+        ));
+    }
+
+    let identity = state
+        .auth
+        .authenticate_identity(headers, app)
+        .await
+        .map_err(|error| auth_error_with_limit(state, headers, peer, error))?;
+    let role = state
+        .auth
+        .resolve_sender_role(app, &identity)
+        .await
+        .map_err(|error| auth_error_with_limit(state, headers, peer, error))?;
+    Ok((
+        template::Sender {
+            uid: identity.uid,
+            name: identity.name,
+            role,
+        },
+        identity.email,
+        false,
+    ))
+}
+
+/// `POST /api/v1/campaigns` (T9). The numbered steps match plan 3.3.
+async fn create_campaign(
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CreateCampaignRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), CampaignHttpError> {
+    // 1-2. A known app, the IP limit, and the service key or a verified sender.
+    let (sender, _sender_email, is_service) =
+        authorize_campaign_sender(&state, &headers, peer, &payload.app).await?;
+
+    // 3. Campaigns must be enabled for the app; a missing config is the same 404.
+    let snapshot = state
+        .config
+        .get(&payload.app)
+        .ok_or_else(campaigns_disabled)?;
+    let campaigns_cfg = &snapshot.config.campaigns;
+    if !campaigns_cfg.enabled {
+        return Err(campaigns_disabled());
+    }
+
+    // 4. The role must be listed literally, then the per-uid hourly limit.
+    if !is_service {
+        let listed = sender
+            .role
+            .as_deref()
+            .is_some_and(|role| campaigns_cfg.senders.iter().any(|allowed| allowed == role));
+        if !listed {
+            return Err(campaigns::CampaignError::Forbidden.into());
+        }
+        topics::check_uid_limit(&state, &sender.uid)?;
+    }
+
+    // 5-6. The entity id, its document and its require map.
+    let entity = campaigns::resolve_entity(
+        &state,
+        &payload.app,
+        campaigns_cfg,
+        &sender,
+        is_service,
+        &payload.entity_id,
+    )
+    .await?;
+
+    // 7. A blocked company cannot create campaigns.
+    if db::is_entity_blocked(&state.db, &payload.app, &payload.entity_id)
+        .await
+        .map_err(campaigns::storage_error)?
+    {
+        return Err(campaigns::CampaignError::Forbidden.into());
+    }
+
+    // 8. Content (including the action check), then the audience.
+    let content = campaigns::ContentInput {
+        title: &payload.title,
+        body: &payload.body,
+        image: payload.image.as_deref(),
+        action: &payload.action,
+        action_params: payload.action_params.as_ref(),
+    };
+    let prepared = campaigns::prepare_content(
+        campaigns_cfg,
+        &entity,
+        &sender,
+        &payload.entity_id,
+        &content,
+    )?;
+    campaigns::check_action(&state, &payload.app, &sender, &entity, &prepared).await?;
+    let condition = campaigns::build_condition(
+        &payload.audience.groups,
+        &campaigns_cfg.audience,
+        &payload.entity_id,
+    )?;
+
+    // 9. The same content limits as `/send`, with the real condition.
+    let data_value = if prepared.data.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(
+            prepared
+                .data
+                .iter()
+                .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+                .collect(),
+        ))
+    };
+    validation::validate_send(
+        &payload.app,
+        None,
+        None,
+        Some(&condition),
+        &prepared.title,
+        Some(&prepared.body),
+        prepared.image.as_deref(),
+        data_value.as_ref(),
+    )
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+
+    // 10. Quota and insert in one transaction.
+    let audience = json!({ "groups": &payload.audience.groups });
+    let new = db::NewCampaign {
+        app: payload.app.clone(),
+        entity_id: payload.entity_id.clone(),
+        sender_uid: sender.uid.clone(),
+        title: prepared.title,
+        body: prepared.body,
+        image: prepared.image,
+        data: serde_json::to_string(&prepared.data)
+            .map_err(|_| campaigns::CampaignError::Internal)?,
+        audience: serde_json::to_string(&audience)
+            .map_err(|_| campaigns::CampaignError::Internal)?,
+        condition: condition.clone(),
+        review: campaigns_cfg.review.clone(),
+        sender_is_service: is_service,
+    };
+    let inserted =
+        campaigns::insert_campaign(&state, &new, &campaigns_cfg.quota, unix_seconds()).await?;
+
+    // 11-12. A campaign that does not need review is dispatched immediately.
+    let status = if inserted.status == "sending" {
+        campaigns::dispatch_campaign(&state, inserted.id)
+            .await?
+            .status()
+            .to_string()
+    } else {
+        inserted.status
+    };
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "id": inserted.id, "status": status })),
+    ))
+}
+
+/// `GET /api/v1/campaigns` (T9): the sender's entity campaigns, without the raw
+/// condition or the FCM response.
+async fn list_campaigns_route(
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListCampaignsQuery>,
+) -> Result<Json<serde_json::Value>, CampaignHttpError> {
+    // 1-2.
+    let (sender, _sender_email, is_service) =
+        authorize_campaign_sender(&state, &headers, peer, &query.app).await?;
+
+    // 3.
+    let snapshot = state
+        .config
+        .get(&query.app)
+        .ok_or_else(campaigns_disabled)?;
+    let campaigns_cfg = &snapshot.config.campaigns;
+    if !campaigns_cfg.enabled {
+        return Err(campaigns_disabled());
+    }
+
+    // 6. A company must name its own entity; the service key may list the app.
+    if !is_service && query.entity_id.is_none() {
+        return Err(
+            campaigns::CampaignError::BadRequest("entity_id is required".to_string()).into(),
+        );
+    }
+    if let Some(entity_id) = query.entity_id.as_deref() {
+        campaigns::resolve_entity(
+            &state,
+            &query.app,
+            campaigns_cfg,
+            &sender,
+            is_service,
+            entity_id,
+        )
+        .await?;
+    }
+
+    let rows = db::list_campaigns(
+        &state.db,
+        &query.app,
+        query.entity_id.as_deref(),
+        query.limit.unwrap_or(50),
+        query.offset.unwrap_or(0),
+    )
+    .await
+    .map_err(campaigns::storage_error)?;
+
+    let items: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|campaign| {
+            json!({
+                "id": campaign.id,
+                "status": campaign.status,
+                "title": campaign.title,
+                "body": campaign.body,
+                "image": campaign.image,
+                "audience": serde_json::from_str::<serde_json::Value>(&campaign.audience)
+                    .unwrap_or(serde_json::Value::Null),
+                "created_at": campaign.created_at,
+                "sent_at": campaign.sent_at,
+                "review_note": campaign.review_note,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::Value::Array(items)))
+}
+
+/// `POST /api/v1/campaigns/{id}/cancel` (T9). A campaign of another entity is a
+/// uniform 404 so ids cannot be probed.
+async fn cancel_campaign(
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(payload): Json<CancelCampaignRequest>,
+) -> Result<Json<serde_json::Value>, CampaignHttpError> {
+    // 1-2.
+    let (sender, _sender_email, is_service) =
+        authorize_campaign_sender(&state, &headers, peer, &payload.app).await?;
+
+    // 3.
+    let snapshot = state
+        .config
+        .get(&payload.app)
+        .ok_or_else(campaigns_disabled)?;
+    let campaigns_cfg = &snapshot.config.campaigns;
+    if !campaigns_cfg.enabled {
+        return Err(campaigns_disabled());
+    }
+
+    // A campaign of another app is indistinguishable from a missing one.
+    let campaign = db::get_campaign(&state.db, id)
+        .await
+        .map_err(campaigns::storage_error)?
+        .filter(|campaign| campaign.app == payload.app)
+        .ok_or(campaigns::CampaignError::NotFound)?;
+
+    // The same entity check as creation; a foreign campaign is a uniform 404.
+    match campaigns::resolve_entity(
+        &state,
+        &payload.app,
+        campaigns_cfg,
+        &sender,
+        is_service,
+        &campaign.entity_id,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(campaigns::CampaignError::Forbidden) | Err(campaigns::CampaignError::NotFound) => {
+            return Err(campaigns::CampaignError::NotFound.into());
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let cancelled = db::cancel_pending(&state.db, id, &payload.app, &campaign.entity_id)
+        .await
+        .map_err(campaigns::storage_error)?;
+    if !cancelled {
+        return Err(campaigns::CampaignError::Conflict.into());
+    }
+    Ok(Json(json!({ "status": "cancelled" })))
 }
 
 #[derive(Deserialize)]
@@ -2925,5 +3344,1071 @@ mod tests {
             json!({ "status": "duplicate", "delivered": 0, "failed": 0 })
         );
         assert_eq!(harness.fcm.message_count(), 1);
+    }
+    // ---------- campaign routes (T9) ----------
+
+    fn campaigns_config() -> Value {
+        json!({
+            "enabled": true,
+            "senders": ["company"],
+            "entity": {
+                "param": "company_id",
+                "doc": "companies/{p.company_id}",
+                "require": { "user_id": "{sender.uid}", "status": "approved" },
+                "name_field": "name"
+            },
+            "audience": {
+                "allowed_topics": [
+                    "country_*", "lang_*", "users", "technicals", "cat_*",
+                    "company_{p.company_id}"
+                ],
+                "required_topic": "promos",
+                "max_topics": 5
+            },
+            "content": {
+                "title_prefix": "{entity.name}: ",
+                "title_max": 60,
+                "body_max": 240,
+                "forbid_links": true,
+                "image_hosts": ["firebasestorage.googleapis.com"],
+                "actions": {
+                    "open_company": {
+                        "data": {
+                            "action": "open_company",
+                            "company_id": "{p.company_id}"
+                        }
+                    },
+                    "open_product": {
+                        "params": {
+                            "product_id": {
+                                "type": "pattern",
+                                "pattern": "^[A-Za-z0-9_-]{1,64}$"
+                            }
+                        },
+                        "check": {
+                            "doc": "store_products/{p.product_id}",
+                            "require": {
+                                "owner_id": "{sender.uid}",
+                                "status": "approved"
+                            }
+                        },
+                        "data": {
+                            "action": "open_product",
+                            "product_id": "{p.product_id}"
+                        }
+                    }
+                }
+            },
+            "quota": { "per_entity_per_day": 1, "per_entity_per_week": 5 },
+            "review": { "mode": "first_n", "n": 3 }
+        })
+    }
+
+    fn campaign_entity(owner: &str, status: &str) -> Value {
+        json!({
+            "user_id": owner,
+            "status": status,
+            "name": "Acme"
+        })
+    }
+
+    fn company_doc(entity_id: &str) -> (String, Value) {
+        (
+            format!("companies/{entity_id}"),
+            campaign_entity(entity_id, "approved"),
+        )
+    }
+
+    fn campaign_body(entity_id: &str, groups: Value) -> Value {
+        json!({
+            "app": APP,
+            "entity_id": entity_id,
+            "title": "Weekend sale",
+            "body": "A short offer",
+            "action": "open_company",
+            "audience": { "groups": groups }
+        })
+    }
+
+    /// A resolver that answers different documents by path prefix.
+    async fn spawn_docs(routes: Vec<(String, Value)>, members: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the source server must bind");
+        let addr = listener.local_addr().expect("the address must be known");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let routes = routes.clone();
+                let members = members.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 8192];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let target = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or_default();
+                    let (status, body) = if target.starts_with("/doc") {
+                        let requested = target
+                            .split("path=")
+                            .nth(1)
+                            .unwrap_or_default()
+                            .replace("%2F", "/")
+                            .replace("%2f", "/");
+                        match routes
+                            .iter()
+                            .find(|(prefix, _)| requested.starts_with(prefix))
+                        {
+                            Some((_, doc)) => ("200 OK", doc.to_string()),
+                            None => ("404 Not Found", "{}".to_string()),
+                        }
+                    } else if target.starts_with("/members") {
+                        ("200 OK", json!({ "uids": members }).to_string())
+                    } else {
+                        ("404 Not Found", "{}".to_string())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn campaign_setup(
+        fcm: Arc<FakeTransport>,
+        docs: Vec<(String, Value)>,
+        config: Value,
+    ) -> Harness {
+        let harness = harness(fcm).await;
+        let base = spawn_docs(docs, Vec::new()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        use_http_source(&harness, &base).await;
+        save_section(&harness, "campaigns", config).await;
+        harness
+    }
+
+    fn campaign_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route(
+                "/campaigns",
+                get(list_campaigns_route).post(create_campaign),
+            )
+            .route("/campaigns/:id/cancel", post(cancel_campaign))
+            .with_state(state)
+    }
+
+    fn campaign_call(
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+        token: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let body = body.map(|value| value.to_string()).unwrap_or_default();
+        let mut request = builder
+            .body(Body::from(body))
+            .expect("the request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 42_000))));
+        request
+    }
+
+    async fn create_campaign_call(
+        harness: &Harness,
+        body: Value,
+        token: Option<&str>,
+    ) -> (StatusCode, Value) {
+        call_json(
+            &campaign_router(harness.state.clone()),
+            campaign_call(Method::POST, "/campaigns", Some(body), token),
+        )
+        .await
+    }
+
+    async fn get_campaigns_call(
+        harness: &Harness,
+        query: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, Value) {
+        call_json(
+            &campaign_router(harness.state.clone()),
+            campaign_call(Method::GET, &format!("/campaigns?{query}"), None, token),
+        )
+        .await
+    }
+
+    fn one_company(entity_id: &str) -> Vec<(String, Value)> {
+        vec![company_doc(entity_id)]
+    }
+
+    #[tokio::test]
+    async fn campaign_unknown_app_is_404() {
+        let harness = harness(FakeTransport::accepting()).await;
+        let body = json!({
+            "app": "ghost",
+            "entity_id": "company-1",
+            "title": "Title",
+            "body": "Body",
+            "action": "open_company",
+            "audience": { "groups": [["users"]] }
+        });
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(body),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(text, "App 'ghost' not found in credentials folder.");
+    }
+
+    #[tokio::test]
+    async fn campaign_without_token_is_401() {
+        let harness = campaign_setup(
+            FakeTransport::accepting(),
+            one_company("company-1"),
+            campaigns_config(),
+        )
+        .await;
+
+        let (status, _) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn campaigns_disabled_is_404() {
+        let harness = harness(FakeTransport::accepting()).await;
+        let base = spawn_docs(one_company("company-1"), Vec::new()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        use_http_source(&harness, &base).await;
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(campaign_body("company-1", json!([["users"]]))),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(text, "Campaigns are not enabled");
+    }
+
+    #[tokio::test]
+    async fn campaign_role_not_in_senders_is_403() {
+        let harness = campaign_setup(
+            FakeTransport::accepting(),
+            one_company("company-1"),
+            campaigns_config(),
+        )
+        .await;
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(campaign_body("company-1", json!([["users"]]))),
+                Some(&jwt("user-1", "user")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(text, "Forbidden");
+    }
+
+    #[tokio::test]
+    async fn pending_company_is_forbidden() {
+        let docs = vec![(
+            "companies/company-1".to_string(),
+            campaign_entity("company-1", "pending"),
+        )];
+        let harness = campaign_setup(FakeTransport::accepting(), docs, campaigns_config()).await;
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(campaign_body("company-1", json!([["users"]]))),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(text, "Forbidden");
+    }
+
+    #[tokio::test]
+    async fn other_companys_entity_is_forbidden() {
+        let docs = vec![(
+            "companies/company-1".to_string(),
+            campaign_entity("company-2", "approved"),
+        )];
+        let harness = campaign_setup(FakeTransport::accepting(), docs, campaigns_config()).await;
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(campaign_body("company-1", json!([["users"]]))),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(text, "Forbidden");
+    }
+
+    #[tokio::test]
+    async fn blocked_entity_is_forbidden() {
+        let harness = campaign_setup(
+            FakeTransport::accepting(),
+            one_company("company-1"),
+            campaigns_config(),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO campaign_blocks (app, entity_id, reason, blocked_by) VALUES (?, ?, ?, ?)",
+        )
+        .bind(APP)
+        .bind("company-1")
+        .bind("test")
+        .bind("tester")
+        .execute(&harness.pool)
+        .await
+        .expect("the block must insert");
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(campaign_body("company-1", json!([["users"]]))),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(text, "Forbidden");
+    }
+
+    #[tokio::test]
+    async fn forbidden_responses_are_uniform() {
+        let pending = campaign_setup(
+            FakeTransport::accepting(),
+            vec![(
+                "companies/company-1".to_string(),
+                campaign_entity("company-1", "pending"),
+            )],
+            campaigns_config(),
+        )
+        .await;
+        let foreign = campaign_setup(
+            FakeTransport::accepting(),
+            vec![(
+                "companies/company-1".to_string(),
+                campaign_entity("company-2", "approved"),
+            )],
+            campaigns_config(),
+        )
+        .await;
+        let blocked = campaign_setup(
+            FakeTransport::accepting(),
+            one_company("company-1"),
+            campaigns_config(),
+        )
+        .await;
+        sqlx::query("INSERT INTO campaign_blocks (app, entity_id) VALUES (?, ?)")
+            .bind(APP)
+            .bind("company-1")
+            .execute(&blocked.pool)
+            .await
+            .expect("the block must insert");
+
+        let mut bodies = Vec::new();
+        for harness in [&pending, &foreign, &blocked] {
+            let (status, text) = call(
+                &campaign_router(harness.state.clone()),
+                campaign_call(
+                    Method::POST,
+                    "/campaigns",
+                    Some(campaign_body("company-1", json!([["users"]]))),
+                    Some(&jwt("company-1", "company")),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            bodies.push(text);
+        }
+        assert_eq!(bodies, vec!["Forbidden", "Forbidden", "Forbidden"]);
+    }
+
+    #[tokio::test]
+    async fn audience_with_admins_topic_is_400() {
+        let harness = campaign_setup(
+            FakeTransport::accepting(),
+            one_company("company-1"),
+            campaigns_config(),
+        )
+        .await;
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(campaign_body("company-1", json!([["admins"]]))),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(text, "topic not allowed");
+    }
+
+    #[tokio::test]
+    async fn five_topics_plus_promos_is_400() {
+        let harness = campaign_setup(
+            FakeTransport::accepting(),
+            one_company("company-1"),
+            campaigns_config(),
+        )
+        .await;
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(campaign_body(
+                    "company-1",
+                    json!([["country_iq", "users", "technicals", "lang_ar", "cat_x"]]),
+                )),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(text, "too many topics");
+    }
+
+    #[tokio::test]
+    async fn link_in_body_is_400() {
+        let harness = campaign_setup(
+            FakeTransport::accepting(),
+            one_company("company-1"),
+            campaigns_config(),
+        )
+        .await;
+        let mut body = campaign_body("company-1", json!([["users"]]));
+        body["body"] = json!("Visit https://example.com now");
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(body),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(text, "links are not allowed");
+    }
+
+    #[tokio::test]
+    async fn external_image_is_400() {
+        let harness = campaign_setup(
+            FakeTransport::accepting(),
+            one_company("company-1"),
+            campaigns_config(),
+        )
+        .await;
+        let mut body = campaign_body("company-1", json!([["users"]]));
+        body["image"] = json!("https://evil.example/x.png");
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(body),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(text, "image host is not allowed");
+    }
+
+    #[tokio::test]
+    async fn foreign_product_action_is_403() {
+        let docs = vec![
+            company_doc("company-1"),
+            (
+                "store_products/p1".to_string(),
+                json!({ "owner_id": "company-2", "status": "approved" }),
+            ),
+        ];
+        let harness = campaign_setup(FakeTransport::accepting(), docs, campaigns_config()).await;
+        let mut body = campaign_body("company-1", json!([["users"]]));
+        body["action"] = json!("open_product");
+        body["action_params"] = json!({ "product_id": "p1" });
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(body),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(text, "Forbidden");
+        assert_eq!(harness.fcm.message_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn action_check_foreign_product_is_forbidden() {
+        let docs = vec![
+            company_doc("company-1"),
+            (
+                "store_products/p1".to_string(),
+                json!({ "owner_id": "company-1", "status": "approved" }),
+            ),
+            (
+                "store_products/p2".to_string(),
+                json!({ "owner_id": "company-2", "status": "approved" }),
+            ),
+        ];
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "none" });
+        config["quota"] = json!({ "per_entity_per_day": 10, "per_entity_per_week": 50 });
+        let harness = campaign_setup(FakeTransport::accepting(), docs, config).await;
+        let token = jwt("company-1", "company");
+
+        let mut own = campaign_body("company-1", json!([["users"]]));
+        own["action"] = json!("open_product");
+        own["action_params"] = json!({ "product_id": "p1" });
+        let (own_status, own_body) = create_campaign_call(&harness, own, Some(&token)).await;
+        assert_eq!(own_status, StatusCode::CREATED);
+        assert_eq!(own_body["status"], "sent");
+
+        let mut foreign = campaign_body("company-1", json!([["users"]]));
+        foreign["action"] = json!("open_product");
+        foreign["action_params"] = json!({ "product_id": "p2" });
+        let (status, text) = call(
+            &campaign_router(harness.state.clone()),
+            campaign_call(Method::POST, "/campaigns", Some(foreign), Some(&token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(text, "Forbidden");
+        assert_eq!(harness.fcm.message_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn second_campaign_same_day_is_429_with_retry_after() {
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "none" });
+        let harness =
+            campaign_setup(FakeTransport::accepting(), one_company("company-1"), config).await;
+        let token = jwt("company-1", "company");
+
+        let (first_status, first) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::CREATED);
+        assert_eq!(first["status"], "sent");
+
+        let (second_status, second) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second["error"], "quota_exceeded");
+        assert!(
+            second["retry_after"]
+                .as_i64()
+                .is_some_and(|value| value >= 1),
+            "retry_after must be a positive integer: {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_three_campaigns_pending_review_fourth_sent() {
+        let mut config = campaigns_config();
+        config["quota"] = json!({ "per_entity_per_day": 10, "per_entity_per_week": 50 });
+        let harness =
+            campaign_setup(FakeTransport::accepting(), one_company("company-1"), config).await;
+        let token = jwt("company-1", "company");
+
+        let mut statuses = Vec::new();
+        for index in 0..3 {
+            let mut body = campaign_body("company-1", json!([["users"]]));
+            body["title"] = json!(format!("Sale {index}"));
+            let (status, response) = create_campaign_call(&harness, body, Some(&token)).await;
+            assert_eq!(status, StatusCode::CREATED);
+            statuses.push(response["status"].as_str().unwrap_or_default().to_string());
+        }
+
+        // The first three are reviewed. Approving them is T10's job; the test
+        // moves them to `sent` directly so the fourth can pass the review rule.
+        assert_eq!(
+            statuses,
+            vec!["pending_review", "pending_review", "pending_review"]
+        );
+        sqlx::query("UPDATE campaigns SET status = 'sent'")
+            .execute(&harness.pool)
+            .await
+            .expect("the approvals must apply");
+
+        let mut body = campaign_body("company-1", json!([["users"]]));
+        body["title"] = json!("Sale 3");
+        let (status, response) = create_campaign_call(&harness, body, Some(&token)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(response["status"], "sent");
+        assert_eq!(harness.fcm.message_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn service_key_skips_review() {
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "always" });
+        config["quota"] = json!({ "per_entity_per_day": 10, "per_entity_per_week": 50 });
+        let harness =
+            campaign_setup(FakeTransport::accepting(), one_company("company-1"), config).await;
+
+        let (status, body) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(SERVICE_KEY),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["status"], "sent");
+        assert_eq!(harness.fcm.message_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_key_cannot_create_campaign() {
+        let harness = campaign_setup(
+            FakeTransport::accepting(),
+            one_company("company-1"),
+            campaigns_config(),
+        )
+        .await;
+
+        let (status, _) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(LEGACY_KEY),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sent_campaign_calls_fcm_with_exact_condition() {
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "none" });
+        config["quota"] = json!({ "per_entity_per_day": 10, "per_entity_per_week": 50 });
+        let harness =
+            campaign_setup(FakeTransport::accepting(), one_company("company-1"), config).await;
+
+        let (status, response) = create_campaign_call(
+            &harness,
+            campaign_body(
+                "company-1",
+                json!([["country_iq"], ["technicals", "users"], ["lang_ar"]]),
+            ),
+            Some(&jwt("company-1", "company")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(response["status"], "sent");
+        let messages = harness.fcm.messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]["message"]["condition"],
+            "'promos' in topics && ('country_iq' in topics) && ('technicals' in topics || 'users' in topics) && ('lang_ar' in topics)"
+        );
+        assert!(messages[0]["message"].get("token").is_none());
+        assert!(messages[0]["message"].get("topic").is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_fcm_marks_campaign_failed() {
+        let fcm = FakeTransport::new(|_, _| {
+            Ok(FcmOutcome::Rejected {
+                http_status: 503,
+                body: "upstream".to_string(),
+                dead_token: false,
+            })
+        });
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "none" });
+        config["quota"] = json!({ "per_entity_per_day": 10, "per_entity_per_week": 50 });
+        let harness = campaign_setup(fcm, one_company("company-1"), config).await;
+
+        let (status, response) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(&jwt("company-1", "company")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(response["status"], "failed");
+        let stored: String = sqlx::query_scalar("SELECT status FROM campaigns WHERE id = ?")
+            .bind(response["id"].as_i64().expect("the id must be an integer"))
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the campaign must exist");
+        assert_eq!(stored, "failed");
+
+        let history: (String, String) =
+            sqlx::query_as("SELECT kind, status FROM notifications_history")
+                .fetch_one(&harness.pool)
+                .await
+                .expect("the history row must exist");
+        assert_eq!(history.0, "campaign");
+        assert_eq!(history.1, "failed");
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_ok_and_sent_is_409() {
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "always" });
+        let harness =
+            campaign_setup(FakeTransport::accepting(), one_company("company-1"), config).await;
+        let token = jwt("company-1", "company");
+
+        let (create_status, created) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::CREATED);
+        assert_eq!(created["status"], "pending_review");
+        let id = created["id"].as_i64().expect("the id must be an integer");
+
+        let (cancel_status, cancel) = call_json(
+            &campaign_router(harness.state.clone()),
+            campaign_call(
+                Method::POST,
+                &format!("/campaigns/{id}/cancel"),
+                Some(json!({ "app": APP })),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(cancel_status, StatusCode::OK);
+        assert_eq!(cancel, json!({ "status": "cancelled" }));
+
+        let (again_status, again) = call(
+            &campaign_router(harness.state.clone()),
+            campaign_call(
+                Method::POST,
+                &format!("/campaigns/{id}/cancel"),
+                Some(json!({ "app": APP })),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(again_status, StatusCode::CONFLICT);
+        assert_eq!(again, "Campaign is not pending review");
+
+        // A campaign that was sent cannot be cancelled either.
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "none" });
+        config["quota"] = json!({ "per_entity_per_day": 10, "per_entity_per_week": 50 });
+        save_section(&harness, "campaigns", config).await;
+        let (sent_status, sent) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(sent_status, StatusCode::CREATED);
+        assert_eq!(sent["status"], "sent");
+        let sent_id = sent["id"].as_i64().expect("the id must be an integer");
+
+        let (status, text) = call(
+            &campaign_router(harness.state.clone()),
+            campaign_call(
+                Method::POST,
+                &format!("/campaigns/{sent_id}/cancel"),
+                Some(json!({ "app": APP })),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(text, "Campaign is not pending review");
+    }
+
+    #[tokio::test]
+    async fn cancel_other_entity_is_404() {
+        let docs = vec![company_doc("company-1"), company_doc("company-2")];
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "always" });
+        let harness = campaign_setup(FakeTransport::accepting(), docs, config).await;
+
+        let (_, created) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(&jwt("company-1", "company")),
+        )
+        .await;
+        let id = created["id"].as_i64().expect("the id must be an integer");
+
+        let (status, text) = call(
+            &campaign_router(harness.state.clone()),
+            campaign_call(
+                Method::POST,
+                &format!("/campaigns/{id}/cancel"),
+                Some(json!({ "app": APP })),
+                Some(&jwt("company-2", "company")),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(text, "Campaign not found");
+
+        let (missing_status, missing) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns/999999/cancel",
+                Some(json!({ "app": APP })),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        assert_eq!(missing, text);
+    }
+
+    #[tokio::test]
+    async fn list_returns_only_own_campaigns_without_internals() {
+        let docs = vec![company_doc("company-1"), company_doc("company-2")];
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "always" });
+        config["quota"] = json!({ "per_entity_per_day": 10, "per_entity_per_week": 50 });
+        let harness = campaign_setup(FakeTransport::accepting(), docs, config).await;
+
+        for entity_id in ["company-1", "company-2"] {
+            let token = jwt(entity_id, "company");
+            let (status, _) = create_campaign_call(
+                &harness,
+                campaign_body(entity_id, json!([["users"]])),
+                Some(&token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let token = jwt("company-1", "company");
+        let (status, list) =
+            get_campaigns_call(&harness, "app=testapp&entity_id=company-1", Some(&token)).await;
+        assert_eq!(status, StatusCode::OK);
+        let items = list.as_array().expect("the list must be an array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["title"], "Acme: Weekend sale");
+        assert!(items[0].get("condition").is_none());
+        assert!(items[0].get("fcm_response").is_none());
+
+        let (missing_status, text) = call(
+            &campaign_router(harness.state.clone()),
+            campaign_call(Method::GET, "/campaigns?app=testapp", None, Some(&token)),
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::BAD_REQUEST);
+        assert_eq!(text, "entity_id is required");
+    }
+
+    #[tokio::test]
+    async fn campaign_history_row_has_kind_and_ref() {
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "none" });
+        config["quota"] = json!({ "per_entity_per_day": 10, "per_entity_per_week": 50 });
+        let harness =
+            campaign_setup(FakeTransport::accepting(), one_company("company-1"), config).await;
+
+        let (status, created) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(&jwt("company-1", "company")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = created["id"].as_i64().expect("the id must be an integer");
+
+        let row: (String, String, String, String, String) = sqlx::query_as(
+            "SELECT kind, \"ref\", target, sender_uid, status FROM notifications_history",
+        )
+        .fetch_one(&harness.pool)
+        .await
+        .expect("the history row must exist");
+        assert_eq!(row.0, "campaign");
+        assert_eq!(row.1, id.to_string());
+        assert_eq!(row.2, "condition");
+        assert_eq!(row.3, "company-1");
+        assert_eq!(row.4, "success");
+    }
+
+    #[tokio::test]
+    async fn campaign_source_unavailable_is_503() {
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        use_http_source(&harness, "http://127.0.0.1:1").await;
+        save_section(&harness, "campaigns", campaigns_config()).await;
+
+        let (status, text) = call(
+            &campaign_router(harness.state),
+            campaign_call(
+                Method::POST,
+                "/campaigns",
+                Some(campaign_body("company-1", json!([["users"]]))),
+                Some(&jwt("company-1", "company")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(text, "the data source is unavailable");
+    }
+
+    #[tokio::test]
+    async fn campaign_works_with_jwt_identity_and_http_source() {
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "none" });
+        config["quota"] = json!({ "per_entity_per_day": 10, "per_entity_per_week": 50 });
+        let harness =
+            campaign_setup(FakeTransport::accepting(), one_company("company-1"), config).await;
+
+        let (status, body) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(&jwt("company-1", "company")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["status"], "sent");
+        let messages = harness.fcm.messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]["message"]["notification"]["title"],
+            "Acme: Weekend sale"
+        );
+        assert!(messages[0]["message"]["condition"]
+            .as_str()
+            .is_some_and(|condition| condition.contains("'promos' in topics")));
+    }
+
+    #[tokio::test]
+    async fn injection_in_title_cannot_alter_condition() {
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "always" });
+        let harness =
+            campaign_setup(FakeTransport::accepting(), one_company("company-1"), config).await;
+        let mut body = campaign_body("company-1", json!([["users"]]));
+        body["title"] = json!("x' in topics || 'admins");
+
+        let (status, created) =
+            create_campaign_call(&harness, body, Some(&jwt("company-1", "company"))).await;
+
+        // The title is text, not part of the condition grammar: it is stored in
+        // the campaign but can never change the audience.
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["status"], "pending_review");
+        let condition: String = sqlx::query_scalar("SELECT condition FROM campaigns WHERE id = ?")
+            .bind(created["id"].as_i64().expect("the id must be an integer"))
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the campaign must exist");
+        assert_eq!(condition, "'promos' in topics && ('users' in topics)");
+        assert_eq!(harness.fcm.message_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn injection_in_audience_topic_cannot_alter_condition() {
+        let harness = campaign_setup(
+            FakeTransport::accepting(),
+            one_company("company-1"),
+            campaigns_config(),
+        )
+        .await;
+
+        for payload in ["x' in topics || 'admins", "a') || ('b"] {
+            let (status, text) = call(
+                &campaign_router(harness.state.clone()),
+                campaign_call(
+                    Method::POST,
+                    "/campaigns",
+                    Some(campaign_body("company-1", json!([[payload]]))),
+                    Some(&jwt("company-1", "company")),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(text, "topic not allowed");
+        }
+        assert_eq!(harness.fcm.message_count(), 0);
     }
 }

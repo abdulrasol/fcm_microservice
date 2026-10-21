@@ -582,7 +582,6 @@ pub struct Campaign {
     pub condition: String,
     pub status: String,
     pub review_note: Option<String>,
-    pub fcm_response: Option<String>,
     pub created_at: String,
     pub sent_at: Option<String>,
 }
@@ -601,7 +600,6 @@ fn campaign_from_row(row: SqliteRow) -> Campaign {
         condition: row.get("condition"),
         status: row.get("status"),
         review_note: row.get("review_note"),
-        fcm_response: row.get("fcm_response"),
         created_at: row.get("created_at"),
         sent_at: row.get("sent_at"),
     }
@@ -756,6 +754,10 @@ pub async fn list_campaigns(
 }
 
 /// Moves a campaign from `pending_review` to `sending` exactly once.
+///
+/// T9 creates campaigns that already need no review; the T10 approve route uses
+/// this to claim a pending campaign.
+#[allow(dead_code)]
 pub async fn claim_for_sending(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE campaigns SET status = 'sending' WHERE id = ? AND status = 'pending_review'",

@@ -48,6 +48,23 @@ impl ValidatedParams {
     }
 }
 
+/// The parameter source of a [`Renderer`]: a validated template map or the
+/// plain map of a standalone snippet (T9).
+#[derive(Clone, Copy)]
+enum Params<'a> {
+    Validated(&'a ValidatedParams),
+    Plain(&'a BTreeMap<String, String>),
+}
+
+impl<'a> Params<'a> {
+    fn get(&self, name: &str) -> Option<&'a str> {
+        match self {
+            Params::Validated(params) => params.get(name),
+            Params::Plain(params) => params.get(name).map(String::as_str),
+        }
+    }
+}
+
 /// Why rendering failed. `Forbidden` is deliberately uniform (plan 3.6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderError {
@@ -268,7 +285,7 @@ pub fn render_snippet(
 ) -> Result<String, RenderError> {
     let mut renderer = Renderer {
         template: None,
-        params: ctx.params,
+        params: Params::Plain(ctx.params),
         sender: ctx.sender,
         doc: ctx.doc,
         entity: ctx.entity,
@@ -319,7 +336,7 @@ pub fn context_path(
     };
     let mut renderer = Renderer {
         template: Some(template),
-        params: &params.0,
+        params: Params::Validated(params),
         sender,
         doc: None,
         entity: None,
@@ -344,7 +361,7 @@ pub fn render(
 ) -> Result<Rendered, RenderError> {
     let mut renderer = Renderer {
         template: Some(template),
-        params: &params.0,
+        params: Params::Validated(params),
         sender,
         doc,
         entity,
@@ -479,7 +496,7 @@ enum Mode {
 
 struct Renderer<'a> {
     template: Option<&'a Template>,
-    params: &'a BTreeMap<String, String>,
+    params: Params<'a>,
     sender: &'a Sender,
     doc: Option<&'a Value>,
     entity: Option<&'a Value>,
