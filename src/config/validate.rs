@@ -547,6 +547,21 @@ pub fn validate_template(key: &str, template: &Template, cfg: &AppConfig) -> Vec
                 template,
                 &mut issues,
             );
+            // [T10] A `require` guard is compared after rendering, so it may
+            // only read parameters and sender fields. A document or `vars`
+            // reference would compare against data the guard is meant to
+            // protect, or against a value that is not available yet.
+            if let Ok(found) = placeholder::extract(value) {
+                if found
+                    .iter()
+                    .any(|item| !matches!(item.r, Ref::Param(_) | Ref::Sender(_)))
+                {
+                    issues.push(Issue::new(
+                        format!("{}.context.require.{}", base, key),
+                        "[T3] require values may only use '{p.*}' and '{sender.*}'".to_string(),
+                    ));
+                }
+            }
         }
     }
     if let Some(dedupe) = &template.dedupe {
@@ -1052,6 +1067,19 @@ fn validate_campaigns(cfg: &AppConfig, issues: &mut Vec<Issue>) {
         if let Some(check) = &action.check {
             let path = format!("campaigns.content.actions.{}.check", name);
             check_campaign_placeholders(&check.doc, &path, &allowed, "C5", issues);
+            // [T10] A `require` guard is compared against the document after
+            // rendering, so it may only read parameters and sender fields. A
+            // document reference would compare the document with itself and
+            // the guard would always pass.
+            for (key, value) in &check.require {
+                check_campaign_placeholders(
+                    value,
+                    &format!("{}.require.{}", path, key),
+                    &allowed,
+                    "C5",
+                    issues,
+                );
+            }
             if !check
                 .require
                 .values()
@@ -1594,6 +1622,92 @@ mod tests {
         let issues = validate_template("t", &template, &example_config());
         assert!(
             has_code(&issues, "[G4]"),
+            "issues: {:?}",
+            issue_codes(&issues)
+        );
+    }
+
+    fn require_template(require: BTreeMap<String, String>) -> Template {
+        Template {
+            description: "t".to_string(),
+            enabled: true,
+            senders: vec!["admin".to_string()],
+            params: BTreeMap::new(),
+            context: Some(crate::config::Context {
+                doc: "users/{sender.uid}".to_string(),
+                require,
+            }),
+            vars: BTreeMap::new(),
+            to: Target::Role("admin".to_string()),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            image: None,
+            data: BTreeMap::new(),
+            dedupe: None,
+            rate: None,
+        }
+    }
+
+    /// The `open_product` action of the example configuration with one extra
+    /// `require` entry in its action check.
+    fn example_check_require(value: &str) -> Vec<Issue> {
+        let (mut config, templates) = example_parts();
+        let action = config
+            .campaigns
+            .content
+            .actions
+            .get_mut("open_product")
+            .expect("the example has the open_product action");
+        let check = action.check.as_mut().expect("the example has a check");
+        check.require.insert("extra".to_string(), value.to_string());
+        validate_all(&config, &templates)
+    }
+
+    #[test]
+    fn require_rejects_var_reference() {
+        let mut require = BTreeMap::new();
+        require.insert("uid".to_string(), "{sender.uid}".to_string());
+        require.insert("level".to_string(), "{level}".to_string());
+        let issues = validate_template("t", &require_template(require), &example_config());
+        assert!(
+            issues.iter().any(|issue| {
+                issue.path == "templates.t.context.require.level"
+                    && issue.message.contains("may only use")
+            }),
+            "issues: {:?}",
+            issue_codes(&issues)
+        );
+
+        let issues = example_check_require("{level}");
+        assert!(
+            issues.iter().any(|issue| {
+                issue.path == "campaigns.content.actions.open_product.check.require.extra"
+            }),
+            "issues: {:?}",
+            issue_codes(&issues)
+        );
+    }
+
+    #[test]
+    fn require_rejects_doc_reference() {
+        let mut require = BTreeMap::new();
+        require.insert("uid".to_string(), "{sender.uid}".to_string());
+        require.insert("owner".to_string(), "{doc.owner_id}".to_string());
+        let issues = validate_template("t", &require_template(require), &example_config());
+        assert!(
+            issues.iter().any(|issue| {
+                issue.path == "templates.t.context.require.owner"
+                    && issue.message.contains("may only use")
+            }),
+            "issues: {:?}",
+            issue_codes(&issues)
+        );
+
+        let issues = example_check_require("{doc.owner_id}");
+        assert!(
+            issues.iter().any(|issue| {
+                issue.path == "campaigns.content.actions.open_product.check.require.extra"
+            }),
             "issues: {:?}",
             issue_codes(&issues)
         );
