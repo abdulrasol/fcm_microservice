@@ -310,14 +310,20 @@
 
 | الطلب من الأداة | الرد المتوقع |
 |---|---|
-| `GET {base}/doc?path=store_orders/abc123` | `200 {"buyer_id": "...", "seller_id": "...", "order_number": 42, ...}` أو `404` |
-| `GET {base}/members?field=role&value=admin&limit=50` | `200 {"uids": ["u1", "u2"]}` |
+| `GET {base}/doc?path=<percent-encoded full path>` | `200` + كائن JSON (الوثيقة) أو `404` |
+| `GET {base}/members?collection=<c>&field=<f>&value=<v>&limit=<n>` | `200 {"uids": ["u1", "u2"]}` |
 
-- الطلبات موقعة: `Authorization: Bearer <secret>` + `X-FCM-Timestamp` + `X-FCM-Signature = HMAC-SHA256(secret, method|path|query|timestamp)`،
-  والباك إند يرفض توقيعاً أقدم من 60ث.
-- رد غير 200/404، أو مهلة ⇐ **503** (fail-closed). الأداة لا تخزن ردود `doc` مؤقتاً.
+- المسار يُرمَّز كقيمة واحدة (percent-encoding بحروف hex كبيرة)، فيصير `store_orders/abc123` هو `store_orders%2Fabc123`. ترتيب معاملات الاستعلام ثابت كما في الجدول أعلاه.
+- الطلبات موقعة **بلا Bearer** (السر لا يُرسَل أبداً): ترويسات `X-FCM-Timestamp` (ثواني UNIX) و`X-FCM-Signature` = hex صغير لـ `HMAC-SHA256(secret, canonical)` حيث
+  `canonical = "GET" + "\n" + <مسار URL كما أُرسل، مثل /internal/fcm/doc> + "\n" + <نص الاستعلام الخام كما أُرسل> + "\n" + <timestamp>`.
+  الباك إند يرفض انحراف الوقت > 60ث أو توقيعاً غير مطابق، ويجب أن يحافظ الـ reverse proxy على المسار كما أُرسل (لا يعيد كتابة prefix).
+- السر من متغير البيئة المسمّى في `secret_env` (32 بايتاً على الأقل)، ولا يُسجَّل ولا يُرسَل.
+- رد غير 200/404، أو مهلة ⇐ **503** (fail-closed). الأداة لا تخزن ردود `doc` مؤقتاً. `404` في `members` خطأ لا فراغ.
 - الحقول تُعامل كنصوص/أرقام/منطقيات. الكائنات المتداخلة تُقرأ بمسار نقطي (`{doc.buyer.name}`).
-- **مثال جاهز:** `examples/resolver_fastapi.py` (FastAPI، ~60 سطر) يتحقق من التوقيع ويقرأ من قاعدة بياناته.
+- **متجه الاختبار** (ثابت حرفياً في اختبارات Rust وفي المثال و`examples/README.md`):
+  secret = `test-secret-test-secret-test-secret-00`، path = `/internal/fcm/doc`، query = `path=store_orders%2Fabc123`، timestamp = `1700000000`
+  ⇒ التوقيع = `f97974c3e1b1706c53e625f9f6b324adab12a0143af3348757cc311771f20813`.
+- **مثال جاهز:** `examples/resolver_fastapi.py` (FastAPI، ~100 سطر) + `examples/README.md`، و`--selftest` يتحقق من متجه الاختبار بمكتبة Python القياسية.
 
 **مصدر الدور** (`identity.role.source`): `claim` (من التوكن، مثل `"claim": "app_metadata.role"`) أو `data_source` (وثيقة + حقل).
 
@@ -724,6 +730,7 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
   - مرجع إعدادات القوالب والحواجز.
   - النسخ الاحتياطي لـ `data.db`.
   - الـ reverse proxy يجب أن يرسل `X-Forwarded-Proto` وإلا أضف الأصل إلى `CORS_ALLOWED_ORIGINS` (فحص CSRF في الداشبورد).
+  - اجعل الباك إند يضيف `iat` في كل توكن، وإلا لا يُطبَّق `max_age_seconds`.
 - **طريقة الفحص:** تجاوز الحد ⇐ 429. كل مسار في الـ Router موثق. اتباع `jwt-fastapi.md` حرفياً على مشروع تجريبي ينجح.
 
 ### T14 — App Check (اختياري)
@@ -866,4 +873,5 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
 | 2026-10-21 | الخطة (المراجعة 2.1) | ✅ | رفع service account وإضافة تطبيق من الداشبورد (3.13، T16، D12) |
 | 2026-10-21 | T1 — مخزن الإعدادات والقوالب | ✅ | النماذج + التحقق + SQLite (إصدارات وسجل) + استيراد/تصدير + أمرا CLI. DDL: `app_configs` صار فيه `version` |
 | 2026-10-21 | T2 — حسابات الداشبورد والجلسات | 🔄 بانتظار المراجعة | T2-0: قفل كتابات `ConfigStore` + حفظ `last_used_at` + حاجز `[G6]` + إنجليزية `src/`. T2: `tool_users`/`tool_user_apps`/`tool_sessions` (أوقات INTEGER epoch) + argon2id + كوكي `__Host-` + CSRF + `create-owner`/`reset-owner-password`. 118 اختباراً ناجحاً |
-| 2026-10-21 | T3 — مزودات الهوية | 🔄 بانتظار المراجعة | نقل JWKS/Firebase من `auth.rs` إلى `src/identity/` بلا تغيير سلوك (خط `auth.rs`: −270/+33) + مزود JWT عام (JWKS أو HS256 من البيئة، خوارزمية مثبتة، claims نقطية) + سجل يبني مزوداً لكل `(تطبيق، إصدار إعداد)` بلا ربط بالإرسال. T3-0: إصدارات القوالب متصاعدة عند الاستيراد. 152 اختباراً ناجحاً. البند الوحيد غير المنفَّذ: حقل `identity` في `AppState` (تعارض مع منع تعديل `src/admin/**`) — §5/§6 في التقرير |
+| 2026-10-21 | T3 — مزودات الهوية | ✅ | نقل JWKS/Firebase من `auth.rs` إلى `src/identity/` بلا تغيير سلوك (خط `auth.rs`: −270/+33) + مزود JWT عام (JWKS أو HS256 من البيئة، خوارزمية مثبتة، claims نقطية) + سجل يبني مزوداً لكل `(تطبيق، إصدار إعداد)` بلا ربط بالإرسال. T3-0: إصدارات القوالب متصاعدة عند الاستيراد. 152 اختباراً ناجحاً. قرار المالك: حقلا `identity` و`datasource` في `AppState` يُضافان في T5 مع السماح بتعديل سطر واحد في `test_state()` داخل `src/admin/mod.rs` |
+| 2026-10-21 | T4 — مصادر البيانات | 🔄 بانتظار المراجعة | واجهة `DataSource` (`get_doc`/`members`) + تحقق المسارات/المجموعات/الحقول/القيم والترميز + مصدر Firestore معمَّم (تحويل القيم، `runQuery`، سقف 1MB وعمق 8) + resolver HTTP موقّع HMAC-SHA256 بلا Bearer + مثال FastAPI و`--selftest` + سجل لكل `(تطبيق، إصدار)` بلا إضافة إلى `AppState` وبلا ربط بالمسارات. 187 اختباراً ناجحاً (35 جديداً). التقرير: `docs/plans/reports/T4-report.md` |
