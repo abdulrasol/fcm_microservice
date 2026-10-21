@@ -1262,6 +1262,201 @@ pub async fn device_stats(pool: &SqlitePool, app: &str) -> Result<DeviceStats, s
     })
 }
 
+// ---------- T10-C: dashboard accounts ----------
+
+/// One dashboard account. The password hash is never part of it.
+pub struct ToolAccount {
+    pub id: i64,
+    pub email: String,
+    pub role: String,
+    pub apps: Vec<String>,
+    pub disabled: bool,
+    pub must_change_password: bool,
+    pub test_uid: Option<String>,
+    pub created_at: String,
+}
+
+/// The app bindings of one account.
+async fn load_account_apps(pool: &SqlitePool, user_id: i64) -> Result<Vec<String>, sqlx::Error> {
+    let apps: Vec<String> =
+        sqlx::query_scalar("SELECT app FROM tool_user_apps WHERE user_id = ? ORDER BY app")
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(apps)
+}
+
+/// Lists the dashboard accounts, oldest first.
+pub async fn list_accounts(pool: &SqlitePool) -> Result<Vec<ToolAccount>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, email, role, disabled, must_change_password, test_uid, created_at \
+         FROM tool_users ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut accounts = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i64 = row.get("id");
+        accounts.push(ToolAccount {
+            id,
+            email: row.get("email"),
+            role: row.get("role"),
+            apps: load_account_apps(pool, id).await?,
+            disabled: row.get::<i64, _>("disabled") != 0,
+            must_change_password: row.get::<i64, _>("must_change_password") != 0,
+            test_uid: row.get("test_uid"),
+            created_at: row.get("created_at"),
+        });
+    }
+    Ok(accounts)
+}
+
+/// One account by id, without the password hash.
+pub async fn get_account(pool: &SqlitePool, id: i64) -> Result<Option<ToolAccount>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, email, role, disabled, must_change_password, test_uid, created_at \
+         FROM tool_users WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id: i64 = row.get("id");
+    Ok(Some(ToolAccount {
+        id,
+        email: row.get("email"),
+        role: row.get("role"),
+        apps: load_account_apps(pool, id).await?,
+        disabled: row.get::<i64, _>("disabled") != 0,
+        must_change_password: row.get::<i64, _>("must_change_password") != 0,
+        test_uid: row.get("test_uid"),
+        created_at: row.get("created_at"),
+    }))
+}
+
+/// Is an account with this email stored? The comparison ignores the case.
+pub async fn account_exists(pool: &SqlitePool, email: &str) -> Result<bool, sqlx::Error> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tool_users WHERE email = ?")
+        .bind(email)
+        .fetch_one(pool)
+        .await?;
+    Ok(count > 0)
+}
+
+/// Inserts a manager account with its app bindings in one transaction.
+pub async fn insert_account(
+    pool: &SqlitePool,
+    email: &str,
+    password_hash: &str,
+    apps: &[String],
+) -> Result<i64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let result = sqlx::query(
+        "INSERT INTO tool_users (email, password_hash, role, must_change_password) \
+         VALUES (?, ?, 'manager', 1)",
+    )
+    .bind(email)
+    .bind(password_hash)
+    .execute(&mut *tx)
+    .await?;
+    let id = result.last_insert_rowid();
+    for app in apps {
+        sqlx::query("INSERT INTO tool_user_apps (user_id, app) VALUES (?, ?)")
+            .bind(id)
+            .bind(app)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Replaces the app bindings of one account in one transaction.
+pub async fn replace_account_apps(
+    pool: &SqlitePool,
+    user_id: i64,
+    apps: &[String],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM tool_user_apps WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    for app in apps {
+        sqlx::query("INSERT INTO tool_user_apps (user_id, app) VALUES (?, ?)")
+            .bind(user_id)
+            .bind(app)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Deletes every session of one account.
+pub async fn delete_account_sessions(pool: &SqlitePool, user_id: i64) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM tool_sessions WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Sets the password hash of one account and asks for a new password.
+pub async fn set_account_password(
+    pool: &SqlitePool,
+    user_id: i64,
+    password_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE tool_users SET password_hash = ?, must_change_password = 1 WHERE id = ?")
+        .bind(password_hash)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Enables or disables one account.
+pub async fn set_account_disabled(
+    pool: &SqlitePool,
+    user_id: i64,
+    disabled: bool,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE tool_users SET disabled = ? WHERE id = ?")
+        .bind(i64::from(disabled))
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Sets the test uid of one account. `None` clears it.
+pub async fn set_account_test_uid(
+    pool: &SqlitePool,
+    user_id: i64,
+    test_uid: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE tool_users SET test_uid = ? WHERE id = ?")
+        .bind(test_uid)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Deletes one account. The sessions and the app bindings cascade.
+pub async fn delete_account(pool: &SqlitePool, user_id: i64) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM tool_users WHERE id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

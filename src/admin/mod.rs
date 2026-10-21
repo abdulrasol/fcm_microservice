@@ -11,6 +11,7 @@ pub mod history;
 pub mod password;
 pub mod session;
 pub mod templates;
+pub mod users;
 
 use crate::config::store::ConfigError;
 use crate::config::validate::Issue;
@@ -483,6 +484,17 @@ pub(crate) fn admin_routes() -> Vec<AdminRoute> {
             true,
             get(history::device_stats),
         ),
+        ("GET", "/users", true, get(users::list_users)),
+        ("POST", "/users", true, post(users::create_user)),
+        ("PUT", "/users/:id", true, put(users::update_user)),
+        (
+            "POST",
+            "/users/:id/reset-password",
+            true,
+            post(users::reset_password),
+        ),
+        ("DELETE", "/users/:id", true, delete(users::delete_user)),
+        ("PUT", "/auth/test-uid", true, put(auth::set_test_uid)),
     ]
 }
 
@@ -1583,6 +1595,21 @@ pub(crate) mod tests {
         token: Option<&str>,
         csrf: bool,
     ) -> (StatusCode, serde_json::Value) {
+        let response = call_raw(router, method, uri, body, token, csrf).await;
+        let status = response.status();
+        let body = read_json(response).await;
+        (status, body)
+    }
+
+    /// Sends a request and returns the whole response, headers included.
+    pub(crate) async fn call_raw(
+        router: &Router,
+        method: Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        token: Option<&str>,
+        csrf: bool,
+    ) -> Response {
         let mut builder = Request::builder().method(method).uri(uri);
         if csrf {
             builder = builder.header("x-requested-with", CSRF_HEADER_VALUE);
@@ -1604,14 +1631,11 @@ pub(crate) mod tests {
         request
             .extensions_mut()
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
-        let response = router
+        router
             .clone()
             .oneshot(request)
             .await
-            .expect("the request must run");
-        let status = response.status();
-        let body = read_json(response).await;
-        (status, body)
+            .expect("the request must run")
     }
 
     /// A minimal admin-only template that passes the validators.
@@ -1732,6 +1756,16 @@ pub(crate) mod tests {
             .call(Method::GET, &format!("/apps/{}/export", APP), None)
             .await;
 
+        // The account routes act on a manager, so one is created first.
+        let (_, created) = harness
+            .call(
+                Method::POST,
+                "/users",
+                Some(json!({ "email": "matrix@example.com", "apps": [APP] })),
+            )
+            .await;
+        let manager_id = created["id"].as_i64().expect("an id");
+
         let mut cases: Vec<MatrixCase> = vec![
             MatrixCase::new(
                 Method::POST,
@@ -1832,6 +1866,35 @@ pub(crate) mod tests {
                 Some(json!({ "title": "Matrix", "topic": "news" })),
             ),
             MatrixCase::new(Method::GET, "/apps/:app/devices/stats", None),
+            MatrixCase::new(Method::GET, "/users", None),
+            MatrixCase::new(
+                Method::POST,
+                "/users",
+                Some(json!({ "email": "matrix2@example.com", "apps": [APP] })),
+            ),
+            MatrixCase::at(
+                Method::PUT,
+                "/users/:id",
+                format!("/users/{}", manager_id),
+                Some(json!({ "apps": [APP] })),
+            ),
+            MatrixCase::at(
+                Method::POST,
+                "/users/:id/reset-password",
+                format!("/users/{}/reset-password", manager_id),
+                None,
+            ),
+            MatrixCase::at(
+                Method::DELETE,
+                "/users/:id",
+                format!("/users/{}", manager_id),
+                None,
+            ),
+            MatrixCase::new(
+                Method::PUT,
+                "/auth/test-uid",
+                Some(json!({ "test_uid": "matrix-user" })),
+            ),
         ];
         for section in [
             "identity",
@@ -1932,6 +1995,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn matrix_covers_new_routes() {
         let harness = setup("owner", &[]).await;
+        harness.reauth().await;
         let cases = owner_matrix_cases(&harness).await;
         let (registered, covered) = matrix_coverage(&cases);
         assert_eq!(

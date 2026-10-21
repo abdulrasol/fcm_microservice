@@ -482,6 +482,43 @@ pub async fn change_password(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// The body of the test uid update. It never names a user.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestUidRequest {
+    pub test_uid: Option<String>,
+}
+
+/// `PUT /auth/test-uid`: the test uid of the calling account.
+///
+/// The account of the session is the only one that can change, so the body
+/// carries no user id. The value is validated like a uid and never audited.
+pub async fn set_test_uid(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    AdminJson(request): AdminJson<TestUidRequest>,
+) -> Result<Json<Value>, AdminError> {
+    let value = match &request.test_uid {
+        Some(uid) => {
+            if !crate::identity::is_valid_uid(uid) {
+                return Err(AdminError::invalid_request("the test uid is not valid"));
+            }
+            Some(uid.clone())
+        }
+        None => None,
+    };
+    super::users::check_write_limit(&state, &user)?;
+
+    db::set_account_test_uid(&state.db, user.user_id, value.as_deref())
+        .await
+        .map_err(|error| AdminError::from_db("update the test uid", error))?;
+
+    let detail = json!({ "set": value.is_some() }).to_string();
+    let _ = db::write_audit(&state.db, &user.email, None, "user.test_uid", &detail).await;
+
+    Ok(Json(json!({ "test_uid": value })))
+}
+
 /// `POST /auth/reauth`: records a fresh password confirmation for the session.
 pub async fn reauth(
     State(state): State<Arc<AppState>>,
