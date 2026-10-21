@@ -360,6 +360,15 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/apps/:app/templates/:key/test-send",
             post(templates::test_send),
         )
+        .route("/apps/:app/versions", get(apps::list_versions))
+        .route("/apps/:app/versions/:id", get(apps::get_version))
+        .route(
+            "/apps/:app/versions/:id/restore",
+            post(apps::restore_version),
+        )
+        .route("/apps/:app/export", get(apps::export))
+        .route("/apps/:app/import", post(apps::import))
+        .route("/audit", get(apps::audit))
         .layer(axum::middleware::from_fn_with_state(state, csrf_guard))
 }
 
@@ -1479,4 +1488,380 @@ pub(crate) mod tests {
         })
     }
 
+    /// Every route that requires a dashboard session.
+    fn protected_routes() -> Vec<(Method, String)> {
+        let mut routes = vec![
+            (Method::GET, "/auth/me".to_string()),
+            (Method::POST, "/auth/password".to_string()),
+            (Method::POST, "/auth/reauth".to_string()),
+            (Method::GET, "/apps".to_string()),
+            (Method::GET, format!("/apps/{}", APP)),
+            (Method::POST, format!("/apps/{}/init", APP)),
+            (Method::GET, format!("/apps/{}/templates", APP)),
+            (Method::POST, format!("/apps/{}/templates", APP)),
+            (Method::POST, format!("/apps/{}/templates/validate", APP)),
+            (Method::GET, format!("/apps/{}/templates/sample", APP)),
+            (Method::PUT, format!("/apps/{}/templates/sample", APP)),
+            (Method::DELETE, format!("/apps/{}/templates/sample", APP)),
+            (
+                Method::PUT,
+                format!("/apps/{}/templates/sample/enabled", APP),
+            ),
+            (
+                Method::POST,
+                format!("/apps/{}/templates/sample/preview", APP),
+            ),
+            (
+                Method::POST,
+                format!("/apps/{}/templates/sample/test-send", APP),
+            ),
+            (Method::GET, format!("/apps/{}/versions", APP)),
+            (Method::GET, format!("/apps/{}/versions/1", APP)),
+            (Method::POST, format!("/apps/{}/versions/1/restore", APP)),
+            (Method::GET, format!("/apps/{}/export", APP)),
+            (Method::POST, format!("/apps/{}/import", APP)),
+            (Method::GET, "/audit".to_string()),
+        ];
+        for section in [
+            "identity",
+            "data_source",
+            "devices",
+            "web_subscribe",
+            "campaigns",
+            "app_check",
+        ] {
+            routes.push((Method::PUT, format!("/apps/{}/{}", APP, section)));
+        }
+        routes
+    }
+
+    fn section_value(harness: &Harness, section: &str) -> serde_json::Value {
+        let snapshot = harness.state.config.get(APP).expect("the app exists");
+        match section {
+            "identity" => serde_json::to_value(&snapshot.config.identity),
+            "data_source" => serde_json::to_value(&snapshot.config.data_source),
+            "devices" => serde_json::to_value(&snapshot.config.devices),
+            "web_subscribe" => serde_json::to_value(&snapshot.config.web_subscribe),
+            "campaigns" => serde_json::to_value(&snapshot.config.campaigns),
+            "app_check" => serde_json::to_value(&snapshot.config.app_check),
+            other => panic!("unknown section {}", other),
+        }
+        .expect("the section must serialize")
+    }
+
+    #[tokio::test]
+    async fn matrix_unauthenticated_is_401_on_every_route() {
+        let harness = setup("owner", &[]).await;
+        for (method, uri) in protected_routes() {
+            let (status, body) =
+                call(&harness.router, method.clone(), &uri, None, None, true).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{} {} returned {} ({})",
+                method,
+                uri,
+                status,
+                body
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_owner_can_reach_every_route() {
+        let harness = setup("owner", &[]).await;
+        harness.reauth().await;
+        harness.set_test_uid("tester").await;
+        harness
+            .register_device("tester", "token-tester-1-0000000000000000000000000000")
+            .await;
+        harness.save_template("sample", sample_template()).await;
+        let (_, document) = harness
+            .call(Method::GET, &format!("/apps/{}/export", APP), None)
+            .await;
+
+        let mut routes: Vec<(Method, String, Option<serde_json::Value>)> = vec![
+            (Method::GET, "/apps".to_string(), None),
+            (Method::GET, format!("/apps/{}", APP), None),
+            (Method::POST, format!("/apps/{}/init", APP), Some(json!({}))),
+            (Method::GET, format!("/apps/{}/templates", APP), None),
+            (
+                Method::POST,
+                format!("/apps/{}/templates", APP),
+                Some(json!({ "key": "matrix_new", "definition": sample_template() })),
+            ),
+            (
+                Method::POST,
+                format!("/apps/{}/templates/validate", APP),
+                Some(json!({ "definition": sample_template() })),
+            ),
+            (Method::GET, format!("/apps/{}/templates/sample", APP), None),
+            (
+                Method::PUT,
+                format!("/apps/{}/templates/sample", APP),
+                Some(json!({ "definition": sample_template(), "expected_version": 1 })),
+            ),
+            (
+                Method::PUT,
+                format!("/apps/{}/templates/sample/enabled", APP),
+                Some(json!({ "enabled": true })),
+            ),
+            (
+                Method::POST,
+                format!("/apps/{}/templates/sample/preview", APP),
+                Some(json!({ "params": {}, "sender": { "uid": "u1" } })),
+            ),
+            (
+                Method::POST,
+                format!("/apps/{}/templates/sample/test-send", APP),
+                Some(json!({ "params": {}, "sender": { "uid": "u1" } })),
+            ),
+            (Method::GET, format!("/apps/{}/versions", APP), None),
+            (Method::GET, format!("/apps/{}/versions/1", APP), None),
+            (
+                Method::POST,
+                format!("/apps/{}/versions/1/restore", APP),
+                Some(json!({})),
+            ),
+            (Method::GET, format!("/apps/{}/export", APP), None),
+            (
+                Method::POST,
+                format!("/apps/{}/import", APP),
+                Some(document),
+            ),
+            (Method::GET, format!("/audit?app={}", APP), None),
+            (
+                Method::DELETE,
+                format!("/apps/{}/templates/sample", APP),
+                None,
+            ),
+        ];
+        for section in [
+            "identity",
+            "data_source",
+            "devices",
+            "web_subscribe",
+            "campaigns",
+            "app_check",
+        ] {
+            let version = harness
+                .state
+                .config
+                .get(APP)
+                .expect("the app exists")
+                .version;
+            routes.push((
+                Method::PUT,
+                format!("/apps/{}/{}", APP, section),
+                Some(json!({ "value": section_value(&harness, section), "expected_version": version })),
+            ));
+        }
+
+        for (method, uri, body) in routes {
+            let (status, response) = call(
+                &harness.router,
+                method.clone(),
+                &uri,
+                body,
+                Some(&harness.token),
+                true,
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{} {} was not authenticated: {}",
+                method,
+                uri,
+                response
+            );
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{} {} was refused: {}",
+                method,
+                uri,
+                response
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_manager_denied_owner_only_routes() {
+        let harness = setup("manager", &[APP]).await;
+        harness.reauth().await;
+        let routes = vec![
+            (Method::POST, "/apps/fresh/init".to_string(), json!({})),
+            (
+                Method::PUT,
+                format!("/apps/{}/identity", APP),
+                json!({ "value": {}, "expected_version": 1 }),
+            ),
+            (
+                Method::PUT,
+                format!("/apps/{}/data_source", APP),
+                json!({ "value": {}, "expected_version": 1 }),
+            ),
+            (
+                Method::PUT,
+                format!("/apps/{}/devices", APP),
+                json!({ "value": {}, "expected_version": 1 }),
+            ),
+            (
+                Method::PUT,
+                format!("/apps/{}/app_check", APP),
+                json!({ "value": {}, "expected_version": 1 }),
+            ),
+            (Method::GET, format!("/apps/{}/export", APP), json!(null)),
+            (Method::POST, format!("/apps/{}/import", APP), json!({})),
+        ];
+
+        for (method, uri, body) in routes {
+            let (status, response) = call(
+                &harness.router,
+                method.clone(),
+                &uri,
+                Some(body),
+                Some(&harness.token),
+                true,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{} {} was not refused: {}",
+                method,
+                uri,
+                response
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_manager_allowed_on_own_app_routes() {
+        let harness = setup("manager", &[APP]).await;
+        harness.reauth().await;
+        harness.set_test_uid("tester").await;
+        harness
+            .register_device("tester", "token-tester-1-0000000000000000000000000000")
+            .await;
+        harness.save_template("sample", sample_template()).await;
+
+        let mut routes: Vec<(Method, String, Option<serde_json::Value>)> = vec![
+            (Method::GET, "/apps".to_string(), None),
+            (Method::GET, format!("/apps/{}", APP), None),
+            (Method::GET, format!("/apps/{}/templates", APP), None),
+            (
+                Method::POST,
+                format!("/apps/{}/templates", APP),
+                Some(json!({ "key": "manager_new", "definition": sample_template() })),
+            ),
+            (
+                Method::POST,
+                format!("/apps/{}/templates/validate", APP),
+                Some(json!({ "definition": sample_template() })),
+            ),
+            (Method::GET, format!("/apps/{}/templates/sample", APP), None),
+            (
+                Method::PUT,
+                format!("/apps/{}/templates/sample", APP),
+                Some(json!({ "definition": sample_template(), "expected_version": 1 })),
+            ),
+            (
+                Method::PUT,
+                format!("/apps/{}/templates/sample/enabled", APP),
+                Some(json!({ "enabled": true })),
+            ),
+            (
+                Method::POST,
+                format!("/apps/{}/templates/sample/preview", APP),
+                Some(json!({ "params": {}, "sender": { "uid": "u1" } })),
+            ),
+            (
+                Method::POST,
+                format!("/apps/{}/templates/sample/test-send", APP),
+                Some(json!({ "params": {}, "sender": { "uid": "u1" } })),
+            ),
+            (Method::GET, format!("/apps/{}/versions", APP), None),
+            (Method::GET, format!("/audit?app={}", APP), None),
+        ];
+
+        for section in ["web_subscribe", "campaigns"] {
+            let version = harness
+                .state
+                .config
+                .get(APP)
+                .expect("the app exists")
+                .version;
+            routes.push((
+                Method::PUT,
+                format!("/apps/{}/{}", APP, section),
+                Some(json!({ "value": section_value(&harness, section), "expected_version": version })),
+            ));
+        }
+
+        for (method, uri, body) in routes {
+            let (status, response) = call(
+                &harness.router,
+                method.clone(),
+                &uri,
+                body,
+                Some(&harness.token),
+                true,
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{} {} was refused: {}",
+                method,
+                uri,
+                response
+            );
+            assert_ne!(status, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_manager_other_app_is_403_not_404() {
+        let harness = setup("manager", &[APP]).await;
+        for app in [OTHER_APP, "missing"] {
+            let (status, body) = harness
+                .call(Method::GET, &format!("/apps/{}", app), None)
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "app {}: {}", app, body);
+            assert_eq!(body["error"], "forbidden");
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_must_change_password_blocks_new_routes() {
+        let pool = memory_pool().await;
+        let state = test_state(pool.clone()).await;
+        bind_app(&state, APP, "project-watt").await;
+        insert_user(&pool, "pending@example.com", "owner", true).await;
+        let router = app(state);
+        let login = login_request(&router, "pending@example.com", PASSWORD).await;
+        let token = session_token(&login);
+
+        let (status, body) = call(&router, Method::GET, "/apps", None, Some(&token), true).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "password_change_required");
+    }
+
+    #[tokio::test]
+    async fn matrix_missing_csrf_header_is_403_on_writes() {
+        let harness = setup("owner", &[]).await;
+        let (status, body) = call(
+            &harness.router,
+            Method::POST,
+            &format!("/apps/{}/templates", APP),
+            Some(json!({ "key": "sample", "definition": sample_template() })),
+            Some(&harness.token),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "forbidden");
+    }
 }

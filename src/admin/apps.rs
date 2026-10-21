@@ -190,6 +190,179 @@ pub async fn put_section(
     Ok(Json(json!({ "version": version })))
 }
 
+#[derive(Deserialize)]
+pub struct VersionsQuery {
+    pub section: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// `GET /apps/{app}/versions`: the list never carries the stored content.
+pub async fn list_versions(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(app): Path<String>,
+    Query(query): Query<VersionsQuery>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let rows = state
+        .config
+        .versions(&app, query.section.as_deref(), limit)
+        .await
+        .map_err(map_config_error)?;
+
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "section": row.section,
+                "changed_by": row.changed_by,
+                "created_at": row.created_at,
+                "size": row.content.len(),
+            })
+        })
+        .collect();
+    Ok(Json(Value::Array(items)))
+}
+
+/// Managers may read/restore only the sections they can write (plan 3.11).
+fn manager_section_allowed(section: &str) -> bool {
+    matches!(section, "web_subscribe" | "campaigns") || section.starts_with("template:")
+}
+
+fn require_section_access(user: &AuthedUser, section: &str) -> Result<(), AdminError> {
+    if user.role == Role::Manager && !manager_section_allowed(section) {
+        return Err(AdminError::forbidden(
+            "this section is not available to the manager role",
+        ));
+    }
+    Ok(())
+}
+
+/// `GET /apps/{app}/versions/{id}`: the content, for the section's readers.
+pub async fn get_version(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path((app, id)): Path<(String, i64)>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let row = db::read_version(&state.db, &app, id)
+        .await
+        .map_err(|error| AdminError::from_db("read the version", error))?
+        .ok_or_else(|| AdminError::not_found("the version does not exist"))?;
+    require_section_access(&user, &row.section)?;
+
+    let content: Value = serde_json::from_str(&row.content)
+        .map_err(|_| AdminError::internal("the stored version is not valid JSON"))?;
+    Ok(Json(json!({
+        "id": row.id,
+        "section": row.section,
+        "changed_by": row.changed_by,
+        "created_at": row.created_at,
+        "content": content,
+    })))
+}
+
+/// `POST /apps/{app}/versions/{id}/restore`.
+pub async fn restore_version(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path((app, id)): Path<(String, i64)>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let row = db::read_version(&state.db, &app, id)
+        .await
+        .map_err(|error| AdminError::from_db("read the version", error))?
+        .ok_or_else(|| AdminError::not_found("the version does not exist"))?;
+    require_section_access(&user, &row.section)?;
+
+    let version = state
+        .config
+        .restore(&app, id, &user.email)
+        .await
+        .map_err(map_config_error)?;
+    Ok(Json(json!({ "version": version })))
+}
+
+/// `GET /apps/{app}/export` (owner): the import document, without secrets.
+pub async fn export(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(app): Path<String>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::Owner).await?;
+    let document = state.config.export(&app).await.map_err(map_config_error)?;
+    Ok(Json(document))
+}
+
+/// `POST /apps/{app}/import` (owner, recent password confirmation).
+pub async fn import(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(app): Path<String>,
+    AdminJson(document): AdminJson<Value>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::Owner).await?;
+    user.require_reauth(300)?;
+
+    state
+        .config
+        .import(&app, document, &user.email)
+        .await
+        .map_err(map_config_error)?;
+    let version = state
+        .config
+        .get(&app)
+        .map(|snapshot| snapshot.version)
+        .unwrap_or(0);
+    Ok(Json(json!({ "version": version })))
+}
+
+#[derive(Deserialize)]
+pub struct AuditQuery {
+    pub app: Option<String>,
+    pub limit: Option<i64>,
+    pub before: Option<i64>,
+}
+
+/// `GET /audit`: owners see every app, managers only their own and must filter.
+pub async fn audit(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Query(query): Query<AuditQuery>,
+) -> Result<Json<Value>, AdminError> {
+    if user.role == Role::Manager {
+        let app = query
+            .app
+            .as_deref()
+            .ok_or_else(|| AdminError::forbidden("the app parameter is required"))?;
+        user.require_app(app)?;
+    }
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let rows = db::read_audit(&state.db, query.app.as_deref(), limit, query.before)
+        .await
+        .map_err(|error| AdminError::from_db("read the audit log", error))?;
+
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "actor": row.actor,
+                "app": row.app,
+                "action": row.action,
+                "created_at": row.created_at,
+                "detail": row.detail.map(|detail| {
+                    detail.chars().take(500).collect::<String>()
+                }),
+            })
+        })
+        .collect();
+    Ok(Json(Value::Array(items)))
+}
+
 /// Template metadata keyed by template key.
 async fn template_metadata(
     state: &AppState,
@@ -398,25 +571,343 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn versions_list_hides_content() {
+        let harness = setup("owner", &[]).await;
+        harness.save_template("sample", sample_template()).await;
 
+        let (status, body) = harness
+            .call(
+                Method::GET,
+                &format!("/apps/{}/versions?limit=500", APP),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("an array");
+        assert!(!rows.is_empty(), "create_app writes a version");
+        for row in rows {
+            assert!(row.get("content").is_none(), "the list must hide content");
+            assert!(row.get("size").is_some());
+            assert!(row.get("section").is_some());
+        }
+    }
 
+    #[tokio::test]
+    async fn restore_by_owner_any_section() {
+        let harness = setup("owner", &[]).await;
+        let first = json!({ "anonymous": ["first"], "signed_in": [] });
+        let second = json!({ "anonymous": ["second"], "signed_in": [] });
+        let (_, _) = put_section(&harness, "web_subscribe", first.clone(), 1).await;
+        let (_, _) = put_section(&harness, "web_subscribe", second, 2).await;
 
+        let rows = harness
+            .state
+            .config
+            .versions(APP, Some("web_subscribe"), 50)
+            .await
+            .expect("versions");
+        let target = rows.get(1).expect("the older web_subscribe version");
 
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/versions/{}/restore", APP, target.id),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["version"].as_i64().unwrap_or(0) > 3);
+        let snapshot = harness.state.config.get(APP).expect("the app exists");
+        assert_eq!(
+            serde_json::to_value(&snapshot.config.web_subscribe).expect("json"),
+            first
+        );
+    }
 
+    #[tokio::test]
+    async fn restore_by_manager_allowed_sections_only() {
+        let harness = setup("manager", &[APP]).await;
+        harness.save_template("sample", sample_template()).await;
 
+        let snapshot = harness.state.config.get(APP).expect("the app exists");
+        harness
+            .state
+            .config
+            .save_section(
+                APP,
+                "identity",
+                serde_json::to_value(&snapshot.config.identity).expect("json"),
+                "owner@example.com",
+                snapshot.version,
+            )
+            .await
+            .expect("the identity version must be written");
 
+        let template_versions = harness
+            .state
+            .config
+            .versions(APP, Some("template:sample"), 10)
+            .await
+            .expect("versions");
+        let template_version = template_versions.first().expect("a template version");
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/versions/{}/restore", APP, template_version.id),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
 
+        let identity_versions = harness
+            .state
+            .config
+            .versions(APP, Some("identity"), 10)
+            .await
+            .expect("versions");
+        let identity_version = identity_versions.first().expect("an identity version");
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/versions/{}/restore", APP, identity_version.id),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
 
+    #[tokio::test]
+    async fn restore_foreign_app_version_is_404() {
+        let harness = setup("owner", &[]).await;
+        let foreign_id: i64 =
+            sqlx::query_scalar("SELECT id FROM config_versions WHERE app = ? ORDER BY id LIMIT 1")
+                .bind(OTHER_APP)
+                .fetch_one(&harness.pool)
+                .await
+                .expect("the other app has a version");
 
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/versions/{}/restore", APP, foreign_id),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
+        let (status, _) = harness
+            .call(
+                Method::GET,
+                &format!("/apps/{}/versions/{}", APP, foreign_id),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 
+    #[tokio::test]
+    async fn export_has_no_secrets() {
+        let harness = setup("owner", &[]).await;
+        let (status, body) = harness
+            .call(Method::GET, &format!("/apps/{}/export", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("templates").is_some(), "the document format");
+        let text = body.to_string();
+        for marker in ["private_key", "BEGIN PRIVATE KEY", "client_email", PASSWORD] {
+            assert!(!text.contains(marker), "export leaked {}", marker);
+        }
+    }
 
+    #[tokio::test]
+    async fn import_requires_recent_reauth() {
+        let harness = setup("owner", &[]).await;
+        let (_, document) = harness
+            .call(Method::GET, &format!("/apps/{}/export", APP), None)
+            .await;
 
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/import", APP),
+                Some(document.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["message"], "reauth_required");
 
+        harness.reauth().await;
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/import", APP),
+                Some(document),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
 
+    #[tokio::test]
+    async fn import_roundtrip_via_http() {
+        let harness = setup("owner", &[]).await;
+        harness.reauth().await;
+        let (_, document) = harness
+            .call(Method::GET, &format!("/apps/{}/export", APP), None)
+            .await;
 
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/import", APP),
+                Some(document.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
 
+        let (status, again) = harness
+            .call(Method::GET, &format!("/apps/{}/export", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again, document);
+    }
 
+    #[tokio::test]
+    async fn audit_shows_every_write_above() {
+        let harness = setup("owner", &[]).await;
+        harness.reauth().await;
+        let (_, _) = put_section(
+            &harness,
+            "web_subscribe",
+            json!({ "anonymous": ["all"], "signed_in": [] }),
+            1,
+        )
+        .await;
+        let (_, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates", APP),
+                Some(json!({ "key": "sample", "definition": sample_template() })),
+            )
+            .await;
+        let (_, document) = harness
+            .call(Method::GET, &format!("/apps/{}/export", APP), None)
+            .await;
+        let _ = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/import", APP),
+                Some(document),
+            )
+            .await;
 
+        let (status, body) = harness
+            .call(Method::GET, &format!("/audit?app={}", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let actions: Vec<&str> = body
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|row| row["action"].as_str())
+            .collect();
+        for action in [
+            "config.save_section.web_subscribe",
+            "config.save_template",
+            "config.import",
+        ] {
+            assert!(
+                actions.contains(&action),
+                "missing {} in {:?}",
+                action,
+                actions
+            );
+        }
+    }
 
+    #[tokio::test]
+    async fn audit_manager_scoped_and_requires_app() {
+        let harness = setup("manager", &[APP]).await;
+        let (status, _) = harness.call(Method::GET, "/audit", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _) = harness.call(Method::GET, "/audit?app=other", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, body) = harness
+            .call(Method::GET, &format!("/audit?app={}", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        for row in body.as_array().expect("an array") {
+            assert_eq!(row["app"], APP);
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_pagination_before_and_limit_cap() {
+        let harness = setup("owner", &[]).await;
+        for value in 0..4 {
+            let (_, _) = put_section(
+                &harness,
+                "web_subscribe",
+                json!({ "anonymous": [format!("list-{}", value)], "signed_in": [] }),
+                harness
+                    .state
+                    .config
+                    .get(APP)
+                    .expect("the app exists")
+                    .version,
+            )
+            .await;
+        }
+
+        let (status, body) = harness.call(Method::GET, "/audit?limit=2", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("an array");
+        assert_eq!(rows.len(), 2);
+        let second = rows[1]["id"].as_i64().expect("an id");
+
+        let (status, body) = harness
+            .call(
+                Method::GET,
+                &format!("/audit?before={}&limit=500", second),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("an array");
+        assert!(!rows.is_empty());
+        assert!(rows
+            .iter()
+            .all(|row| row["id"].as_i64().unwrap_or(i64::MAX) < second));
+
+        let (_, body) = harness.call(Method::GET, "/audit?limit=1000", None).await;
+        assert!(body.as_array().expect("an array").len() <= 200);
+    }
+
+    #[tokio::test]
+    async fn audit_never_contains_secret_values() {
+        let harness = setup("owner", &[]).await;
+        harness.reauth().await;
+        let _ = put_section(
+            &harness,
+            "web_subscribe",
+            json!({ "anonymous": ["all"], "signed_in": [] }),
+            1,
+        )
+        .await;
+
+        let (status, body) = harness.call(Method::GET, "/audit", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = body.to_string();
+        for marker in [
+            "private_key",
+            "BEGIN PRIVATE KEY",
+            PASSWORD,
+            "correct horse battery",
+            &harness.token,
+        ] {
+            assert!(!text.contains(marker), "audit leaked {}", marker);
+        }
+    }
 }

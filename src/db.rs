@@ -487,6 +487,112 @@ pub async fn template_metadata(
         .collect())
 }
 
+/// One `audit_log` row for the dashboard.
+pub struct AuditRow {
+    pub id: i64,
+    pub actor: String,
+    pub app: Option<String>,
+    pub action: String,
+    pub created_at: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Audit rows, newest first, optionally filtered by app and id cursor.
+pub async fn read_audit(
+    pool: &SqlitePool,
+    app: Option<&str>,
+    limit: i64,
+    before: Option<i64>,
+) -> Result<Vec<AuditRow>, sqlx::Error> {
+    let rows = match (app, before) {
+        (Some(app), Some(before)) => {
+            sqlx::query(
+                "SELECT id, actor, app, action, created_at, detail FROM audit_log \
+                 WHERE app = ? AND id < ? ORDER BY id DESC LIMIT ?",
+            )
+            .bind(app)
+            .bind(before)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        (Some(app), None) => {
+            sqlx::query(
+                "SELECT id, actor, app, action, created_at, detail FROM audit_log \
+                 WHERE app = ? ORDER BY id DESC LIMIT ?",
+            )
+            .bind(app)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, Some(before)) => {
+            sqlx::query(
+                "SELECT id, actor, app, action, created_at, detail FROM audit_log \
+                 WHERE id < ? ORDER BY id DESC LIMIT ?",
+            )
+            .bind(before)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, None) => {
+            sqlx::query(
+                "SELECT id, actor, app, action, created_at, detail FROM audit_log \
+                 ORDER BY id DESC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(|row| AuditRow {
+            id: row.get("id"),
+            actor: row.get("actor"),
+            app: row.try_get("app").unwrap_or_default(),
+            action: row.get("action"),
+            created_at: row.try_get("created_at").unwrap_or_default(),
+            detail: row.try_get("detail").unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// One stored configuration version (the content is returned only on request).
+pub struct VersionDetail {
+    pub id: i64,
+    pub section: String,
+    pub changed_by: String,
+    pub created_at: String,
+    pub content: String,
+}
+
+/// Reads one version of one app. A version of another app is not found.
+pub async fn read_version(
+    pool: &SqlitePool,
+    app: &str,
+    id: i64,
+) -> Result<Option<VersionDetail>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, section, changed_by, created_at, content FROM config_versions \
+         WHERE id = ? AND app = ?",
+    )
+    .bind(id)
+    .bind(app)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| VersionDetail {
+        id: row.get("id"),
+        section: row.get("section"),
+        changed_by: row.get("changed_by"),
+        created_at: row.try_get("created_at").unwrap_or_default(),
+        content: row.get("content"),
+    }))
+}
+
 // ---------- T8: per-uid template rate limit ----------
 
 /// Sliding window of the per-uid template limit (plan 3.5/3.15).
