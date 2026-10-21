@@ -16,7 +16,10 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::config::placeholder::{self, Placeholder, Ref, Segment, SenderField};
-use crate::config::{Param, Template};
+use crate::config::validate::{is_reserved_data_key, is_role};
+use crate::config::{Context, Param, Target, Template};
+use crate::identity::is_valid_uid;
+use crate::validation::{MAX_BODY_LENGTH, MAX_DATA_BYTES, MAX_IMAGE_URL_LENGTH, MAX_TITLE_LENGTH};
 
 /// A raw client value may not exceed this many bytes before any processing.
 pub const MAX_RAW_VALUE_BYTES: usize = 4096;
@@ -245,6 +248,144 @@ pub fn context_path(
     };
     let path = renderer.render_text(&context.doc, Mode::Path, true)?;
     Ok(Some(path))
+}
+
+// ---------- step 3: the final notification ----------
+
+/// Produces the final notification from a template and its context.
+///
+/// `context.require` is evaluated first, so a missing or mismatching document
+/// is always a uniform [`RenderError::Forbidden`] and never a `BadRequest`.
+pub fn render(
+    template: &Template,
+    params: &ValidatedParams,
+    sender: &Sender,
+    doc: Option<&Value>,
+    entity: Option<&Value>,
+) -> Result<Rendered, RenderError> {
+    let mut renderer = Renderer {
+        template,
+        params,
+        sender,
+        doc,
+        entity,
+        vars: BTreeMap::new(),
+    };
+
+    if let Some(context) = &template.context {
+        check_require(&mut renderer, context)?;
+    }
+
+    let title = renderer.render_text(&template.title, Mode::Text, true)?;
+    if title.trim().is_empty() {
+        return Err(bad("title is empty after rendering"));
+    }
+    let body = renderer.render_text(&template.body, Mode::Text, true)?;
+    let image = match &template.image {
+        Some(definition) => Some(renderer.render_text(definition, Mode::Text, true)?),
+        None => None,
+    };
+
+    let mut data = BTreeMap::new();
+    for (key, definition) in &template.data {
+        if is_reserved_data_key(key) {
+            return Err(bad(format!("data key '{key}' is reserved")));
+        }
+        data.insert(
+            key.clone(),
+            renderer.render_text(definition, Mode::Text, true)?,
+        );
+    }
+
+    let target_text = renderer.render_text(template.to.value(), Mode::Text, true)?;
+    let target = match &template.to {
+        Target::Uid(_) => {
+            if !is_valid_uid(&target_text) {
+                return Err(bad("uid target is not valid"));
+            }
+            ResolvedTarget::Uid(target_text)
+        }
+        Target::Role(_) => {
+            if !is_role(&target_text) {
+                return Err(bad("role target must match ^[a-z0-9_]{1,32}$"));
+            }
+            ResolvedTarget::Role(target_text)
+        }
+        Target::Topic(_) => ResolvedTarget::Topic(target_text),
+        Target::Condition(_) => ResolvedTarget::Condition(target_text),
+    };
+
+    let (dedupe_key, dedupe_seconds) = match &template.dedupe {
+        Some(dedupe) => (
+            Some(renderer.render_text(&dedupe.key, Mode::Text, true)?),
+            Some(dedupe.seconds),
+        ),
+        None => (None, None),
+    };
+
+    enforce_limits(&title, &body, image.as_deref(), &data)?;
+
+    Ok(Rendered {
+        title,
+        body,
+        image,
+        data,
+        target,
+        dedupe_key,
+        dedupe_seconds,
+    })
+}
+
+fn enforce_limits(
+    title: &str,
+    body: &str,
+    image: Option<&str>,
+    data: &BTreeMap<String, String>,
+) -> Result<(), RenderError> {
+    if title.chars().count() > MAX_TITLE_LENGTH {
+        return Err(bad(format!(
+            "title must be at most {MAX_TITLE_LENGTH} characters"
+        )));
+    }
+    if body.chars().count() > MAX_BODY_LENGTH {
+        return Err(bad(format!(
+            "body must be at most {MAX_BODY_LENGTH} characters"
+        )));
+    }
+    if let Some(image) = image {
+        if image.len() > MAX_IMAGE_URL_LENGTH {
+            return Err(bad(format!(
+                "image URL must be at most {MAX_IMAGE_URL_LENGTH} characters"
+            )));
+        }
+    }
+    // Same measure as `validation::validate_send`: the serialized JSON size.
+    let size = serde_json::to_vec(data)
+        .map_err(|_| bad("data could not be serialized"))?
+        .len();
+    if size > MAX_DATA_BYTES {
+        return Err(bad(format!(
+            "data must be at most {MAX_DATA_BYTES} bytes when serialized"
+        )));
+    }
+    Ok(())
+}
+
+fn check_require(renderer: &mut Renderer<'_>, context: &Context) -> Result<(), RenderError> {
+    let doc = renderer.doc;
+    for (field, definition) in &context.require {
+        // Require values are computed from parameters and the sender only.
+        let expected = renderer.render_text(definition, Mode::Text, false)?;
+        let document = doc.ok_or(RenderError::Forbidden)?;
+        let actual = match lookup(document, field) {
+            Ok(value) => scalar_to_text(value).map_err(|_| RenderError::Forbidden)?,
+            Err(_) => return Err(RenderError::Forbidden),
+        };
+        if actual != expected {
+            return Err(RenderError::Forbidden);
+        }
+    }
+    Ok(())
 }
 
 // ---------- substitution ----------
@@ -497,7 +638,7 @@ fn validate_path_value(value: &str) -> Result<(), RenderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Context, Target};
+    use crate::config::ConfigDocument;
     use serde_json::json;
 
     fn base_template() -> Template {
@@ -704,6 +845,324 @@ mod tests {
         expect_bad(validate_params(&template, &json!({ "code": giant })));
     }
 
+    // ----- render -----
+
+    #[test]
+    fn render_substitutes_all_sources() {
+        let mut template = base_template();
+        template.title = "{p.subject} from {sender.name} ({sender.role})".to_string();
+        template.body = "{doc.text} for {entity.name}".to_string();
+        template
+            .data
+            .insert("id".to_string(), "{sender.uid}".to_string());
+        template.to = Target::Uid("{doc.owner}".to_string());
+
+        let doc = json!({ "text": "body text", "owner": "owner-9" });
+        let entity = json!({ "name": "ACME" });
+        let validated = params(&[("subject", "Order")]);
+        let rendered = render(&template, &validated, &sender(), Some(&doc), Some(&entity))
+            .expect("all sources resolve");
+
+        assert_eq!(rendered.title, "Order from Sara (user)");
+        assert_eq!(rendered.body, "body text for ACME");
+        assert_eq!(rendered.data.get("id").map(String::as_str), Some("user-1"));
+        assert_eq!(rendered.target, ResolvedTarget::Uid("owner-9".to_string()));
+    }
+
+    #[test]
+    fn p_value_with_placeholder_is_not_reinterpreted() {
+        let mut template = base_template();
+        template.title = "{p.text}".to_string();
+        let validated = params(&[("text", "{doc.secret}")]);
+        let doc = json!({ "secret": "leaked" });
+
+        let rendered = render(&template, &validated, &sender(), Some(&doc), None)
+            .expect("a substituted value is data");
+        assert_eq!(rendered.title, "{doc.secret}");
+    }
+
+    #[test]
+    fn doc_value_with_placeholder_is_not_reinterpreted() {
+        let mut template = base_template();
+        template.body = "{doc.note}".to_string();
+        let validated = params(&[("text", "leaked")]);
+        let doc = json!({ "note": "{p.text}" });
+
+        let rendered = render(&template, &validated, &sender(), Some(&doc), None)
+            .expect("a document value is data");
+        assert_eq!(rendered.body, "{p.text}");
+    }
+
+    #[test]
+    fn int_filter_rounds_150000_point_0() {
+        let mut template = base_template();
+        template.body = "total {doc.total|int}".to_string();
+        let doc = json!({ "total": 150000.0 });
+
+        let rendered = render(&template, &params(&[]), &sender(), Some(&doc), None)
+            .expect("integral float renders");
+        assert_eq!(rendered.body, "total 150000");
+    }
+
+    #[test]
+    fn int_filter_rounds_half_away_from_zero() {
+        let mut template = base_template();
+        template.body = "{doc.up|int}|{doc.down|int}|{doc.text|int}".to_string();
+        let doc = json!({ "up": 2.5, "down": -2.5, "text": "150000.6" });
+
+        let rendered = render(&template, &params(&[]), &sender(), Some(&doc), None)
+            .expect("halves round away from zero");
+        assert_eq!(rendered.body, "3|-3|150001");
+    }
+
+    #[test]
+    fn int_filter_rejects_non_numeric_and_huge() {
+        let mut template = base_template();
+        template.body = "{doc.value|int}".to_string();
+
+        for value in [json!("abc"), json!(1e16), json!(-1e16), json!(true)] {
+            let doc = json!({ "value": value });
+            expect_bad(render(&template, &params(&[]), &sender(), Some(&doc), None));
+        }
+
+        let null_doc = json!({ "value": null });
+        expect_bad(render(
+            &template,
+            &params(&[]),
+            &sender(),
+            Some(&null_doc),
+            None,
+        ));
+    }
+
+    #[test]
+    fn float_without_filter_prints_integer_form() {
+        let mut template = base_template();
+        template.body = "{doc.total} {doc.rate}".to_string();
+        let doc = json!({ "total": 150000.0, "rate": 1.25 });
+
+        let rendered = render(&template, &params(&[]), &sender(), Some(&doc), None)
+            .expect("floats render with their shortest form");
+        assert_eq!(rendered.body, "150000 1.25");
+    }
+
+    #[test]
+    fn missing_or_null_or_object_field_is_bad_request() {
+        let mut template = base_template();
+        template.body = "{doc.value}".to_string();
+
+        for doc in [
+            json!({}),
+            json!({ "value": null }),
+            json!({ "value": { "nested": 1 } }),
+            json!({ "value": [1, 2] }),
+        ] {
+            expect_bad(render(&template, &params(&[]), &sender(), Some(&doc), None));
+        }
+
+        // Array indices are not object keys, so this is also a bad request.
+        let array_doc = json!({ "value": [{ "x": 1 }] });
+        let mut indexed = base_template();
+        indexed.body = "{doc.value.0.x}".to_string();
+        expect_bad(render(
+            &indexed,
+            &params(&[]),
+            &sender(),
+            Some(&array_doc),
+            None,
+        ));
+    }
+
+    #[test]
+    fn arabic_text_is_preserved_exactly() {
+        let mut template = base_template();
+        template.title = "تحديث الطلب #{doc.number}".to_string();
+        template.body = "{doc.message}".to_string();
+        let doc = json!({
+            "number": 42,
+            "message": "تم شحن طلبك وهو في الطريق إليك — شكراً",
+        });
+
+        let rendered = render(&template, &params(&[]), &sender(), Some(&doc), None)
+            .expect("arabic text renders");
+        assert_eq!(rendered.title, "تحديث الطلب #42");
+        assert_eq!(rendered.body, "تم شحن طلبك وهو في الطريق إليك — شكراً");
+        assert_eq!(rendered.title.chars().count(), 15);
+    }
+
+    #[test]
+    fn control_chars_in_substituted_value_rejected() {
+        let mut template = base_template();
+        template.body = "{doc.value}".to_string();
+
+        let bad_doc = json!({ "value": "a\u{0}b" });
+        expect_bad(render(
+            &template,
+            &params(&[]),
+            &sender(),
+            Some(&bad_doc),
+            None,
+        ));
+
+        let good_doc = json!({ "value": "a\nb\tc" });
+        let rendered = render(&template, &params(&[]), &sender(), Some(&good_doc), None)
+            .expect("newline and tab survive");
+        assert_eq!(rendered.body, "a\nb\tc");
+    }
+
+    #[test]
+    fn title_empty_after_render_rejected() {
+        let mut template = base_template();
+        template.title = "{doc.title}".to_string();
+        template.body = "Body".to_string();
+        let doc = json!({ "title": "" });
+
+        expect_bad(render(&template, &params(&[]), &sender(), Some(&doc), None));
+    }
+
+    #[test]
+    fn title_body_limits_enforced() {
+        let mut template = base_template();
+        template.title = "{doc.title}".to_string();
+        template.body = "{doc.body}".to_string();
+
+        let long_title = json!({ "title": "t".repeat(MAX_TITLE_LENGTH + 1), "body": "b" });
+        expect_bad(render(
+            &template,
+            &params(&[]),
+            &sender(),
+            Some(&long_title),
+            None,
+        ));
+
+        let long_body = json!({ "title": "t", "body": "b".repeat(MAX_BODY_LENGTH + 1) });
+        expect_bad(render(
+            &template,
+            &params(&[]),
+            &sender(),
+            Some(&long_body),
+            None,
+        ));
+
+        let at_limit = json!({
+            "title": "t".repeat(MAX_TITLE_LENGTH),
+            "body": "b".repeat(MAX_BODY_LENGTH),
+        });
+        assert!(render(&template, &params(&[]), &sender(), Some(&at_limit), None).is_ok());
+    }
+
+    #[test]
+    fn data_total_size_limit_enforced() {
+        let mut template = base_template();
+        template
+            .data
+            .insert("payload".to_string(), "{doc.payload}".to_string());
+        let doc = json!({ "payload": "x".repeat(MAX_DATA_BYTES) });
+
+        expect_bad(render(&template, &params(&[]), &sender(), Some(&doc), None));
+    }
+
+    #[test]
+    fn reserved_data_key_rejected() {
+        for key in ["from", "notification", "message_type", "google.x", "gcm.y"] {
+            let mut template = base_template();
+            template.data.insert(key.to_string(), "value".to_string());
+            let error = expect_bad(render(&template, &params(&[]), &sender(), None, None));
+            assert!(error.contains("reserved"), "key {key}: {error}");
+        }
+    }
+
+    #[test]
+    fn target_uid_must_be_valid_uid() {
+        let mut template = base_template();
+        template.to = Target::Uid("{doc.uid}".to_string());
+
+        expect_bad(render(
+            &template,
+            &params(&[]),
+            &sender(),
+            Some(&json!({ "uid": "" })),
+            None,
+        ));
+        expect_bad(render(
+            &template,
+            &params(&[]),
+            &sender(),
+            Some(&json!({ "uid": "u".repeat(129) })),
+            None,
+        ));
+
+        let rendered = render(
+            &template,
+            &params(&[]),
+            &sender(),
+            Some(&json!({ "uid": "user-42" })),
+            None,
+        )
+        .expect("valid uid");
+        assert_eq!(rendered.target, ResolvedTarget::Uid("user-42".to_string()));
+    }
+
+    #[test]
+    fn target_role_charset_enforced() {
+        let mut template = base_template();
+        template.to = Target::Role("{doc.role}".to_string());
+
+        for role in ["Admin", "admin role", ""] {
+            expect_bad(render(
+                &template,
+                &params(&[]),
+                &sender(),
+                Some(&json!({ "role": role })),
+                None,
+            ));
+        }
+        let too_long = "a".repeat(33);
+        expect_bad(render(
+            &template,
+            &params(&[]),
+            &sender(),
+            Some(&json!({ "role": too_long })),
+            None,
+        ));
+
+        let rendered = render(
+            &template,
+            &params(&[]),
+            &sender(),
+            Some(&json!({ "role": "admin_1" })),
+            None,
+        )
+        .expect("valid role");
+        assert_eq!(rendered.target, ResolvedTarget::Role("admin_1".to_string()));
+    }
+
+    #[test]
+    fn dedupe_key_rendered() {
+        let mut template = base_template();
+        template.dedupe = Some(crate::config::Dedupe {
+            key: "{p.order_id}:{doc.status}".to_string(),
+            seconds: 600,
+        });
+        let doc = json!({ "status": "shipped" });
+
+        let rendered = render(
+            &template,
+            &params(&[("order_id", "abc")]),
+            &sender(),
+            Some(&doc),
+            None,
+        )
+        .expect("dedupe key renders");
+        assert_eq!(rendered.dedupe_key.as_deref(), Some("abc:shipped"));
+        assert_eq!(rendered.dedupe_seconds, Some(600));
+
+        let without = base_template();
+        let plain = render(&without, &params(&[]), &sender(), None, None).expect("no dedupe");
+        assert_eq!(plain.dedupe_key, None);
+        assert_eq!(plain.dedupe_seconds, None);
+    }
+
     // ----- context path and require -----
 
     #[test]
@@ -730,5 +1189,339 @@ mod tests {
         let template = base_template();
         let path = context_path(&template, &params(&[]), &sender()).expect("no context");
         assert_eq!(path, None);
+    }
+
+    fn template_with_require() -> Template {
+        let mut template = base_template();
+        template
+            .params
+            .insert("order_id".to_string(), text_param(64));
+        template.context = Some(Context {
+            doc: "store_orders/{p.order_id}".to_string(),
+            require: BTreeMap::from([("buyer_id".to_string(), "{sender.uid}".to_string())]),
+        });
+        template.to = Target::Uid("{doc.buyer_id}".to_string());
+        template.body = "{doc.note}".to_string();
+        template
+    }
+
+    #[test]
+    fn require_match_passes() {
+        let template = template_with_require();
+        let doc = json!({ "buyer_id": "user-1", "note": "ok" });
+
+        let rendered = render(
+            &template,
+            &params(&[("order_id", "a1")]),
+            &sender(),
+            Some(&doc),
+            None,
+        )
+        .expect("require matches");
+        assert_eq!(rendered.body, "ok");
+    }
+
+    #[test]
+    fn require_mismatch_is_forbidden() {
+        let template = template_with_require();
+        let doc = json!({ "buyer_id": "someone-else", "note": "ok" });
+
+        expect_forbidden(render(
+            &template,
+            &params(&[("order_id", "a1")]),
+            &sender(),
+            Some(&doc),
+            None,
+        ));
+    }
+
+    #[test]
+    fn require_missing_doc_is_forbidden() {
+        let template = template_with_require();
+        expect_forbidden(render(
+            &template,
+            &params(&[("order_id", "a1")]),
+            &sender(),
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn require_missing_field_is_forbidden() {
+        let template = template_with_require();
+        let doc = json!({ "note": "ok" });
+
+        expect_forbidden(render(
+            &template,
+            &params(&[("order_id", "a1")]),
+            &sender(),
+            Some(&doc),
+            None,
+        ));
+    }
+
+    #[test]
+    fn forbidden_is_uniform_for_all_three_cases() {
+        let template = template_with_require();
+
+        let mismatch = render(
+            &template,
+            &params(&[("order_id", "a1")]),
+            &sender(),
+            Some(&json!({ "buyer_id": "other" })),
+            None,
+        );
+        let missing_doc = render(
+            &template,
+            &params(&[("order_id", "a1")]),
+            &sender(),
+            None,
+            None,
+        );
+        let missing_field = render(
+            &template,
+            &params(&[("order_id", "a1")]),
+            &sender(),
+            Some(&json!({ "note": "x" })),
+            None,
+        );
+
+        let a = expect_forbidden(mismatch);
+        let b = expect_forbidden(missing_doc);
+        let c = expect_forbidden(missing_field);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        assert_eq!(a, RenderError::Forbidden);
+    }
+
+    #[test]
+    fn require_runs_before_other_substitution() {
+        let template = template_with_require();
+        // `note` is missing, so rendering the body would be a bad request; the
+        // failing require must win and stay a uniform Forbidden.
+        let doc = json!({ "buyer_id": "other" });
+
+        expect_forbidden(render(
+            &template,
+            &params(&[("order_id", "a1")]),
+            &sender(),
+            Some(&doc),
+            None,
+        ));
+    }
+
+    // ----- vars -----
+
+    fn template_with_var(map: &[(&str, &str)], from: &str) -> Template {
+        let mut template = base_template();
+        template.vars.insert(
+            "status_text".to_string(),
+            crate::config::Var {
+                from: from.to_string(),
+                map: map
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            },
+        );
+        template
+    }
+
+    #[test]
+    fn var_maps_doc_value() {
+        let mut template = template_with_var(&[("shipped", "on the way")], "doc.status");
+        template.body = "{status_text}".to_string();
+        let doc = json!({ "status": "shipped" });
+
+        let rendered = render(&template, &params(&[]), &sender(), Some(&doc), None)
+            .expect("var maps the document value");
+        assert_eq!(rendered.body, "on the way");
+    }
+
+    #[test]
+    fn var_unknown_value_is_bad_request_without_echo() {
+        let mut template = template_with_var(&[("shipped", "on the way")], "doc.status");
+        template.body = "{status_text}".to_string();
+        let doc = json!({ "status": "top-secret-status" });
+
+        let error = expect_bad(render(&template, &params(&[]), &sender(), Some(&doc), None));
+        assert!(error.contains("unsupported value"), "message: {error}");
+        assert!(
+            !error.contains("top-secret-status"),
+            "the value must not be echoed: {error}"
+        );
+    }
+
+    #[test]
+    fn var_map_value_may_use_other_sources() {
+        let mut template = template_with_var(
+            &[("yes", "order {doc.number} for {sender.name} ({p.channel})")],
+            "doc.flag",
+        );
+        template.body = "{status_text}".to_string();
+        template
+            .params
+            .insert("channel".to_string(), text_param(20));
+        let doc = json!({ "flag": "yes", "number": 42 });
+
+        let rendered = render(
+            &template,
+            &params(&[("channel", "app")]),
+            &sender(),
+            Some(&doc),
+            None,
+        )
+        .expect("map value renders other sources");
+        assert_eq!(rendered.body, "order 42 for Sara (app)");
+    }
+
+    #[test]
+    fn var_referencing_var_rejected() {
+        let mut template = template_with_var(&[("yes", "value {status_text}")], "doc.flag");
+        template.body = "{status_text}".to_string();
+        let doc = json!({ "flag": "yes" });
+
+        let error = expect_bad(render(&template, &params(&[]), &sender(), Some(&doc), None));
+        assert!(error.contains("variable"), "message: {error}");
+    }
+
+    #[test]
+    fn var_computed_lazily_and_only_when_used() {
+        let mut template = template_with_var(&[("yes", "used")], "doc.missing");
+        // A second, broken variable is defined but never referenced.
+        template.vars.insert(
+            "unused".to_string(),
+            crate::config::Var {
+                from: "doc.missing".to_string(),
+                map: BTreeMap::new(),
+            },
+        );
+        template.body = "{status_text}".to_string();
+        // The used variable succeeds even though the unused one cannot resolve.
+        template.vars.insert(
+            "status_text".to_string(),
+            crate::config::Var {
+                from: "doc.flag".to_string(),
+                map: BTreeMap::from([("yes".to_string(), "used".to_string())]),
+            },
+        );
+        let doc = json!({ "flag": "yes" });
+
+        let rendered = render(&template, &params(&[]), &sender(), Some(&doc), None)
+            .expect("the unused variable is never computed");
+        assert_eq!(rendered.body, "used");
+    }
+
+    // ----- the shipped example -----
+
+    #[test]
+    fn watt_example_templates_render() {
+        let document: ConfigDocument =
+            serde_json::from_str(include_str!("../policies/watt.example.json"))
+                .expect("the example policy must parse");
+        let (_, templates) = document.into_parts();
+
+        // admin_alert: no context, role target.
+        let admin_alert = templates.get("admin_alert").expect("admin_alert exists");
+        let admin_params = validate_params(
+            admin_alert,
+            &json!({
+                "title": "New brand",
+                "body": "ACME added brand X",
+                "route": "/brands/acme",
+            }),
+        )
+        .expect("admin_alert params are valid");
+        let admin =
+            render(admin_alert, &admin_params, &sender(), None, None).expect("admin_alert renders");
+        assert_eq!(admin.title, "New brand");
+        assert_eq!(admin.body, "ACME added brand X");
+        assert_eq!(
+            admin.data.get("target").map(String::as_str),
+            Some("/brands/acme")
+        );
+        assert_eq!(admin.target, ResolvedTarget::Role("admin".to_string()));
+
+        // order_new: the buyer sends it, the seller receives it.
+        let order_new = templates.get("order_new").expect("order_new exists");
+        let order_params = validate_params(order_new, &json!({ "order_id": "abc123" }))
+            .expect("order_new params are valid");
+        let order_doc = json!({
+            "order_number": 42,
+            "buyer_id": "user-1",
+            "buyer_name": "Ahmed",
+            "seller_id": "seller-7",
+            "seller_name": "Sara",
+            "total": 150000.0,
+            "currency": "IQD",
+        });
+        let path = context_path(order_new, &order_params, &sender()).expect("context path");
+        assert_eq!(path.as_deref(), Some("store_orders/abc123"));
+        let created = render(order_new, &order_params, &sender(), Some(&order_doc), None)
+            .expect("order_new renders");
+        assert_eq!(created.title, "طلب جديد #42");
+        assert_eq!(created.body, "طلب جديد من Ahmed بقيمة 150000 IQD");
+        assert_eq!(created.target, ResolvedTarget::Uid("seller-7".to_string()));
+        assert_eq!(
+            created.data.get("target").map(String::as_str),
+            Some("/store/orders/abc123")
+        );
+        assert_eq!(created.dedupe_key.as_deref(), Some("abc123"));
+        assert_eq!(created.dedupe_seconds, Some(600));
+
+        // order_status: the seller sends it, the buyer receives it.
+        let order_status = templates.get("order_status").expect("order_status exists");
+        let status_params = validate_params(order_status, &json!({ "order_id": "abc123" }))
+            .expect("order_status params are valid");
+        let seller = Sender {
+            uid: "seller-7".to_string(),
+            name: Some("Sara".to_string()),
+            role: Some("company".to_string()),
+        };
+        let status_doc = json!({
+            "order_number": 42,
+            "buyer_id": "user-1",
+            "seller_id": "seller-7",
+            "seller_name": "Sara",
+            "status": "shipped",
+        });
+        let status_path =
+            context_path(order_status, &status_params, &seller).expect("context path");
+        assert_eq!(status_path.as_deref(), Some("store_orders/abc123"));
+        let status = render(
+            order_status,
+            &status_params,
+            &seller,
+            Some(&status_doc),
+            None,
+        )
+        .expect("order_status renders");
+        assert_eq!(status.title, "تحديث الطلب #42");
+        assert_eq!(status.body, "تم شحن طلبك #42 وهو في الطريق إليك");
+        assert_eq!(status.target, ResolvedTarget::Uid("user-1".to_string()));
+        assert_eq!(
+            status.data.get("new_status").map(String::as_str),
+            Some("shipped")
+        );
+        assert_eq!(status.dedupe_key.as_deref(), Some("abc123:shipped"));
+    }
+
+    #[test]
+    fn renderer_has_no_io_dependencies() {
+        let source = include_str!("template.rs");
+        // Split so this test does not match its own needle.
+        let forbidden = [
+            "reqw".to_string() + "est",
+            "sql".to_string() + "x",
+            "tokio".to_string() + "::fs",
+            "std::".to_string() + "env",
+        ];
+        for needle in forbidden {
+            assert!(
+                !source.contains(&needle),
+                "template.rs must stay free of I/O: found {needle}"
+            );
+        }
     }
 }
