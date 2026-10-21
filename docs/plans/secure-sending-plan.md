@@ -503,6 +503,7 @@ create ──► pending_review ──approve──► sending ──► sent
 -- إعدادات التطبيقات والقوالب
 CREATE TABLE IF NOT EXISTS app_configs (
   app TEXT PRIMARY KEY, config TEXT NOT NULL,           -- JSON بلا templates
+  version INTEGER NOT NULL DEFAULT 1,                    -- نسخة الإعداد (تُزاد مع كل حفظ)
   updated_by TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS templates (
@@ -860,3 +861,4 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
 | 2026-10-21 | الخطة (المراجعة 1) | ✅ | بعد مراجعة الكود في المشروعين |
 | 2026-10-21 | الخطة (المراجعة 2) | ✅ | القوالب والإعدادات من الداشبورد + دعم باك إند غير Firebase + حسابات الأداة + مفاتيح التطبيقات |
 | 2026-10-21 | الخطة (المراجعة 2.1) | ✅ | رفع service account وإضافة تطبيق من الداشبورد (3.13، T16، D12) |
+| 2026-10-21 | T1 — مخزن الإعدادات والقوالب | ✅ | النماذج + التحقق + SQLite (إصدارات وسجل) + استيراد/تصدير + أمرا CLI. DDL: `app_configs` صار فيه `version` |
