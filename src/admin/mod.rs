@@ -319,6 +319,8 @@ mod tests {
             allowed_origins: vec![DASHBOARD_ORIGIN.to_string()],
         });
 
+        let fcm = Arc::new(crate::send::HttpFcm::new(client.clone(), auth_map.clone()));
+
         Arc::new(AppState {
             db: pool.clone(),
             auth_map,
@@ -334,6 +336,7 @@ mod tests {
             tool_auth,
             identity,
             datasource,
+            fcm,
         })
     }
 

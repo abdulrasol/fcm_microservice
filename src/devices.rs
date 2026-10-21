@@ -1183,6 +1183,8 @@ mod tests {
             allowed_origins: Vec::new(),
         });
 
+        let fcm = Arc::new(crate::send::HttpFcm::new(client.clone(), auth_map.clone()));
+
         Arc::new(AppState {
             devices: Arc::new(DeviceStore::new(pool.clone())),
             devices_limiter: RateLimiter::new(20, Duration::from_secs(60)),
@@ -1198,6 +1200,7 @@ mod tests {
             tool_auth,
             identity,
             datasource,
+            fcm,
         })
     }
 

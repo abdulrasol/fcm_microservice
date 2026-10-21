@@ -9,6 +9,7 @@ mod devices;
 mod identity;
 mod ratelimit;
 mod roles;
+mod send;
 mod template;
 mod topics;
 mod validation;
@@ -29,10 +30,11 @@ use identity::jwt::SystemEnv;
 use identity::registry::IdentityRegistry;
 use ratelimit::RateLimiter;
 use reqwest::Client;
+use send::{FcmOutcome, FcmTransport, HttpFcm, SendError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,6 +76,8 @@ struct AppState {
     /// T4: data sources per app. Used from T6.
     #[allow(dead_code)]
     datasource: Arc<DataSourceRegistry>,
+    /// T8: the FCM transport, replaceable in tests.
+    fcm: Arc<dyn FcmTransport>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -214,6 +218,7 @@ async fn main() {
     admin::spawn_session_cleanup(tool_auth.clone());
 
     let device_store = Arc::new(DeviceStore::new(db_pool.clone()));
+    let fcm = Arc::new(HttpFcm::new(client.clone(), auth_map.clone()));
 
     let state = Arc::new(AppState {
         db: db_pool,
@@ -230,6 +235,7 @@ async fn main() {
         tool_auth,
         identity: identity_registry,
         datasource: datasource_registry,
+        fcm,
     });
 
     // Serve static files from "dist", fallback to index.html for SPA routing
@@ -719,124 +725,87 @@ async fn send_notification(
         ));
     };
 
-    let auth = {
-        let map = state.auth_map.read().await;
-        map.get(&payload.app).cloned()
-    }
-    .ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Service account for this app is not loaded".to_string(),
-    ))?;
-
-    let token = auth
-        .token(&["https://www.googleapis.com/auth/firebase.messaging"])
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "Could not authenticate with Firebase".to_string(),
-            )
-        })?;
-    let access_token = token.token().ok_or((
-        StatusCode::BAD_GATEWAY,
-        "Missing Firebase access token".to_string(),
-    ))?;
-
-    let mut message = json!({
-        "notification": {
-            "title": payload.title,
-        }
-    });
-
-    if let Some(body) = &payload.body {
-        message["notification"]["body"] = json!(body);
-    }
-    if let Some(image) = &payload.image {
-        message["notification"]["image"] = json!(image);
+    if !state.auth_map.read().await.contains_key(&payload.app) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Service account for this app is not loaded".to_string(),
+        ));
     }
 
-    if let Some(data) = &payload.data {
-        if let Some(obj) = data.as_object() {
-            let mut string_map = serde_json::Map::new();
-            for (key, value) in obj {
-                let value_str = match value {
+    let mut data = BTreeMap::new();
+    if let Some(value) = &payload.data {
+        if let Some(object) = value.as_object() {
+            for (key, value) in object {
+                let text = match value {
                     serde_json::Value::String(string) => string.clone(),
                     other => other.to_string(),
                 };
-                string_map.insert(key.clone(), serde_json::Value::String(value_str));
+                data.insert(key.clone(), text);
             }
-            message["data"] = serde_json::Value::Object(string_map);
         }
     }
 
-    if let Some(label) = &payload.analytics_label {
-        message["fcm_options"] = json!({"analytics_label": label});
-    }
-
-    if let Some(topic) = &payload.topic {
-        message["topic"] = json!(topic);
-        // Automatically save topic to DB
-        let _ = db::save_topic(&state.db, &payload.app, topic).await;
+    let destination = if let Some(topic) = &payload.topic {
+        send::Destination::Topic(topic.clone())
     } else if let Some(token) = &payload.token {
-        message["token"] = json!(token);
-    } else if let Some(condition) = &payload.condition {
-        message["condition"] = json!(condition);
-    }
+        send::Destination::Token(token.clone())
+    } else {
+        send::Destination::Condition(payload.condition.clone().unwrap_or_default())
+    };
 
-    let fcm_payload = json!({ "message": message });
-    let url = format!(
-        "https://fcm.googleapis.com/v1/projects/{}/messages:send",
-        project_id
+    let fcm_payload = send::build_message(
+        &payload.title,
+        payload.body.as_deref(),
+        payload.image.as_deref(),
+        &data,
+        payload.analytics_label.as_deref(),
+        &destination,
     );
 
-    let res = state
-        .client
-        .post(&url)
-        .bearer_auth(access_token)
-        .json(&fcm_payload)
-        .send()
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "Network error while calling Firebase".to_string(),
+    match state.fcm.send(&payload.app, &project_id, fcm_payload).await {
+        Ok(FcmOutcome::Accepted { body }) => {
+            if let Some(topic) = &payload.topic {
+                let _ = db::save_topic(&state.db, &payload.app, topic).await;
+            }
+            let _ = db::log_notification(
+                &state.db,
+                &payload.app,
+                &target,
+                &payload.title,
+                "success",
+                &body,
+                &payload_str,
+                &identity.uid,
+                identity.email.as_deref(),
             )
-        })?;
-
-    let status = res.status();
-    let body_text = res
-        .text()
-        .await
-        .unwrap_or_else(|_| "Failed to read response body".to_string());
-
-    if status.is_success() {
-        let _ = db::log_notification(
-            &state.db,
-            &payload.app,
-            &target,
-            &payload.title,
-            "success",
-            &body_text,
-            &payload_str,
-            &identity.uid,
-            identity.email.as_deref(),
-        )
-        .await;
-        Ok(raw_send_success_response(body_text))
-    } else {
-        let _ = db::log_notification(
-            &state.db,
-            &payload.app,
-            &target,
-            &payload.title,
-            "failed",
-            &body_text,
-            &payload_str,
-            &identity.uid,
-            identity.email.as_deref(),
-        )
-        .await;
-        Ok(raw_send_fcm_error_response(status.as_u16(), &body_text))
+            .await;
+            Ok(raw_send_success_response(body))
+        }
+        Ok(FcmOutcome::Rejected {
+            http_status, body, ..
+        }) => {
+            let _ = db::log_notification(
+                &state.db,
+                &payload.app,
+                &target,
+                &payload.title,
+                "failed",
+                &body,
+                &payload_str,
+                &identity.uid,
+                identity.email.as_deref(),
+            )
+            .await;
+            Ok(raw_send_fcm_error_response(http_status, &body))
+        }
+        Err(SendError::Auth) => Err((
+            StatusCode::BAD_GATEWAY,
+            "Could not authenticate with Firebase".to_string(),
+        )),
+        Err(SendError::Network) => Err((
+            StatusCode::BAD_GATEWAY,
+            "Network error while calling Firebase".to_string(),
+        )),
     }
 }
 
@@ -1090,6 +1059,16 @@ mod tests {
     }
 
     async fn test_state(client: Client) -> Arc<AppState> {
+        test_state_with_fcm(client, |client, auth_map| {
+            Arc::new(HttpFcm::new(client.clone(), auth_map.clone()))
+        })
+        .await
+    }
+
+    async fn test_state_with_fcm(
+        client: Client,
+        make_fcm: impl FnOnce(&Client, &AuthMap) -> Arc<dyn FcmTransport>,
+    ) -> Arc<AppState> {
         let pool = memory_pool().await;
         let config = Arc::new(
             ConfigStore::new(pool.clone())
@@ -1103,6 +1082,7 @@ mod tests {
 
         let project_map: ProjectIdMap = Arc::new(RwLock::new(HashMap::new()));
         let auth_map: AuthMap = Arc::new(RwLock::new(HashMap::new()));
+        let fcm = make_fcm(&client, &auth_map);
         let env: Arc<dyn EnvSource> = Arc::new(FakeEnv);
         let identity = Arc::new(IdentityRegistry::new(
             config.clone(),
@@ -1151,6 +1131,7 @@ mod tests {
             devices_limiter: RateLimiter::new(20, Duration::from_secs(60)),
             identity,
             datasource,
+            fcm,
         })
     }
 
