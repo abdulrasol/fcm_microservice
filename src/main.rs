@@ -22,7 +22,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use config::store::ConfigStore;
+use config::store::{AppSnapshot, ConfigStore};
 use credentials::{AuthMap, ProjectIdMap};
 use datasource::registry::DataSourceRegistry;
 use datasource::DataError;
@@ -41,7 +41,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use template::ResolvedTarget;
+use template::{Rendered, ResolvedTarget};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -1052,130 +1052,38 @@ async fn send_template(
         }
     }
 
-    // 10. Recipients.
-    let mut tokens = Vec::new();
-    let target_label = match &rendered.target {
-        ResolvedTarget::Uid(uid) => {
-            tokens = state
-                .devices
-                .tokens_for_uid(&payload.app, uid)
-                .await
-                .map_err(device_error)?;
-            format!("uid:{uid}")
+    // 10-11. Recipients and delivery. Every error exit releases the claimed
+    // key, so a request that delivered nothing can be retried instead of being
+    // swallowed as a duplicate.
+    let delivery = match deliver(&state, &payload.app, &snapshot, &rendered).await {
+        Ok(delivery) => delivery,
+        Err(error) => {
+            release_dedupe_key(&state, &payload.app, &payload.template, &rendered).await;
+            return Err(error);
         }
-        ResolvedTarget::Role(role) => {
-            let role_members = snapshot
-                .config
-                .identity
-                .role_members
-                .as_ref()
-                .ok_or_else(|| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "role targets require identity.role_members".to_string(),
-                    )
-                })?;
-            let source = state
-                .datasource
-                .source_for(&payload.app)
-                .await
-                .map_err(|_| data_source_unavailable())?;
-            tokens = state
-                .devices
-                .tokens_for_role(
-                    &payload.app,
-                    snapshot.version,
-                    Some(role_members),
-                    role,
-                    &state.role_directory,
-                    source.as_ref(),
-                )
-                .await
-                .map_err(device_error)?;
-            format!("role:{role}")
-        }
-        ResolvedTarget::Topic(topic) => format!("topic:{topic}"),
-        ResolvedTarget::Condition(_) => "condition".to_string(),
     };
 
-    let token_targeted = matches!(
-        rendered.target,
-        ResolvedTarget::Uid(_) | ResolvedTarget::Role(_)
-    );
-    if token_targeted && tokens.is_empty() {
-        if let Some(key) = &rendered.dedupe_key {
-            let _ = db::release_dedupe(&state.db, &payload.app, &payload.template, key).await;
-        }
+    for token in &delivery.dead_tokens {
+        let _ = state.devices.remove_dead_token(&payload.app, token).await;
+    }
+
+    if delivery.delivered > 0 {
+        let _ = db::touch_template_used(&state.db, &payload.app, &payload.template).await;
+    } else {
+        // Nothing was delivered (all failed, or no devices): free the key.
+        release_dedupe_key(&state, &payload.app, &payload.template, &rendered).await;
+    }
+
+    if delivery.empty_audience {
         return Ok((
             StatusCode::OK,
             Json(json!({ "status": "no_devices", "delivered": 0, "failed": 0 })),
         ));
     }
 
-    // 11. One message per topic/condition, or one per device token.
-    let project_id = {
-        let projects = state.project_map.read().await;
-        projects.get(&payload.app).cloned()
-    }
-    .ok_or_else(|| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Service account for this app is not loaded".to_string(),
-        )
-    })?;
-
-    let single_destination = match &rendered.target {
-        ResolvedTarget::Topic(topic) => Some(send::Destination::Topic(topic.clone())),
-        ResolvedTarget::Condition(condition) => {
-            Some(send::Destination::Condition(condition.clone()))
-        }
-        ResolvedTarget::Uid(_) | ResolvedTarget::Role(_) => None,
-    };
-
-    let (delivered, failed, dead_tokens) = if let Some(destination) = single_destination {
-        let message = send::build_message(
-            &rendered.title,
-            Some(&rendered.body),
-            rendered.image.as_deref(),
-            &rendered.data,
-            None,
-            &destination,
-        );
-        match state.fcm.send(&payload.app, &project_id, message).await {
-            Ok(FcmOutcome::Accepted { .. }) => (1usize, 0usize, Vec::new()),
-            Ok(FcmOutcome::Rejected { .. }) | Err(_) => (0usize, 1usize, Vec::new()),
-        }
-    } else {
-        let delivery = send::send_to_tokens(
-            &state.fcm,
-            &payload.app,
-            &project_id,
-            &tokens,
-            |token| {
-                send::build_message(
-                    &rendered.title,
-                    Some(&rendered.body),
-                    rendered.image.as_deref(),
-                    &rendered.data,
-                    None,
-                    &send::Destination::Token(token.to_string()),
-                )
-            },
-            send::DEFAULT_CONCURRENCY,
-        )
-        .await;
-        (delivery.delivered, delivery.failed, delivery.dead_tokens)
-    };
-
-    for token in &dead_tokens {
-        let _ = state.devices.remove_dead_token(&payload.app, token).await;
-    }
-
-    if delivered > 0 {
-        let _ = db::touch_template_used(&state.db, &payload.app, &payload.template).await;
-    } else if let Some(key) = &rendered.dedupe_key {
-        let _ = db::release_dedupe(&state.db, &payload.app, &payload.template, key).await;
-    }
+    let delivered = delivery.delivered;
+    let failed = delivery.failed;
+    let target_label = delivery.target;
 
     // 12. One history row per request: rendered content only, never tokens or
     // raw parameters.
@@ -1213,6 +1121,153 @@ async fn send_template(
             Json(json!({ "status": "failed", "delivered": 0, "failed": failed })),
         ))
     }
+}
+
+/// What steps 10-11 resolved and delivered.
+struct Delivery {
+    target: String,
+    delivered: usize,
+    failed: usize,
+    dead_tokens: Vec<String>,
+    /// A `uid`/`role` target with no registered devices is not an error.
+    empty_audience: bool,
+}
+
+/// Frees a claimed dedupe key. A failure is ignored on purpose: it must not
+/// hide the original error or change the response.
+async fn release_dedupe_key(state: &AppState, app: &str, template: &str, rendered: &Rendered) {
+    if let Some(key) = &rendered.dedupe_key {
+        let _ = db::release_dedupe(&state.db, app, template, key).await;
+    }
+}
+
+/// Steps 10-11 of the template route: resolve the recipients and send.
+async fn deliver(
+    state: &AppState,
+    app: &str,
+    snapshot: &AppSnapshot,
+    rendered: &Rendered,
+) -> Result<Delivery, (StatusCode, String)> {
+    let mut tokens = Vec::new();
+    let target = match &rendered.target {
+        ResolvedTarget::Uid(uid) => {
+            tokens = state
+                .devices
+                .tokens_for_uid(app, uid)
+                .await
+                .map_err(device_error)?;
+            format!("uid:{uid}")
+        }
+        ResolvedTarget::Role(role) => {
+            let role_members = snapshot
+                .config
+                .identity
+                .role_members
+                .as_ref()
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "role targets require identity.role_members".to_string(),
+                    )
+                })?;
+            let source = state
+                .datasource
+                .source_for(app)
+                .await
+                .map_err(|_| data_source_unavailable())?;
+            tokens = state
+                .devices
+                .tokens_for_role(
+                    app,
+                    snapshot.version,
+                    Some(role_members),
+                    role,
+                    &state.role_directory,
+                    source.as_ref(),
+                )
+                .await
+                .map_err(device_error)?;
+            format!("role:{role}")
+        }
+        ResolvedTarget::Topic(topic) => format!("topic:{topic}"),
+        ResolvedTarget::Condition(_) => "condition".to_string(),
+    };
+
+    let token_targeted = matches!(
+        rendered.target,
+        ResolvedTarget::Uid(_) | ResolvedTarget::Role(_)
+    );
+    if token_targeted && tokens.is_empty() {
+        return Ok(Delivery {
+            target,
+            delivered: 0,
+            failed: 0,
+            dead_tokens: Vec::new(),
+            empty_audience: true,
+        });
+    }
+
+    let project_id = {
+        let projects = state.project_map.read().await;
+        projects.get(app).cloned()
+    }
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Service account for this app is not loaded".to_string(),
+        )
+    })?;
+
+    let single_destination = match &rendered.target {
+        ResolvedTarget::Topic(topic) => Some(send::Destination::Topic(topic.clone())),
+        ResolvedTarget::Condition(condition) => {
+            Some(send::Destination::Condition(condition.clone()))
+        }
+        ResolvedTarget::Uid(_) | ResolvedTarget::Role(_) => None,
+    };
+
+    let (delivered, failed, dead_tokens) = if let Some(destination) = single_destination {
+        let message = send::build_message(
+            &rendered.title,
+            Some(&rendered.body),
+            rendered.image.as_deref(),
+            &rendered.data,
+            None,
+            &destination,
+        );
+        match state.fcm.send(app, &project_id, message).await {
+            Ok(FcmOutcome::Accepted { .. }) => (1usize, 0usize, Vec::new()),
+            Ok(FcmOutcome::Rejected { .. }) | Err(_) => (0usize, 1usize, Vec::new()),
+        }
+    } else {
+        let delivery = send::send_to_tokens(
+            &state.fcm,
+            app,
+            &project_id,
+            &tokens,
+            |token| {
+                send::build_message(
+                    &rendered.title,
+                    Some(&rendered.body),
+                    rendered.image.as_deref(),
+                    &rendered.data,
+                    None,
+                    &send::Destination::Token(token.to_string()),
+                )
+            },
+            send::DEFAULT_CONCURRENCY,
+        )
+        .await;
+        (delivery.delivered, delivery.failed, delivery.dead_tokens)
+    };
+
+    Ok(Delivery {
+        target,
+        delivered,
+        failed,
+        dead_tokens,
+        empty_audience: false,
+    })
 }
 
 #[derive(Deserialize)]
@@ -2706,5 +2761,168 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(text.contains("https://"), "unexpected body: {text}");
+    }
+
+    fn dedupe_uid_template() -> Value {
+        json!({
+            "enabled": true,
+            "senders": ["user"],
+            "to": { "uid": "{sender.uid}" },
+            "title": "Hello",
+            "body": "Body",
+            "rate": { "per_uid_per_hour": 120 },
+            "dedupe": { "key": "hello-{sender.uid}", "seconds": 600 }
+        })
+    }
+
+    fn dedupe_role_template() -> Value {
+        json!({
+            "enabled": true,
+            "senders": ["admin"],
+            "to": { "role": "admin" },
+            "title": "Role",
+            "body": "Body",
+            "dedupe": { "key": "role-{sender.uid}", "seconds": 600 }
+        })
+    }
+
+    #[tokio::test]
+    async fn dedupe_released_when_device_lookup_fails() {
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        save_template(&harness, "hello", dedupe_uid_template()).await;
+        let router = template_router(harness.state.clone());
+        let token = jwt("uid-1", "user");
+        let request = json!({ "app": APP, "template": "hello" });
+
+        sqlx::query("DROP TABLE devices")
+            .execute(&harness.pool)
+            .await
+            .expect("the devices table must drop");
+
+        // A storage failure is a 500 (`device_error(Database)`), not a 503:
+        // only data-source failures map to 503.
+        let (status, text) = call(&router, template_request(request.clone(), Some(&token))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(text, "device storage failed");
+
+        // Restore the schema: the same request must not come back as a
+        // duplicate after the failed attempt.
+        crate::db::migrate(&harness.pool)
+            .await
+            .expect("the schema must be restored");
+
+        let (status, body) = call_json(&router, template_request(request, Some(&token))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({ "status": "no_devices", "delivered": 0, "failed": 0 })
+        );
+    }
+
+    #[tokio::test]
+    async fn dedupe_released_when_role_source_unavailable() {
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(true)).await;
+        use_http_source(&harness, "http://127.0.0.1:1").await;
+        save_template(&harness, "role_target", dedupe_role_template()).await;
+        let router = template_router(harness.state.clone());
+        let token = jwt("admin-1", "admin");
+        let request = json!({ "app": APP, "template": "role_target" });
+
+        let (status, text) = call(&router, template_request(request.clone(), Some(&token))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(text, "the data source is unavailable");
+
+        // A working source with one member: the retry must deliver.
+        let base = spawn_source(None, vec!["seller-1".to_string()]).await;
+        use_http_source(&harness, &base).await;
+        register_device(&harness, "seller-1").await;
+
+        let (status, body) = call_json(&router, template_request(request, Some(&token))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["delivered"], 1);
+        assert_eq!(harness.fcm.message_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn dedupe_released_when_role_members_missing() {
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        save_template(&harness, "role_target", dedupe_role_template()).await;
+        let router = template_router(harness.state.clone());
+        let token = jwt("admin-1", "admin");
+        let request = json!({ "app": APP, "template": "role_target" });
+
+        let (status, text) = call(&router, template_request(request.clone(), Some(&token))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(text, "role targets require identity.role_members");
+
+        // Configure members and one working source, then retry.
+        let base = spawn_source(None, vec!["seller-1".to_string()]).await;
+        save_section(&harness, "identity", jwt_identity(true)).await;
+        use_http_source(&harness, &base).await;
+        register_device(&harness, "seller-1").await;
+
+        let (status, body) = call_json(&router, template_request(request, Some(&token))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "success");
+        assert_eq!(harness.fcm.message_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn dedupe_released_when_credentials_missing() {
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        save_template(&harness, "hello", dedupe_uid_template()).await;
+        register_device(&harness, "uid-1").await;
+        harness.state.project_map.write().await.remove(APP);
+        let router = template_router(harness.state.clone());
+        let token = jwt("uid-1", "user");
+        let request = json!({ "app": APP, "template": "hello" });
+
+        let (status, text) = call(&router, template_request(request.clone(), Some(&token))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(text, "Service account for this app is not loaded");
+
+        // Load the credentials, then the retry must deliver.
+        harness
+            .state
+            .project_map
+            .write()
+            .await
+            .insert(APP.to_string(), PROJECT.to_string());
+
+        let (status, body) = call_json(&router, template_request(request, Some(&token))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["delivered"], 1);
+        assert_eq!(harness.fcm.message_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn dedupe_still_blocks_after_successful_delivery() {
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        save_template(&harness, "hello", dedupe_uid_template()).await;
+        register_device(&harness, "uid-1").await;
+        let router = template_router(harness.state.clone());
+        let token = jwt("uid-1", "user");
+        let request = json!({ "app": APP, "template": "hello" });
+
+        let (first_status, first) =
+            call_json(&router, template_request(request.clone(), Some(&token))).await;
+        let (second_status, second) =
+            call_json(&router, template_request(request, Some(&token))).await;
+
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(first["status"], "success");
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(
+            second,
+            json!({ "status": "duplicate", "delivered": 0, "failed": 0 })
+        );
+        assert_eq!(harness.fcm.message_count(), 1);
     }
 }
