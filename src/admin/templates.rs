@@ -1,0 +1,661 @@
+//! Dashboard template CRUD, validation, preview and test-send (T10-A).
+//!
+//! Preview and test-send use the exact send engine (`validate_params`,
+//! `context_path`, `render`). Preview never calls FCM; test-send only reaches
+//! the devices of the caller's `test_uid`.
+
+use super::auth::AuthedUser;
+use super::{authorize, map_config_error, AdminError, AdminJson, Need};
+use crate::config::store::AppSnapshot;
+use crate::config::validate::{validate_template, Issue};
+use crate::config::Template;
+use crate::datasource::DataError;
+use crate::db;
+use crate::devices::DeviceError;
+use crate::send;
+use crate::template::{self, RenderError, Rendered, ResolvedTarget, Sender};
+use crate::AppState;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::Json;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+const MAX_TEMPLATE_KEY_LEN: usize = 40;
+/// Test-send is limited to 10 messages per dashboard user per minute.
+const TEST_SEND_KEY_PREFIX: &str = "admin:test_send:";
+
+fn valid_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_TEMPLATE_KEY_LEN
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn snapshot_of(state: &AppState, app: &str) -> Result<Arc<AppSnapshot>, AdminError> {
+    state
+        .config
+        .get(app)
+        .ok_or_else(|| AdminError::not_found("the app has no configuration"))
+}
+
+async fn metadata(
+    state: &AppState,
+    app: &str,
+) -> Result<HashMap<String, db::TemplateMeta>, AdminError> {
+    let rows = db::template_metadata(&state.db, app)
+        .await
+        .map_err(|error| AdminError::from_db("read the template metadata", error))?;
+    Ok(rows.into_iter().map(|row| (row.key.clone(), row)).collect())
+}
+
+fn key_error() -> AdminError {
+    AdminError::invalid_request("a template key must match [a-z0-9_]{1,40}")
+}
+
+/// `GET /apps/{app}/templates`.
+pub async fn list_templates(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(app): Path<String>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let snapshot = snapshot_of(&state, &app)?;
+    let metadata = metadata(&state, &app).await?;
+
+    let items: Vec<Value> = snapshot
+        .templates
+        .iter()
+        .map(|(key, template)| {
+            let meta = metadata.get(key);
+            json!({
+                "key": key,
+                "description": template.description,
+                "enabled": template.enabled,
+                "version": meta.map(|meta| meta.version).unwrap_or(0),
+                "senders": template.senders,
+                "target_kind": template.to.kind(),
+                "last_used_at": meta.and_then(|meta| meta.last_used_at.clone()),
+            })
+        })
+        .collect();
+    Ok(Json(Value::Array(items)))
+}
+
+/// `GET /apps/{app}/templates/{key}`.
+pub async fn get_template(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path((app, key)): Path<(String, String)>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let snapshot = snapshot_of(&state, &app)?;
+    let template = snapshot
+        .templates
+        .get(&key)
+        .ok_or_else(|| AdminError::not_found("the template does not exist"))?;
+    let metadata = metadata(&state, &app).await?;
+    let meta = metadata.get(&key);
+    let definition = serde_json::to_value(template)
+        .map_err(|_| AdminError::internal("the template could not be rendered"))?;
+
+    Ok(Json(json!({
+        "key": key,
+        "version": meta.map(|meta| meta.version).unwrap_or(0),
+        "enabled": template.enabled,
+        "last_used_at": meta.and_then(|meta| meta.last_used_at.clone()),
+        "definition": definition,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTemplateRequest {
+    pub key: String,
+    pub definition: Value,
+    pub enabled: Option<bool>,
+}
+
+/// `POST /apps/{app}/templates`.
+pub async fn create_template(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(app): Path<String>,
+    AdminJson(request): AdminJson<CreateTemplateRequest>,
+) -> Result<(StatusCode, Json<Value>), AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let snapshot = snapshot_of(&state, &app)?;
+    if !valid_key(&request.key) {
+        return Err(key_error());
+    }
+    if snapshot.templates.contains_key(&request.key) {
+        let metadata = metadata(&state, &app).await?;
+        let current = metadata
+            .get(&request.key)
+            .map(|meta| meta.version)
+            .unwrap_or(0);
+        return Err(AdminError::conflict(current));
+    }
+
+    let mut definition = request.definition;
+    if let Some(enabled) = request.enabled {
+        let object = definition
+            .as_object_mut()
+            .ok_or_else(|| AdminError::invalid_request("definition must be an object"))?;
+        object.insert("enabled".to_string(), Value::Bool(enabled));
+    }
+
+    let version = state
+        .config
+        .save_template(&app, &request.key, definition, &user.email, None)
+        .await
+        .map_err(map_config_error)?;
+    Ok((StatusCode::CREATED, Json(json!({ "version": version }))))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateTemplateRequest {
+    pub definition: Value,
+    pub expected_version: i64,
+}
+
+/// `PUT /apps/{app}/templates/{key}`.
+pub async fn update_template(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path((app, key)): Path<(String, String)>,
+    AdminJson(request): AdminJson<UpdateTemplateRequest>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let snapshot = snapshot_of(&state, &app)?;
+    if !snapshot.templates.contains_key(&key) {
+        return Err(AdminError::not_found("the template does not exist"));
+    }
+
+    let version = state
+        .config
+        .save_template(
+            &app,
+            &key,
+            request.definition,
+            &user.email,
+            Some(request.expected_version),
+        )
+        .await
+        .map_err(map_config_error)?;
+    Ok(Json(json!({ "version": version })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnabledRequest {
+    pub enabled: bool,
+}
+
+/// `PUT /apps/{app}/templates/{key}/enabled`.
+pub async fn set_enabled(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path((app, key)): Path<(String, String)>,
+    AdminJson(request): AdminJson<EnabledRequest>,
+) -> Result<StatusCode, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let snapshot = snapshot_of(&state, &app)?;
+    if !snapshot.templates.contains_key(&key) {
+        return Err(AdminError::not_found("the template does not exist"));
+    }
+
+    state
+        .config
+        .set_template_enabled(&app, &key, request.enabled, &user.email)
+        .await
+        .map_err(map_config_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /apps/{app}/templates/{key}`.
+pub async fn delete_template(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path((app, key)): Path<(String, String)>,
+) -> Result<StatusCode, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let snapshot = snapshot_of(&state, &app)?;
+    if !snapshot.templates.contains_key(&key) {
+        return Err(AdminError::not_found("the template does not exist"));
+    }
+    let metadata = metadata(&state, &app).await?;
+    if metadata.get(&key).is_some_and(|meta| meta.recently_used) {
+        return Err(AdminError::recently_used());
+    }
+
+    state
+        .config
+        .delete_template(&app, &key, &user.email)
+        .await
+        .map_err(map_config_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidateRequest {
+    pub key: Option<String>,
+    pub definition: Value,
+}
+
+fn issue_json(issues: Vec<Issue>) -> Value {
+    Value::Array(
+        issues
+            .into_iter()
+            .map(|issue| json!({ "path": issue.path, "message": issue.message }))
+            .collect(),
+    )
+}
+
+/// `POST /apps/{app}/templates/validate`: a dry run, nothing is saved.
+pub async fn validate_definition(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(app): Path<String>,
+    AdminJson(request): AdminJson<ValidateRequest>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let snapshot = snapshot_of(&state, &app)?;
+    let key = request.key.unwrap_or_else(|| "draft".to_string());
+
+    let template: Template = match serde_json::from_value(request.definition) {
+        Ok(template) => template,
+        Err(error) => {
+            let issues = vec![Issue::new(
+                format!("templates.{}", key),
+                format!("[S1] the template could not be read: {}", error),
+            )];
+            return Ok(Json(json!({ "ok": false, "issues": issue_json(issues) })));
+        }
+    };
+
+    let issues = validate_template(&key, &template, &snapshot.config);
+    let ok = issues.is_empty();
+    Ok(Json(json!({ "ok": ok, "issues": issue_json(issues) })))
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SenderBody {
+    pub uid: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewRequest {
+    #[serde(default)]
+    pub params: Value,
+    pub sender: SenderBody,
+    #[serde(default)]
+    pub doc: Option<Value>,
+    #[serde(default)]
+    pub definition: Option<Value>,
+    #[serde(default)]
+    pub use_real_doc: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{
+        sample_template, setup, setup_with_env, FakeEnv, Harness, APP, DATASOURCE_SECRET_ENV,
+    };
+    use super::*;
+    use axum::http::Method;
+    use serde_json::json;
+
+    fn doc_template() -> Value {
+        json!({
+            "description": "Document greeting",
+            "enabled": true,
+            "senders": ["admin"],
+            "to": { "role": "admin" },
+            "title": "Hello",
+            "body": "Hello {doc.name}",
+            "context": {
+                "doc": "users/{sender.uid}",
+                "require": { "uid": "{sender.uid}" }
+            }
+        })
+    }
+
+    fn uid_template() -> Value {
+        json!({
+            "description": "UID greeting",
+            "enabled": true,
+            "senders": ["admin"],
+            "to": { "uid": "{sender.uid}" },
+            "title": "Hello",
+            "body": "Body"
+        })
+    }
+
+    fn preview_body() -> Value {
+        json!({ "params": {}, "sender": { "uid": "u1" } })
+    }
+
+    async fn create(harness: &Harness, key: &str, definition: Value) -> (StatusCode, Value) {
+        harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates", APP),
+                Some(json!({ "key": key, "definition": definition })),
+            )
+            .await
+    }
+
+    async fn update(
+        harness: &Harness,
+        key: &str,
+        definition: Value,
+        expected_version: i64,
+    ) -> (StatusCode, Value) {
+        harness
+            .call(
+                Method::PUT,
+                &format!("/apps/{}/templates/{}", APP, key),
+                Some(json!({
+                    "definition": definition,
+                    "expected_version": expected_version,
+                })),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn template_create_then_get_roundtrip() {
+        let harness = setup("owner", &[]).await;
+        let (status, body) = create(&harness, "sample", sample_template()).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["version"], 1);
+
+        let (status, body) = harness
+            .call(
+                Method::GET,
+                &format!("/apps/{}/templates/sample", APP),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["key"], "sample");
+        assert_eq!(body["version"], 1);
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["definition"]["description"], "Sample admin alert");
+        assert_eq!(body["definition"]["to"]["role"], "admin");
+        assert_eq!(body["definition"]["title"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn template_create_duplicate_is_409() {
+        let harness = setup("owner", &[]).await;
+        let _ = create(&harness, "sample", sample_template()).await;
+        let (status, body) = create(&harness, "sample", sample_template()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["current_version"], 1);
+    }
+
+    #[tokio::test]
+    async fn template_update_requires_expected_version() {
+        let harness = setup("owner", &[]).await;
+        let _ = create(&harness, "sample", sample_template()).await;
+        let (status, body) = harness
+            .call(
+                Method::PUT,
+                &format!("/apps/{}/templates/sample", APP),
+                Some(json!({ "definition": sample_template() })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn template_update_stale_version_is_409() {
+        let harness = setup("owner", &[]).await;
+        let _ = create(&harness, "sample", sample_template()).await;
+        let (status, body) = update(&harness, "sample", sample_template(), 99).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["current_version"], 1);
+    }
+
+    #[tokio::test]
+    async fn template_invalid_definition_returns_guard_issues() {
+        let harness = setup("owner", &[]).await;
+        let definition = json!({
+            "description": "Broadcast with free text",
+            "enabled": true,
+            "senders": ["user"],
+            "params": { "message": { "type": "text", "max": 100 } },
+            "to": { "topic": "all" },
+            "title": "Hello",
+            "body": "{p.message}",
+            "rate": { "per_uid_per_hour": 10 }
+        });
+        let (status, body) = create(&harness, "broadcast", definition).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid");
+        let text = body["issues"].to_string();
+        assert!(text.contains("[G1]"), "issues: {}", text);
+    }
+
+    #[tokio::test]
+    async fn template_enable_disable() {
+        let harness = setup("owner", &[]).await;
+        let _ = create(&harness, "sample", sample_template()).await;
+
+        let (status, _) = harness
+            .call(
+                Method::PUT,
+                &format!("/apps/{}/templates/sample/enabled", APP),
+                Some(json!({ "enabled": false })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = harness
+            .call(
+                Method::GET,
+                &format!("/apps/{}/templates/sample", APP),
+                None,
+            )
+            .await;
+        assert_eq!(body["enabled"], false);
+
+        let (status, _) = harness
+            .call(
+                Method::PUT,
+                &format!("/apps/{}/templates/sample/enabled", APP),
+                Some(json!({ "enabled": true })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn template_delete_unused_ok() {
+        let harness = setup("owner", &[]).await;
+        let _ = create(&harness, "sample", sample_template()).await;
+        let (status, _) = harness
+            .call(
+                Method::DELETE,
+                &format!("/apps/{}/templates/sample", APP),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = harness
+            .call(
+                Method::GET,
+                &format!("/apps/{}/templates/sample", APP),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn template_delete_recently_used_is_409() {
+        let harness = setup("owner", &[]).await;
+        let _ = create(&harness, "sample", sample_template()).await;
+        sqlx::query(
+            "UPDATE templates SET last_used_at = CURRENT_TIMESTAMP WHERE app = ? AND key = ?",
+        )
+        .bind(APP)
+        .bind("sample")
+        .execute(&harness.pool)
+        .await
+        .expect("the template must be marked used");
+
+        let (status, body) = harness
+            .call(
+                Method::DELETE,
+                &format!("/apps/{}/templates/sample", APP),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "recently_used");
+        assert_eq!(body["hint"], "disable the template instead");
+    }
+
+    #[tokio::test]
+    async fn template_delete_old_usage_ok() {
+        let harness = setup("owner", &[]).await;
+        let _ = create(&harness, "sample", sample_template()).await;
+        sqlx::query(
+            "UPDATE templates SET last_used_at = datetime('now', '-40 days') WHERE app = ? AND key = ?",
+        )
+        .bind(APP)
+        .bind("sample")
+        .execute(&harness.pool)
+        .await
+        .expect("the template must be marked used");
+
+        let (status, _) = harness
+            .call(
+                Method::DELETE,
+                &format!("/apps/{}/templates/sample", APP),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn template_key_charset_enforced() {
+        let harness = setup("owner", &[]).await;
+        for key in [
+            "Bad".to_string(),
+            "with space".to_string(),
+            "x".repeat(41),
+            String::new(),
+        ] {
+            let (status, body) = create(&harness, &key, sample_template()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "key {:?}", key);
+            assert_eq!(body["error"], "invalid_request");
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_endpoint_reports_issues_without_saving() {
+        let harness = setup("owner", &[]).await;
+        let definition = json!({
+            "enabled": true,
+            "senders": ["user"],
+            "params": { "message": { "type": "text", "max": 100 } },
+            "to": { "topic": "all" },
+            "title": "Hello",
+            "body": "{p.message}",
+            "rate": { "per_uid_per_hour": 10 }
+        });
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/validate", APP),
+                Some(json!({ "key": "broadcast", "definition": definition })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], false);
+        assert!(!body["issues"].as_array().expect("issues").is_empty());
+
+        let (_, list) = harness
+            .call(Method::GET, &format!("/apps/{}/templates", APP), None)
+            .await;
+        assert!(list.as_array().expect("an array").is_empty());
+    }
+
+    #[tokio::test]
+    async fn validate_endpoint_unknown_field_is_issue_not_500() {
+        let harness = setup("owner", &[]).await;
+        let definition = json!({ "title": "Hi", "bogus": true });
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/validate", APP),
+                Some(json!({ "definition": definition })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], false);
+        let issues = body["issues"].as_array().expect("issues");
+        assert!(issues[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[S1]"));
+    }
+
+
+
+
+
+
+
+
+
+    async fn configure_http_source(harness: &Harness, base_url: &str) {
+        let value = json!({
+            "type": "http",
+            "base_url": base_url,
+            "secret_env": DATASOURCE_SECRET_ENV
+        });
+        let (status, _) = harness
+            .call(
+                Method::PUT,
+                &format!("/apps/{}/data_source", APP),
+                Some(json!({ "value": value, "expected_version": 1 })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+}

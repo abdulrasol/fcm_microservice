@@ -8,6 +8,7 @@ pub mod apps;
 pub mod auth;
 pub mod password;
 pub mod session;
+pub mod templates;
 
 use crate::config::store::ConfigError;
 use crate::config::validate::Issue;
@@ -333,6 +334,24 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/apps/:app", get(apps::get_app))
         .route("/apps/:app/init", post(apps::init_app))
         .route("/apps/:app/:section", put(apps::put_section))
+        .route(
+            "/apps/:app/templates",
+            get(templates::list_templates).post(templates::create_template),
+        )
+        .route(
+            "/apps/:app/templates/validate",
+            post(templates::validate_definition),
+        )
+        .route(
+            "/apps/:app/templates/:key",
+            get(templates::get_template)
+                .put(templates::update_template)
+                .delete(templates::delete_template),
+        )
+        .route(
+            "/apps/:app/templates/:key/enabled",
+            put(templates::set_enabled),
+        )
         .layer(axum::middleware::from_fn_with_state(state, csrf_guard))
 }
 
