@@ -35,6 +35,13 @@ pub struct Placeholder {
     pub int_filter: bool,
 }
 
+/// One piece of a parsed text: literal text or a placeholder, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Segment {
+    Text(String),
+    Ref(Placeholder),
+}
+
 const MAX_NAME_LEN: usize = 30;
 const MAX_PATH_SEGMENTS: usize = 5;
 
@@ -79,6 +86,48 @@ pub fn extract(s: &str) -> Result<Vec<Placeholder>, String> {
 /// Text with a syntax error is not "literal", so this returns `false` (fail-closed).
 pub fn is_literal(s: &str) -> bool {
     matches!(extract(s), Ok(placeholders) if placeholders.is_empty())
+}
+
+/// Splits a text into its literal segments and placeholders, in order.
+///
+/// Same rules and the same error messages as [`extract`]: every check is
+/// delegated to it, so the two entry points can never disagree.
+pub fn segments(s: &str) -> Result<Vec<Segment>, String> {
+    let placeholders = extract(s)?;
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut found = placeholders.into_iter();
+    let mut cursor = 0usize;
+    let mut text_start = 0usize;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'{' {
+            let close = match find_close(bytes, cursor) {
+                Some(position) => position,
+                // Unreachable after a successful `extract`; fail closed anyway.
+                None => return Err(format!("unclosed '{{' at position {}", cursor)),
+            };
+            if cursor > text_start {
+                out.push(Segment::Text(s[text_start..cursor].to_string()));
+            }
+            match found.next() {
+                Some(placeholder) => out.push(Segment::Ref(placeholder)),
+                // Unreachable after a successful `extract`; fail closed anyway.
+                None => {
+                    return Err(format!("unexpected placeholder at position {}", cursor));
+                }
+            }
+            cursor = close + 1;
+            text_start = cursor;
+        } else {
+            cursor += 1;
+        }
+    }
+
+    if text_start < bytes.len() {
+        out.push(Segment::Text(s[text_start..].to_string()));
+    }
+    Ok(out)
 }
 
 /// Finds the matching `}` (nested braces are not supported).
@@ -281,5 +330,72 @@ mod tests {
         assert!(is_literal("text without placeholders"));
         assert!(!is_literal("text {p.name}"));
         assert!(!is_literal("text {broken"), "malformed text is not literal");
+    }
+
+    #[test]
+    fn segments_preserves_order_and_literals() {
+        let parts = segments("a {p.order_id} b {doc.total|int} c").expect("all forms must parse");
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0], Segment::Text("a ".to_string()));
+        assert_eq!(
+            parts[1],
+            Segment::Ref(Placeholder {
+                r: Ref::Param("order_id".to_string()),
+                int_filter: false,
+            })
+        );
+        assert_eq!(parts[2], Segment::Text(" b ".to_string()));
+        assert_eq!(
+            parts[3],
+            Segment::Ref(Placeholder {
+                r: Ref::Doc("total".to_string()),
+                int_filter: true,
+            })
+        );
+        assert_eq!(parts[4], Segment::Text(" c".to_string()));
+
+        assert!(segments("").expect("empty text must parse").is_empty());
+        assert_eq!(
+            segments("plain").expect("literal text must parse"),
+            vec![Segment::Text("plain".to_string())]
+        );
+        assert_eq!(
+            segments("{sender.uid}").expect("one placeholder must parse"),
+            vec![Segment::Ref(Placeholder {
+                r: Ref::Sender(SenderField::Uid),
+                int_filter: false,
+            })]
+        );
+        // Arabic literals and values keep their exact bytes.
+        assert_eq!(
+            segments("طلب {p.order_id}")
+                .expect("arabic literal must parse")
+                .first(),
+            Some(&Segment::Text("طلب ".to_string()))
+        );
+    }
+
+    #[test]
+    fn segments_same_errors_as_extract() {
+        let malformed = [
+            "text {p.name",
+            "text } more",
+            "{p.{name}}",
+            "{doc.total|float}",
+            "{p.OrderId}",
+            "{p.}",
+            "{doc.}",
+            "{doc.a.b.c.d.e.f}",
+            "{sender.email}",
+        ];
+        for text in malformed {
+            let from_extract = extract(text).expect_err("extract must fail");
+            let from_segments = segments(text).expect_err("segments must fail");
+            assert_eq!(
+                from_extract, from_segments,
+                "segments must reuse the extract error for {:?}",
+                text
+            );
+        }
     }
 }
