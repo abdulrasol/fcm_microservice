@@ -450,6 +450,43 @@ pub async fn touch_template_used(
     Ok(())
 }
 
+// ---------- T10-A: dashboard reads ----------
+
+/// Per-template metadata that is not part of the in-memory snapshot.
+pub struct TemplateMeta {
+    pub key: String,
+    pub version: i64,
+    pub last_used_at: Option<String>,
+    /// `last_used_at` is inside the last 30 days (the delete guard, plan 3.5).
+    pub recently_used: bool,
+}
+
+/// Template versions and last use. Read-only; the store still owns every write.
+pub async fn template_metadata(
+    pool: &SqlitePool,
+    app: &str,
+) -> Result<Vec<TemplateMeta>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT key, version, last_used_at, \
+         CASE WHEN last_used_at IS NOT NULL AND last_used_at >= datetime('now', '-30 days') \
+         THEN 1 ELSE 0 END AS recently_used \
+         FROM templates WHERE app = ? ORDER BY key",
+    )
+    .bind(app)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| TemplateMeta {
+            key: row.get("key"),
+            version: row.get("version"),
+            last_used_at: row.try_get("last_used_at").unwrap_or_default(),
+            recently_used: row.try_get::<i64, _>("recently_used").unwrap_or(0) != 0,
+        })
+        .collect())
+}
+
 // ---------- T8: per-uid template rate limit ----------
 
 /// Sliding window of the per-uid template limit (plan 3.5/3.15).

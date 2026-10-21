@@ -4,20 +4,23 @@
 //! envelope `{"error": "<code>", "message": "<text>"}` instead of the plain
 //! text used by the rest of the tool.
 
+pub mod apps;
 pub mod auth;
 pub mod password;
 pub mod session;
 
+use crate::config::store::ConfigError;
+use crate::config::validate::Issue;
 use crate::ratelimit::RateLimiter;
 use crate::AppState;
 use axum::extract::{FromRequest, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,11 +63,15 @@ impl ToolAuth {
 }
 
 /// The admin error envelope: `{"error": "<code>", "message": "<text>"}`.
+///
+/// A few documented responses have their own shape (`invalid`, `conflict`,
+/// `recently_used`); `body` carries those instead of the envelope.
 #[derive(Debug)]
 pub struct AdminError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    body: Option<Value>,
 }
 
 impl AdminError {
@@ -73,6 +80,16 @@ impl AdminError {
             status,
             code,
             message: message.to_string(),
+            body: None,
+        }
+    }
+
+    fn with_body(status: StatusCode, code: &'static str, body: Value) -> Self {
+        Self {
+            status,
+            code,
+            message: String::new(),
+            body: Some(body),
         }
     }
 
@@ -114,6 +131,56 @@ impl AdminError {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
     }
 
+    /// A stored configuration/template was rejected by the validators.
+    pub fn invalid(issues: Vec<Issue>) -> Self {
+        let issues: Vec<Value> = issues
+            .into_iter()
+            .map(|issue| json!({ "path": issue.path, "message": issue.message }))
+            .collect();
+        Self::with_body(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            json!({ "error": "invalid", "issues": issues }),
+        )
+    }
+
+    /// Someone else changed the version first.
+    pub fn conflict(current_version: i64) -> Self {
+        Self::with_body(
+            StatusCode::CONFLICT,
+            "conflict",
+            json!({ "error": "conflict", "current_version": current_version }),
+        )
+    }
+
+    pub fn not_found(message: &str) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not_found", message)
+    }
+
+    /// A template used inside the last 30 days cannot be deleted (plan 3.5).
+    pub fn recently_used() -> Self {
+        Self::with_body(
+            StatusCode::CONFLICT,
+            "recently_used",
+            json!({
+                "error": "recently_used",
+                "hint": "disable the template instead",
+            }),
+        )
+    }
+
+    pub fn unavailable(message: &str) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
+    }
+
+    pub fn too_many_requests() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many requests; retry later",
+        )
+    }
+
     pub fn rate_limited() -> Self {
         Self::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -135,8 +202,55 @@ impl AdminError {
 
 impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
-        let body = json!({ "error": self.code, "message": self.message });
+        let body = self
+            .body
+            .unwrap_or_else(|| json!({ "error": self.code, "message": self.message }));
         (self.status, Json(body)).into_response()
+    }
+}
+
+/// Maps a `ConfigStore` failure to the dashboard's documented error shapes.
+pub fn map_config_error(error: ConfigError) -> AdminError {
+    match error {
+        ConfigError::Invalid(issues) => AdminError::invalid(issues),
+        ConfigError::Conflict { current_version } => AdminError::conflict(current_version),
+        ConfigError::NotFound => AdminError::not_found("not found"),
+        ConfigError::Db(error) => AdminError::from_db("the configuration store", error),
+    }
+}
+
+/// What a route needs beyond a valid session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Need {
+    /// Owners and managers of the app.
+    AnyMember,
+    /// Owners only (identity, data source, devices, App Check, keys, import...).
+    Owner,
+}
+
+/// The single authorization helper used by every dashboard route (plan 3.11).
+///
+/// The caller's role is checked first, then the app binding, then existence. A
+/// manager who is not bound to an app always sees `403`, even when the app does
+/// not exist, so app names cannot be enumerated. An owner gets `404` for an
+/// unknown app.
+pub async fn authorize(
+    state: &AppState,
+    user: &auth::AuthedUser,
+    app: &str,
+    need: Need,
+) -> Result<(), AdminError> {
+    if need == Need::Owner {
+        user.require_owner()?;
+    }
+    user.require_app(app)?;
+
+    let configured = state.config.get(app).is_some();
+    let has_credentials = state.project_map.read().await.contains_key(app);
+    if configured || has_credentials {
+        Ok(())
+    } else {
+        Err(AdminError::not_found("the app does not exist"))
     }
 }
 
@@ -215,6 +329,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/auth/me", get(auth::me))
         .route("/auth/password", post(auth::change_password))
         .route("/auth/reauth", post(auth::reauth))
+        .route("/apps", get(apps::list_apps))
+        .route("/apps/:app", get(apps::get_app))
+        .route("/apps/:app/init", post(apps::init_app))
+        .route("/apps/:app/:section", put(apps::put_section))
         .layer(axum::middleware::from_fn_with_state(state, csrf_guard))
 }
 
@@ -237,7 +355,7 @@ pub fn spawn_session_cleanup(tool_auth: Arc<ToolAuth>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::admin::auth::Role;
     use crate::auth::{AuthConfig, AuthService};
@@ -255,11 +373,11 @@ mod tests {
     use tokio::sync::RwLock;
     use tower::ServiceExt;
 
-    const PASSWORD: &str = "correct horse battery 2026";
+    pub(crate) const PASSWORD: &str = "correct horse battery 2026";
     const NEW_PASSWORD: &str = "a brand new passphrase 2026";
     const DASHBOARD_ORIGIN: &str = "http://localhost:5173";
 
-    async fn memory_pool() -> SqlitePool {
+    pub(crate) async fn memory_pool() -> SqlitePool {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")
             .expect("the options must parse")
             .foreign_keys(true);
@@ -274,7 +392,16 @@ mod tests {
         pool
     }
 
-    async fn test_state(pool: SqlitePool) -> Arc<AppState> {
+    pub(crate) async fn test_state(pool: SqlitePool) -> Arc<AppState> {
+        test_state_with_env(pool, None, None).await
+    }
+
+    /// A state whose data-source environment and FCM transport can be replaced.
+    pub(crate) async fn test_state_with_env(
+        pool: SqlitePool,
+        env: Option<Arc<dyn crate::identity::jwt::EnvSource>>,
+        fcm: Option<Arc<dyn crate::send::FcmTransport>>,
+    ) -> Arc<AppState> {
         let client = Client::builder()
             .build()
             .expect("the test client must build");
@@ -285,18 +412,19 @@ mod tests {
                 .await
                 .expect("the config store must open"),
         );
+        let env = env.unwrap_or_else(|| Arc::new(crate::identity::jwt::SystemEnv));
         let identity = Arc::new(crate::identity::registry::IdentityRegistry::new(
             config.clone(),
             project_map.clone(),
             client.clone(),
-            Arc::new(crate::identity::jwt::SystemEnv),
+            env.clone(),
         ));
         let datasource = Arc::new(crate::datasource::registry::DataSourceRegistry::new(
             config.clone(),
             project_map.clone(),
             auth_map.clone(),
             client.clone(),
-            Arc::new(crate::identity::jwt::SystemEnv),
+            env,
         ));
         let auth = AuthService::new(
             project_map.clone(),
@@ -319,7 +447,9 @@ mod tests {
             allowed_origins: vec![DASHBOARD_ORIGIN.to_string()],
         });
 
-        let fcm = Arc::new(crate::send::HttpFcm::new(client.clone(), auth_map.clone()));
+        let fcm = fcm.unwrap_or_else(|| {
+            Arc::new(crate::send::HttpFcm::new(client.clone(), auth_map.clone()))
+        });
 
         Arc::new(AppState {
             db: pool.clone(),
@@ -342,11 +472,15 @@ mod tests {
         })
     }
 
-    fn app(state: Arc<AppState>) -> Router {
+    pub(crate) fn app(state: Arc<AppState>) -> Router {
         router(state.clone()).with_state(state)
     }
 
-    fn build_request(method: Method, uri: &str, body: Option<serde_json::Value>) -> Request {
+    pub(crate) fn build_request(
+        method: Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> Request {
         let mut builder = Request::builder()
             .method(method)
             .uri(uri)
@@ -365,14 +499,14 @@ mod tests {
         request
     }
 
-    fn with_cookie(mut request: Request, name: &str, token: &str) -> Request {
+    pub(crate) fn with_cookie(mut request: Request, name: &str, token: &str) -> Request {
         let value =
             HeaderValue::from_str(&format!("{}={}", name, token)).expect("a valid cookie header");
         request.headers_mut().insert(header::COOKIE, value);
         request
     }
 
-    async fn read_json(response: Response) -> serde_json::Value {
+    pub(crate) async fn read_json(response: Response) -> serde_json::Value {
         let bytes = response
             .into_body()
             .collect()
@@ -391,7 +525,7 @@ mod tests {
             .to_string()
     }
 
-    fn session_token(response: &Response) -> String {
+    pub(crate) fn session_token(response: &Response) -> String {
         session::read_cookie(
             [set_cookie_of(response).as_str()],
             session::SECURE_COOKIE_NAME,
@@ -399,7 +533,7 @@ mod tests {
         .expect("the cookie must carry the token")
     }
 
-    async fn insert_user(
+    pub(crate) async fn insert_user(
         pool: &SqlitePool,
         email: &str,
         role: &str,
@@ -435,7 +569,7 @@ mod tests {
             .expect("the login must run")
     }
 
-    async fn send(app: &Router, request: Request) -> Response {
+    pub(crate) async fn send(app: &Router, request: Request) -> Response {
         app.clone()
             .oneshot(request)
             .await
@@ -1089,4 +1223,233 @@ mod tests {
             .expect("the count must exist");
         assert_eq!(count, 0, "ON DELETE CASCADE needs PRAGMA foreign_keys=ON");
     }
+
+    // ---------- T10-A shared harness ----------
+
+    pub(crate) const APP: &str = "watt";
+    pub(crate) const OTHER_APP: &str = "other";
+    pub(crate) const DATASOURCE_SECRET_ENV: &str = "ADMIN_TEST_DS_SECRET";
+
+    pub(crate) struct FakeEnv;
+
+    impl crate::identity::jwt::EnvSource for FakeEnv {
+        fn get(&self, name: &str) -> Option<String> {
+            (name == DATASOURCE_SECRET_ENV).then(|| "0123456789abcdef0123456789abcdef".to_string())
+        }
+    }
+
+    /// Counts FCM calls and remembers the addressed tokens.
+    #[derive(Default)]
+    pub(crate) struct CountingFcm {
+        calls: std::sync::atomic::AtomicUsize,
+        tokens: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingFcm {
+        pub(crate) fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        pub(crate) fn tokens(&self) -> Vec<String> {
+            self.tokens
+                .lock()
+                .expect("the token list must be readable")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::send::FcmTransport for CountingFcm {
+        async fn send(
+            &self,
+            _app: &str,
+            _project_id: &str,
+            message: serde_json::Value,
+        ) -> Result<crate::send::FcmOutcome, crate::send::SendError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(token) = message
+                .pointer("/message/token")
+                .and_then(serde_json::Value::as_str)
+            {
+                self.tokens
+                    .lock()
+                    .expect("the token list must be writable")
+                    .push(token.to_string());
+            }
+            Ok(crate::send::FcmOutcome::Accepted {
+                body: "{}".to_string(),
+            })
+        }
+    }
+
+    /// Creates the configuration and the credentials entry for `app`.
+    pub(crate) async fn bind_app(state: &Arc<AppState>, app: &str, project: &str) {
+        if state.config.get(app).is_none() {
+            state
+                .config
+                .create_app(app, "tester")
+                .await
+                .expect("the app configuration must be created");
+        }
+        state
+            .project_map
+            .write()
+            .await
+            .insert(app.to_string(), project.to_string());
+    }
+
+    /// Adds credentials without a configuration (`POST /init` scenario).
+    pub(crate) async fn add_credentials(state: &Arc<AppState>, app: &str, project: &str) {
+        state
+            .project_map
+            .write()
+            .await
+            .insert(app.to_string(), project.to_string());
+    }
+
+    pub(crate) struct Harness {
+        pub state: Arc<AppState>,
+        pub pool: SqlitePool,
+        pub router: Router,
+        pub token: String,
+        pub user_id: i64,
+        pub fcm: Arc<CountingFcm>,
+    }
+
+    impl Harness {
+        pub(crate) async fn call(
+            &self,
+            method: Method,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, serde_json::Value) {
+            call(&self.router, method, uri, body, Some(&self.token), true).await
+        }
+
+        /// Marks the session freshly re-authenticated.
+        pub(crate) async fn reauth(&self) {
+            sqlx::query("UPDATE tool_sessions SET reauth_at = ? WHERE id_hash = ?")
+                .bind(session::now_epoch())
+                .bind(session::hash_token(&self.token))
+                .execute(&self.pool)
+                .await
+                .expect("the session must be updated");
+        }
+
+        pub(crate) async fn set_test_uid(&self, uid: &str) {
+            sqlx::query("UPDATE tool_users SET test_uid = ? WHERE id = ?")
+                .bind(uid)
+                .bind(self.user_id)
+                .execute(&self.pool)
+                .await
+                .expect("the test uid must be set");
+        }
+
+        pub(crate) async fn register_device(&self, uid: &str, token: &str) {
+            self.state
+                .devices
+                .register(APP, uid, token, crate::devices::Platform::Android, 20)
+                .await
+                .expect("the device must register");
+        }
+
+        pub(crate) async fn save_template(&self, key: &str, definition: serde_json::Value) {
+            self.state
+                .config
+                .save_template(APP, key, definition, "tester", None)
+                .await
+                .expect("the template must save");
+        }
+    }
+
+    /// Logs in a dashboard account bound to the given apps.
+    pub(crate) async fn setup(role: &str, bound: &[&str]) -> Harness {
+        setup_with_env(role, bound, None).await
+    }
+
+    pub(crate) async fn setup_with_env(
+        role: &str,
+        bound: &[&str],
+        env: Option<Arc<dyn crate::identity::jwt::EnvSource>>,
+    ) -> Harness {
+        let pool = memory_pool().await;
+        let fcm = Arc::new(CountingFcm::default());
+        let state = test_state_with_env(pool.clone(), env, Some(fcm.clone())).await;
+        bind_app(&state, APP, "project-watt").await;
+        bind_app(&state, OTHER_APP, "project-other").await;
+
+        let user_id = insert_user(&pool, "user@example.com", role, false).await;
+        for app in bound {
+            sqlx::query("INSERT INTO tool_user_apps (user_id, app) VALUES (?, ?)")
+                .bind(user_id)
+                .bind(app)
+                .execute(&pool)
+                .await
+                .expect("the app binding must be inserted");
+        }
+
+        let router = app(state.clone());
+        let login = login_request(&router, "user@example.com", PASSWORD).await;
+        let token = session_token(&login);
+        Harness {
+            state,
+            pool,
+            router,
+            token,
+            user_id,
+            fcm,
+        }
+    }
+
+    pub(crate) async fn call(
+        router: &Router,
+        method: Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        token: Option<&str>,
+        csrf: bool,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if csrf {
+            builder = builder.header("x-requested-with", CSRF_HEADER_VALUE);
+        }
+        if let Some(token) = token {
+            builder = builder.header(
+                header::COOKIE,
+                format!("{}={}", session::SECURE_COOKIE_NAME, token),
+            );
+        }
+        let body = match body {
+            Some(value) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(value.to_string())
+            }
+            None => Body::empty(),
+        };
+        let mut request = builder.body(body).expect("the request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the request must run");
+        let status = response.status();
+        let body = read_json(response).await;
+        (status, body)
+    }
+
+    /// A minimal admin-only template that passes the validators.
+    pub(crate) fn sample_template() -> serde_json::Value {
+        json!({
+            "description": "Sample admin alert",
+            "enabled": true,
+            "senders": ["admin"],
+            "to": { "role": "admin" },
+            "title": "Hello",
+            "body": "Body"
+        })
+    }
+
 }

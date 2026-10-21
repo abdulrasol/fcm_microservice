@@ -141,6 +141,16 @@ pub async fn load_user_by_id(
     }
 }
 
+/// The `test_uid` bound to a dashboard account (test-send destination).
+pub async fn load_test_uid(pool: &SqlitePool, user_id: i64) -> Result<Option<String>, sqlx::Error> {
+    let value: Option<Option<String>> =
+        sqlx::query_scalar("SELECT test_uid FROM tool_users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(value.flatten())
+}
+
 /// The authenticated caller, built from the session cookie on every request.
 #[derive(Clone, Debug)]
 pub struct AuthedUser {
@@ -150,14 +160,10 @@ pub struct AuthedUser {
     pub apps: Vec<String>,
     pub must_change_password: bool,
     pub session_id_hash: String,
-    /// Read by `require_reauth`, which T10 wires to the admin routes.
-    #[allow(dead_code)]
+    /// The last password confirmation, for `require_reauth`.
     pub reauth_at: Option<i64>,
 }
 
-// The three guards are the reusable authorization API for T10; they have no
-// route of their own yet, so they are exercised by tests only.
-#[allow(dead_code)]
 impl AuthedUser {
     /// Owner-only actions (app keys, account management).
     pub fn require_owner(&self) -> Result<(), AdminError> {
