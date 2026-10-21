@@ -2068,6 +2068,31 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_body_unauthenticated_is_401() {
+        // The session is checked before the body, so a broken body of an
+        // anonymous request is a 401 and never a 400.
+        let harness = setup("owner", &[]).await;
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/apps/{}/identity/test", APP))
+            .header("x-requested-with", CSRF_HEADER_VALUE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{not json"))
+            .expect("the request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+
+        let response = harness
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the request must run");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn matrix_covers_new_routes() {
         let harness = setup("owner", &[]).await;
         harness.reauth().await;
