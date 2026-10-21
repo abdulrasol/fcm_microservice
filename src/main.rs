@@ -822,10 +822,7 @@ async fn send_notification(
             identity.email.as_deref(),
         )
         .await;
-        Ok((
-            StatusCode::OK,
-            Json(json!({ "status": "success", "response": body_text })),
-        ))
+        Ok(raw_send_success_response(body_text))
     } else {
         let _ = db::log_notification(
             &state.db,
@@ -839,22 +836,41 @@ async fn send_notification(
             identity.email.as_deref(),
         )
         .await;
-        let parsed_error: serde_json::Value =
-            serde_json::from_str(&body_text).unwrap_or_else(|_| json!(body_text));
-        let client_status = if status.as_u16() >= 400 && status.as_u16() < 500 {
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_REQUEST)
-        } else {
-            StatusCode::BAD_REQUEST
-        };
-        Ok((
-            client_status,
-            Json(json!({
-                "status": "failed",
-                "error": "fcm_error",
-                "response": parsed_error
-            })),
-        ))
+        Ok(raw_send_fcm_error_response(status.as_u16(), &body_text))
     }
+}
+
+/// Maps a successful FCM response to the raw `/send` response.
+fn raw_send_success_response(body_text: String) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "success", "response": body_text })),
+    )
+}
+
+/// Maps a failed FCM HTTP response to the raw `/send` response.
+///
+/// An FCM `4xx` status is passed through; every other status is reported as
+/// `400`, which is the historical behavior of the route.
+fn raw_send_fcm_error_response(
+    http_status: u16,
+    body_text: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let parsed_error: serde_json::Value =
+        serde_json::from_str(body_text).unwrap_or_else(|_| json!(body_text));
+    let client_status = if (400..500).contains(&http_status) {
+        StatusCode::from_u16(http_status).unwrap_or(StatusCode::BAD_REQUEST)
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        client_status,
+        Json(json!({
+            "status": "failed",
+            "error": "fcm_error",
+            "response": parsed_error
+        })),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1018,4 +1034,294 @@ async fn unregister_device(
         .map_err(device_error)?;
 
     Ok((StatusCode::OK, Json(json!({ "removed": removed }))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::{session::CookieConfig, ToolAuth};
+    use crate::config::store::ConfigStore;
+    use crate::datasource::registry::DataSourceRegistry;
+    use crate::devices::DeviceStore;
+    use crate::identity::jwt::EnvSource;
+    use crate::identity::registry::IdentityRegistry;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use hyper::client::HttpConnector;
+    use hyper_rustls::HttpsConnector;
+    use serde_json::Value;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+    use yup_oauth2::{
+        authenticator::Authenticator, ServiceAccountAuthenticator, ServiceAccountKey,
+    };
+
+    const APP: &str = "testapp";
+    const SERVICE_KEY: &str = "test-service-key";
+    const PROJECT: &str = "test-project";
+
+    fn test_client() -> Client {
+        Client::builder()
+            .build()
+            .expect("the test client must build")
+    }
+
+    async fn memory_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("the in-memory database must open");
+        db::migrate(&pool).await.expect("the migrations must run");
+        pool
+    }
+
+    struct FakeEnv;
+
+    impl EnvSource for FakeEnv {
+        fn get(&self, _name: &str) -> Option<String> {
+            None
+        }
+    }
+
+    async fn test_state(client: Client) -> Arc<AppState> {
+        let pool = memory_pool().await;
+        let config = Arc::new(
+            ConfigStore::new(pool.clone())
+                .await
+                .expect("the config store must open"),
+        );
+        config
+            .create_app(APP, "tester")
+            .await
+            .expect("the app must be created");
+
+        let project_map: ProjectIdMap = Arc::new(RwLock::new(HashMap::new()));
+        let auth_map: AuthMap = Arc::new(RwLock::new(HashMap::new()));
+        let env: Arc<dyn EnvSource> = Arc::new(FakeEnv);
+        let identity = Arc::new(IdentityRegistry::new(
+            config.clone(),
+            project_map.clone(),
+            client.clone(),
+            env.clone(),
+        ));
+        let datasource = Arc::new(DataSourceRegistry::new(
+            config.clone(),
+            project_map.clone(),
+            auth_map.clone(),
+            client.clone(),
+            env,
+        ));
+        let auth = AuthService::new(
+            project_map.clone(),
+            identity.clone(),
+            datasource.clone(),
+            config.clone(),
+            AuthConfig {
+                service_api_key: Some(SERVICE_KEY.to_string()),
+                legacy_api_key: None,
+                legacy_enabled: false,
+            },
+        );
+        let tool_auth = Arc::new(ToolAuth {
+            pool: pool.clone(),
+            cookie: CookieConfig::with_hours(true, 12),
+            login_limiter: RateLimiter::new(5, Duration::from_secs(900)),
+            dummy_hash: "unused in send tests".to_string(),
+            allowed_origins: Vec::new(),
+        });
+
+        Arc::new(AppState {
+            db: pool.clone(),
+            auth_map,
+            project_map,
+            client,
+            auth,
+            trust_proxy: false,
+            topics_limiter: RateLimiter::new(30, Duration::from_secs(60)),
+            auth_fail_limiter: RateLimiter::new(10, Duration::from_secs(60)),
+            config,
+            tool_auth,
+            devices: Arc::new(DeviceStore::new(pool.clone())),
+            devices_limiter: RateLimiter::new(20, Duration::from_secs(60)),
+            identity,
+            datasource,
+        })
+    }
+
+    fn send_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/send", post(send_notification))
+            .with_state(state)
+    }
+
+    fn send_request(body: Value) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {SERVICE_KEY}"))
+            .body(Body::from(body.to_string()))
+            .expect("the request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+        request
+    }
+
+    async fn call(router: &Router, request: Request<Body>) -> (StatusCode, String) {
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router must answer");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("the body must be readable")
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// A service-account key with a throwaway RSA key, only to build a real
+    /// `yup-oauth2` authenticator whose token endpoint is under test control.
+    fn test_private_key_pem() -> String {
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048)
+            .expect("the test key must generate");
+        key.to_pkcs8_pem(LineEnding::LF)
+            .expect("the test key must encode")
+            .to_string()
+    }
+
+    async fn fake_authenticator(token_uri: &str) -> Authenticator<HttpsConnector<HttpConnector>> {
+        let key = ServiceAccountKey {
+            key_type: Some("service_account".to_string()),
+            project_id: Some(PROJECT.to_string()),
+            private_key_id: None,
+            private_key: test_private_key_pem(),
+            client_email: "tester@example.com".to_string(),
+            client_id: None,
+            auth_uri: None,
+            token_uri: token_uri.to_string(),
+            auth_provider_x509_cert_url: None,
+            client_x509_cert_url: None,
+        };
+        ServiceAccountAuthenticator::builder(key)
+            .build()
+            .await
+            .expect("the fake authenticator must build")
+    }
+
+    /// A minimal plain-HTTP token endpoint for the fake authenticator.
+    async fn spawn_token_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the token server must bind");
+        let addr = listener.local_addr().expect("the address must be known");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    let body =
+                        r#"{"access_token":"test-token","expires_in":3600,"token_type":"Bearer"}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/token")
+    }
+
+    #[test]
+    fn raw_send_success_response_shape() {
+        let body_text = r#"{"name":"projects/test/messages/1"}"#;
+        let (status, Json(body)) = raw_send_success_response(body_text.to_string());
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "status": "success", "response": body_text }));
+    }
+
+    #[test]
+    fn raw_send_fcm_4xx_is_passed_through() {
+        for code in [400u16, 403, 404, 429] {
+            let (status, Json(body)) =
+                raw_send_fcm_error_response(code, r#"{"error":{"status":"INVALID_ARGUMENT"}}"#);
+
+            assert_eq!(status.as_u16(), code);
+            assert_eq!(body["status"], "failed");
+            assert_eq!(body["error"], "fcm_error");
+            assert_eq!(body["response"]["error"]["status"], "INVALID_ARGUMENT");
+        }
+
+        // A non-JSON body is kept as a string, and a non-4xx status is 400.
+        let (status, Json(body)) = raw_send_fcm_error_response(503, "upstream down");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["response"], "upstream down");
+    }
+
+    #[tokio::test]
+    async fn raw_send_token_failure_is_502() {
+        let state = test_state(test_client()).await;
+        state
+            .project_map
+            .write()
+            .await
+            .insert(APP.to_string(), PROJECT.to_string());
+        // Nothing listens on port 1, so the token request fails.
+        let auth = fake_authenticator("http://127.0.0.1:1/token").await;
+        state.auth_map.write().await.insert(APP.to_string(), auth);
+
+        let (status, body) = call(
+            &send_router(state),
+            send_request(json!({ "app": APP, "topic": "all", "title": "Hi" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body, "Could not authenticate with Firebase");
+    }
+
+    #[tokio::test]
+    async fn raw_send_network_failure_is_502() {
+        // The token step succeeds against the local server; the FCM call itself
+        // is pointed at a closed port.
+        let client = Client::builder()
+            .resolve("fcm.googleapis.com", SocketAddr::from(([127, 0, 0, 1], 1)))
+            .build()
+            .expect("the test client must build");
+        let state = test_state(client).await;
+        state
+            .project_map
+            .write()
+            .await
+            .insert(APP.to_string(), PROJECT.to_string());
+        let token_uri = spawn_token_server().await;
+        let auth = fake_authenticator(&token_uri).await;
+        state.auth_map.write().await.insert(APP.to_string(), auth);
+
+        let (status, body) = call(
+            &send_router(state),
+            send_request(json!({ "app": APP, "topic": "all", "title": "Hi" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body, "Network error while calling Firebase");
+    }
 }
