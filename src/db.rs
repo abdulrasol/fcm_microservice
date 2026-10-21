@@ -1119,6 +1119,21 @@ pub async fn unblock_entity(
     Ok(result.rows_affected() == 1)
 }
 
+/// Fails the campaigns that were still sending when the process stopped.
+///
+/// The tool runs as one instance, so a campaign that is `sending` at startup
+/// is orphaned: its FCM call never came back. The number of failed campaigns
+/// is returned so the caller can log it.
+pub async fn fail_stale_sending(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE campaigns SET status = 'failed', fcm_response = 'interrupted by restart', \
+         sent_at = NULL WHERE status = 'sending'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 // ---------- T10-B: dashboard history and device statistics ----------
 
 /// One history row. The payload is the rendered content, never a token.
@@ -1756,6 +1771,79 @@ mod tests {
         assert_eq!(row.0, "sending");
         assert_eq!(row.1.as_deref(), Some("owner@example.com"));
         assert!(row.2.is_some(), "the decision time must be written");
+    }
+
+    #[tokio::test]
+    async fn stale_sending_campaigns_fail_on_startup() {
+        let pool = memory_pool().await;
+        let sending = raw_campaign(&pool, "e1", "sending", 10).await;
+
+        let count = fail_stale_sending(&pool)
+            .await
+            .expect("the recovery must run");
+        assert_eq!(count, 1, "one campaign was interrupted");
+
+        let row: (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, fcm_response, sent_at FROM campaigns WHERE id = ?")
+                .bind(sending)
+                .fetch_one(&pool)
+                .await
+                .expect("the row must exist");
+        assert_eq!(row.0, "failed");
+        assert_eq!(row.1.as_deref(), Some("interrupted by restart"));
+        assert!(row.2.is_none(), "an interrupted campaign was never sent");
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_leaves_other_statuses_alone() {
+        let pool = memory_pool().await;
+        for status in ["pending_review", "sent", "failed", "rejected", "cancelled"] {
+            raw_campaign(&pool, "e1", status, 10).await;
+        }
+
+        let count = fail_stale_sending(&pool)
+            .await
+            .expect("the recovery must run");
+        assert_eq!(count, 0, "nothing was sending");
+
+        let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM campaigns ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("the rows must exist");
+        assert_eq!(
+            statuses,
+            vec![
+                "pending_review".to_string(),
+                "sent".to_string(),
+                "failed".to_string(),
+                "rejected".to_string(),
+                "cancelled".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_runs_before_serving() {
+        // The recovery must run after the store is open and before the server
+        // starts serving, so an orphaned campaign is never dispatched.
+        let main_source = include_str!("main.rs");
+        let open = main_source
+            .find("ConfigStore::new")
+            .expect("the startup must open the store");
+        let recovery = main_source
+            .find("fail_stale_sending")
+            .expect("the startup must call the recovery");
+        let serving = main_source
+            .find("axum::serve")
+            .expect("the startup must serve");
+        assert!(
+            open < recovery,
+            "the recovery must run after the store is open"
+        );
+        assert!(
+            recovery < serving,
+            "the recovery must run before the server serves"
+        );
     }
 
     #[tokio::test]

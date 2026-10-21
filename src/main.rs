@@ -233,6 +233,20 @@ async fn main() {
         config_store.app_count()
     );
 
+    // A campaign that was still sending when the process stopped is orphaned:
+    // its FCM call never came back. The recovery runs before the server
+    // serves, so an interrupted campaign is never dispatched.
+    match db::fail_stale_sending(&db_pool).await {
+        Ok(count) if count > 0 => {
+            tracing::warn!("{} interrupted campaign(s) marked as failed", count);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!("Failed to recover the interrupted campaigns: {}", error);
+            std::process::exit(1);
+        }
+    }
+
     let identity_registry = Arc::new(IdentityRegistry::new(
         config_store.clone(),
         project_map.clone(),
