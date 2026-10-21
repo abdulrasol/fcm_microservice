@@ -18,7 +18,8 @@ use axum::extract::{FromRequest, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::MethodRouter;
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -322,54 +323,126 @@ async fn csrf_guard(State(state): State<Arc<AppState>>, request: Request, next: 
     next.run(request).await
 }
 
+/// One admin route: its method, its path, whether it needs a dashboard
+/// session, and its handler.
+pub(crate) type AdminRoute = (
+    &'static str,
+    &'static str,
+    bool,
+    MethodRouter<Arc<AppState>>,
+);
+
+/// Every admin route in one table.
+///
+/// The table is the single source of truth: the router is built from it and
+/// the permission matrix test enumerates it, so a route cannot be added
+/// without a test covering it.
+pub(crate) fn admin_routes() -> Vec<AdminRoute> {
+    vec![
+        ("POST", "/auth/login", false, post(auth::login)),
+        ("POST", "/auth/logout", false, post(auth::logout)),
+        ("GET", "/auth/me", true, get(auth::me)),
+        ("POST", "/auth/password", true, post(auth::change_password)),
+        ("POST", "/auth/reauth", true, post(auth::reauth)),
+        ("GET", "/apps", true, get(apps::list_apps)),
+        ("GET", "/apps/:app", true, get(apps::get_app)),
+        ("POST", "/apps/:app/init", true, post(apps::init_app)),
+        ("PUT", "/apps/:app/:section", true, put(apps::put_section)),
+        (
+            "GET",
+            "/apps/:app/templates",
+            true,
+            get(templates::list_templates),
+        ),
+        (
+            "POST",
+            "/apps/:app/templates",
+            true,
+            post(templates::create_template),
+        ),
+        (
+            "POST",
+            "/apps/:app/templates/validate",
+            true,
+            post(templates::validate_definition),
+        ),
+        (
+            "GET",
+            "/apps/:app/templates/:key",
+            true,
+            get(templates::get_template),
+        ),
+        (
+            "PUT",
+            "/apps/:app/templates/:key",
+            true,
+            put(templates::update_template),
+        ),
+        (
+            "DELETE",
+            "/apps/:app/templates/:key",
+            true,
+            delete(templates::delete_template),
+        ),
+        (
+            "PUT",
+            "/apps/:app/templates/:key/enabled",
+            true,
+            put(templates::set_enabled),
+        ),
+        (
+            "POST",
+            "/apps/:app/templates/:key/preview",
+            true,
+            post(templates::preview),
+        ),
+        (
+            "POST",
+            "/apps/:app/templates/:key/test-send",
+            true,
+            post(templates::test_send),
+        ),
+        ("GET", "/apps/:app/versions", true, get(apps::list_versions)),
+        (
+            "GET",
+            "/apps/:app/versions/:id",
+            true,
+            get(apps::get_version),
+        ),
+        (
+            "POST",
+            "/apps/:app/versions/:id/restore",
+            true,
+            post(apps::restore_version),
+        ),
+        ("GET", "/apps/:app/export", true, get(apps::export)),
+        ("POST", "/apps/:app/import", true, post(apps::import)),
+        ("GET", "/audit", true, get(apps::audit)),
+    ]
+}
+
+/// Merges the routes of the same path into one method router.
+fn merge_routes(routes: Vec<AdminRoute>) -> Vec<(&'static str, MethodRouter<Arc<AppState>>)> {
+    let mut merged: Vec<(&'static str, MethodRouter<Arc<AppState>>)> = Vec::new();
+    for (_, path, _, method_router) in routes {
+        match merged.iter_mut().find(|(known, _)| *known == path) {
+            Some((_, known)) => {
+                let taken = std::mem::replace(known, MethodRouter::new());
+                *known = taken.merge(method_router);
+            }
+            None => merged.push((path, method_router)),
+        }
+    }
+    merged
+}
+
 /// The admin routes. The caller nests this under `/admin`.
 pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/auth/login", post(auth::login))
-        .route("/auth/logout", post(auth::logout))
-        .route("/auth/me", get(auth::me))
-        .route("/auth/password", post(auth::change_password))
-        .route("/auth/reauth", post(auth::reauth))
-        .route("/apps", get(apps::list_apps))
-        .route("/apps/:app", get(apps::get_app))
-        .route("/apps/:app/init", post(apps::init_app))
-        .route("/apps/:app/:section", put(apps::put_section))
-        .route(
-            "/apps/:app/templates",
-            get(templates::list_templates).post(templates::create_template),
-        )
-        .route(
-            "/apps/:app/templates/validate",
-            post(templates::validate_definition),
-        )
-        .route(
-            "/apps/:app/templates/:key",
-            get(templates::get_template)
-                .put(templates::update_template)
-                .delete(templates::delete_template),
-        )
-        .route(
-            "/apps/:app/templates/:key/enabled",
-            put(templates::set_enabled),
-        )
-        .route(
-            "/apps/:app/templates/:key/preview",
-            post(templates::preview),
-        )
-        .route(
-            "/apps/:app/templates/:key/test-send",
-            post(templates::test_send),
-        )
-        .route("/apps/:app/versions", get(apps::list_versions))
-        .route("/apps/:app/versions/:id", get(apps::get_version))
-        .route(
-            "/apps/:app/versions/:id/restore",
-            post(apps::restore_version),
-        )
-        .route("/apps/:app/export", get(apps::export))
-        .route("/apps/:app/import", post(apps::import))
-        .route("/audit", get(apps::audit))
-        .layer(axum::middleware::from_fn_with_state(state, csrf_guard))
+    let mut router = Router::new();
+    for (path, method_router) in merge_routes(admin_routes()) {
+        router = router.route(path, method_router);
+    }
+    router.layer(axum::middleware::from_fn_with_state(state, csrf_guard))
 }
 
 /// Deletes expired sessions every hour; the task dies with the process.
@@ -1488,51 +1561,29 @@ pub(crate) mod tests {
         })
     }
 
+    /// Every registered route: its method, its path and whether it needs a
+    /// dashboard session. The list comes from the route table, so a new route
+    /// is covered by the matrix without touching the test.
+    fn registered_routes() -> Vec<(Method, String, bool)> {
+        admin_routes()
+            .into_iter()
+            .map(|(method, path, needs_session, _)| {
+                (
+                    Method::from_bytes(method.as_bytes()).expect("a known method"),
+                    path.to_string(),
+                    needs_session,
+                )
+            })
+            .collect()
+    }
+
     /// Every route that requires a dashboard session.
     fn protected_routes() -> Vec<(Method, String)> {
-        let mut routes = vec![
-            (Method::GET, "/auth/me".to_string()),
-            (Method::POST, "/auth/password".to_string()),
-            (Method::POST, "/auth/reauth".to_string()),
-            (Method::GET, "/apps".to_string()),
-            (Method::GET, format!("/apps/{}", APP)),
-            (Method::POST, format!("/apps/{}/init", APP)),
-            (Method::GET, format!("/apps/{}/templates", APP)),
-            (Method::POST, format!("/apps/{}/templates", APP)),
-            (Method::POST, format!("/apps/{}/templates/validate", APP)),
-            (Method::GET, format!("/apps/{}/templates/sample", APP)),
-            (Method::PUT, format!("/apps/{}/templates/sample", APP)),
-            (Method::DELETE, format!("/apps/{}/templates/sample", APP)),
-            (
-                Method::PUT,
-                format!("/apps/{}/templates/sample/enabled", APP),
-            ),
-            (
-                Method::POST,
-                format!("/apps/{}/templates/sample/preview", APP),
-            ),
-            (
-                Method::POST,
-                format!("/apps/{}/templates/sample/test-send", APP),
-            ),
-            (Method::GET, format!("/apps/{}/versions", APP)),
-            (Method::GET, format!("/apps/{}/versions/1", APP)),
-            (Method::POST, format!("/apps/{}/versions/1/restore", APP)),
-            (Method::GET, format!("/apps/{}/export", APP)),
-            (Method::POST, format!("/apps/{}/import", APP)),
-            (Method::GET, "/audit".to_string()),
-        ];
-        for section in [
-            "identity",
-            "data_source",
-            "devices",
-            "web_subscribe",
-            "campaigns",
-            "app_check",
-        ] {
-            routes.push((Method::PUT, format!("/apps/{}/{}", APP, section)));
-        }
-        routes
+        registered_routes()
+            .into_iter()
+            .filter(|(_, _, needs_session)| *needs_session)
+            .map(|(method, path, _)| (method, path))
+            .collect()
     }
 
     fn section_value(harness: &Harness, section: &str) -> serde_json::Value {
@@ -1567,6 +1618,49 @@ pub(crate) mod tests {
         }
     }
 
+    /// One matrix case: the registered route, the concrete request path and
+    /// the request body.
+    struct MatrixCase {
+        method: Method,
+        pattern: String,
+        path: String,
+        body: Option<serde_json::Value>,
+    }
+
+    impl MatrixCase {
+        fn new(method: Method, pattern: &str, body: Option<serde_json::Value>) -> Self {
+            MatrixCase {
+                method,
+                pattern: pattern.to_string(),
+                path: concrete_path(pattern),
+                body,
+            }
+        }
+
+        fn at(
+            method: Method,
+            pattern: &str,
+            path: String,
+            body: Option<serde_json::Value>,
+        ) -> Self {
+            MatrixCase {
+                method,
+                pattern: pattern.to_string(),
+                path,
+                body,
+            }
+        }
+    }
+
+    /// A concrete request path for a route pattern.
+    fn concrete_path(pattern: &str) -> String {
+        pattern
+            .replace(":app", APP)
+            .replace(":section", "identity")
+            .replace(":key", "sample")
+            .replace(":id", "1")
+    }
+
     #[tokio::test]
     async fn matrix_owner_can_reach_every_route() {
         let harness = setup("owner", &[]).await;
@@ -1580,61 +1674,72 @@ pub(crate) mod tests {
             .call(Method::GET, &format!("/apps/{}/export", APP), None)
             .await;
 
-        let mut routes: Vec<(Method, String, Option<serde_json::Value>)> = vec![
-            (Method::GET, "/apps".to_string(), None),
-            (Method::GET, format!("/apps/{}", APP), None),
-            (Method::POST, format!("/apps/{}/init", APP), Some(json!({}))),
-            (Method::GET, format!("/apps/{}/templates", APP), None),
-            (
+        let mut cases: Vec<MatrixCase> = vec![
+            MatrixCase::new(
                 Method::POST,
-                format!("/apps/{}/templates", APP),
+                "/auth/login",
+                Some(json!({ "email": "user@example.com", "password": PASSWORD })),
+            ),
+            MatrixCase::new(Method::GET, "/auth/me", None),
+            MatrixCase::new(
+                Method::POST,
+                "/auth/reauth",
+                Some(json!({ "password": PASSWORD })),
+            ),
+            MatrixCase::new(
+                Method::POST,
+                "/auth/password",
+                Some(json!({
+                    "current_password": PASSWORD,
+                    "new_password": "new password 2026"
+                })),
+            ),
+            MatrixCase::new(Method::GET, "/apps", None),
+            MatrixCase::new(Method::GET, "/apps/:app", None),
+            MatrixCase::new(Method::POST, "/apps/:app/init", Some(json!({}))),
+            MatrixCase::new(Method::GET, "/apps/:app/templates", None),
+            MatrixCase::new(
+                Method::POST,
+                "/apps/:app/templates",
                 Some(json!({ "key": "matrix_new", "definition": sample_template() })),
             ),
-            (
+            MatrixCase::new(
                 Method::POST,
-                format!("/apps/{}/templates/validate", APP),
+                "/apps/:app/templates/validate",
                 Some(json!({ "definition": sample_template() })),
             ),
-            (Method::GET, format!("/apps/{}/templates/sample", APP), None),
-            (
+            MatrixCase::new(Method::GET, "/apps/:app/templates/:key", None),
+            MatrixCase::new(
                 Method::PUT,
-                format!("/apps/{}/templates/sample", APP),
+                "/apps/:app/templates/:key",
                 Some(json!({ "definition": sample_template(), "expected_version": 1 })),
             ),
-            (
+            MatrixCase::new(
                 Method::PUT,
-                format!("/apps/{}/templates/sample/enabled", APP),
+                "/apps/:app/templates/:key/enabled",
                 Some(json!({ "enabled": true })),
             ),
-            (
+            MatrixCase::new(
                 Method::POST,
-                format!("/apps/{}/templates/sample/preview", APP),
+                "/apps/:app/templates/:key/preview",
                 Some(json!({ "params": {}, "sender": { "uid": "u1" } })),
             ),
-            (
+            MatrixCase::new(
                 Method::POST,
-                format!("/apps/{}/templates/sample/test-send", APP),
+                "/apps/:app/templates/:key/test-send",
                 Some(json!({ "params": {}, "sender": { "uid": "u1" } })),
             ),
-            (Method::GET, format!("/apps/{}/versions", APP), None),
-            (Method::GET, format!("/apps/{}/versions/1", APP), None),
-            (
+            MatrixCase::new(Method::GET, "/apps/:app/versions", None),
+            MatrixCase::new(Method::GET, "/apps/:app/versions/:id", None),
+            MatrixCase::new(
                 Method::POST,
-                format!("/apps/{}/versions/1/restore", APP),
+                "/apps/:app/versions/:id/restore",
                 Some(json!({})),
             ),
-            (Method::GET, format!("/apps/{}/export", APP), None),
-            (
-                Method::POST,
-                format!("/apps/{}/import", APP),
-                Some(document),
-            ),
-            (Method::GET, format!("/audit?app={}", APP), None),
-            (
-                Method::DELETE,
-                format!("/apps/{}/templates/sample", APP),
-                None,
-            ),
+            MatrixCase::new(Method::GET, "/apps/:app/export", None),
+            MatrixCase::new(Method::POST, "/apps/:app/import", Some(document)),
+            MatrixCase::at(Method::GET, "/audit", format!("/audit?app={}", APP), None),
+            MatrixCase::new(Method::DELETE, "/apps/:app/templates/:key", None),
         ];
         for section in [
             "identity",
@@ -1650,19 +1755,37 @@ pub(crate) mod tests {
                 .get(APP)
                 .expect("the app exists")
                 .version;
-            routes.push((
+            cases.push(MatrixCase::at(
                 Method::PUT,
+                "/apps/:app/:section",
                 format!("/apps/{}/{}", APP, section),
                 Some(json!({ "value": section_value(&harness, section), "expected_version": version })),
             ));
         }
+        // The last case ends the session, so it must stay at the end.
+        cases.push(MatrixCase::new(Method::POST, "/auth/logout", None));
 
-        for (method, uri, body) in routes {
+        // Every registered route must be covered here, so a new route cannot
+        // be added without a test.
+        let registered: std::collections::BTreeSet<(String, String)> = registered_routes()
+            .into_iter()
+            .map(|(method, pattern, _)| (method.as_str().to_string(), pattern))
+            .collect();
+        let covered: std::collections::BTreeSet<(String, String)> = cases
+            .iter()
+            .map(|case| (case.method.as_str().to_string(), case.pattern.clone()))
+            .collect();
+        assert_eq!(
+            covered, registered,
+            "the owner matrix must cover every registered route"
+        );
+
+        for case in cases {
             let (status, response) = call(
                 &harness.router,
-                method.clone(),
-                &uri,
-                body,
+                case.method.clone(),
+                &case.path,
+                case.body,
                 Some(&harness.token),
                 true,
             )
@@ -1671,16 +1794,16 @@ pub(crate) mod tests {
                 status,
                 StatusCode::UNAUTHORIZED,
                 "{} {} was not authenticated: {}",
-                method,
-                uri,
+                case.method,
+                case.path,
                 response
             );
             assert_ne!(
                 status,
                 StatusCode::FORBIDDEN,
                 "{} {} was refused: {}",
-                method,
-                uri,
+                case.method,
+                case.path,
                 response
             );
         }
