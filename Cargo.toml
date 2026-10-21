@@ -22,6 +22,7 @@ jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 subtle = "2"
 async-trait = "0.1"
 sha2 = "0.10"
+hmac = "0.12"
 regex = "1"
 argon2 = "0.5"
 rand = "0.8"

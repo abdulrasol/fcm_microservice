@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 pub mod firestore;
+pub mod http;
 
 use async_trait::async_trait;
 
