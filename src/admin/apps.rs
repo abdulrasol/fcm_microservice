@@ -140,6 +140,23 @@ pub struct SectionRequest {
     pub expected_version: i64,
 }
 
+/// `PUT /apps/{app}/campaigns`: the campaign list path shadows the section
+/// path, so the section save is registered on the static path as well.
+pub async fn put_campaigns_section(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(app): Path<String>,
+    AdminJson(request): AdminJson<SectionRequest>,
+) -> Result<Json<Value>, AdminError> {
+    put_section(
+        State(state),
+        user,
+        Path((app, "campaigns".to_string())),
+        AdminJson(request),
+    )
+    .await
+}
+
 /// `PUT /apps/{app}/{section}`.
 pub async fn put_section(
     State(state): State<Arc<AppState>>,
@@ -533,6 +550,24 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn init_unassigned_manager_is_403() {
+        // A manager that is not bound to the app learns nothing: the role is
+        // checked before the credentials and before any disclosure.
+        let harness = setup("manager", &[OTHER_APP]).await;
+        add_credentials(&harness.state, "fresh", "project-fresh").await;
+
+        let (status, body) = harness
+            .call(Method::POST, "/apps/fresh/init", Some(json!({})))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "forbidden");
+
+        let (status, body) = harness.call(Method::GET, "/apps/fresh", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "forbidden");
     }
 
     #[tokio::test]

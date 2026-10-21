@@ -6,6 +6,7 @@
 
 pub mod apps;
 pub mod auth;
+pub mod campaigns;
 pub mod password;
 pub mod session;
 pub mod templates;
@@ -418,6 +419,32 @@ pub(crate) fn admin_routes() -> Vec<AdminRoute> {
         ("GET", "/apps/:app/export", true, get(apps::export)),
         ("POST", "/apps/:app/import", true, post(apps::import)),
         ("GET", "/audit", true, get(apps::audit)),
+        (
+            "GET",
+            "/apps/:app/campaigns",
+            true,
+            get(campaigns::list_campaigns),
+        ),
+        // The static path of the campaign list would shadow the `campaigns`
+        // configuration section, so the section save is registered here too.
+        (
+            "PUT",
+            "/apps/:app/campaigns",
+            true,
+            put(apps::put_campaigns_section),
+        ),
+        (
+            "POST",
+            "/apps/:app/campaigns/:id/approve",
+            true,
+            post(campaigns::approve),
+        ),
+        (
+            "POST",
+            "/apps/:app/campaigns/:id/reject",
+            true,
+            post(campaigns::reject),
+        ),
     ]
 }
 
@@ -670,7 +697,7 @@ pub(crate) mod tests {
             .expect("the id must exist")
     }
 
-    async fn login_request(app: &Router, email: &str, password: &str) -> Response {
+    pub(crate) async fn login_request(app: &Router, email: &str, password: &str) -> Response {
         let body = json!({ "email": email, "password": password });
         app.clone()
             .oneshot(build_request(Method::POST, "/auth/login", Some(body)))
@@ -1661,15 +1688,8 @@ pub(crate) mod tests {
             .replace(":id", "1")
     }
 
-    #[tokio::test]
-    async fn matrix_owner_can_reach_every_route() {
-        let harness = setup("owner", &[]).await;
-        harness.reauth().await;
-        harness.set_test_uid("tester").await;
-        harness
-            .register_device("tester", "token-tester-1-0000000000000000000000000000")
-            .await;
-        harness.save_template("sample", sample_template()).await;
+    /// The owner matrix: one case per registered route.
+    async fn owner_matrix_cases(harness: &Harness) -> Vec<MatrixCase> {
         let (_, document) = harness
             .call(Method::GET, &format!("/apps/{}/export", APP), None)
             .await;
@@ -1740,6 +1760,25 @@ pub(crate) mod tests {
             MatrixCase::new(Method::POST, "/apps/:app/import", Some(document)),
             MatrixCase::at(Method::GET, "/audit", format!("/audit?app={}", APP), None),
             MatrixCase::new(Method::DELETE, "/apps/:app/templates/:key", None),
+            MatrixCase::new(Method::GET, "/apps/:app/campaigns", None),
+            MatrixCase::new(
+                Method::PUT,
+                "/apps/:app/campaigns",
+                Some(json!({
+                    "value": section_value(harness, "campaigns"),
+                    "expected_version": 1
+                })),
+            ),
+            MatrixCase::new(
+                Method::POST,
+                "/apps/:app/campaigns/:id/approve",
+                Some(json!({})),
+            ),
+            MatrixCase::new(
+                Method::POST,
+                "/apps/:app/campaigns/:id/reject",
+                Some(json!({ "note": "matrix" })),
+            ),
         ];
         for section in [
             "identity",
@@ -1759,22 +1798,50 @@ pub(crate) mod tests {
                 Method::PUT,
                 "/apps/:app/:section",
                 format!("/apps/{}/{}", APP, section),
-                Some(json!({ "value": section_value(&harness, section), "expected_version": version })),
+                Some(json!({ "value": section_value(harness, section), "expected_version": version })),
             ));
         }
         // The last case ends the session, so it must stay at the end.
         cases.push(MatrixCase::new(Method::POST, "/auth/logout", None));
+        cases
+    }
 
-        // Every registered route must be covered here, so a new route cannot
-        // be added without a test.
-        let registered: std::collections::BTreeSet<(String, String)> = registered_routes()
+    /// A route of the matrix: its method and its path pattern.
+    type MatrixRoute = (String, String);
+
+    /// The registered routes and the routes the matrix covers.
+    fn matrix_coverage(
+        cases: &[MatrixCase],
+    ) -> (
+        std::collections::BTreeSet<MatrixRoute>,
+        std::collections::BTreeSet<MatrixRoute>,
+    ) {
+        let registered: std::collections::BTreeSet<MatrixRoute> = registered_routes()
             .into_iter()
             .map(|(method, pattern, _)| (method.as_str().to_string(), pattern))
             .collect();
-        let covered: std::collections::BTreeSet<(String, String)> = cases
+        let covered: std::collections::BTreeSet<MatrixRoute> = cases
             .iter()
             .map(|case| (case.method.as_str().to_string(), case.pattern.clone()))
             .collect();
+        (registered, covered)
+    }
+
+    #[tokio::test]
+    async fn matrix_owner_can_reach_every_route() {
+        let harness = setup("owner", &[]).await;
+        harness.reauth().await;
+        harness.set_test_uid("tester").await;
+        harness
+            .register_device("tester", "token-tester-1-0000000000000000000000000000")
+            .await;
+        harness.save_template("sample", sample_template()).await;
+
+        let cases = owner_matrix_cases(&harness).await;
+
+        // Every registered route must be covered here, so a new route cannot
+        // be added without a test.
+        let (registered, covered) = matrix_coverage(&cases);
         assert_eq!(
             covered, registered,
             "the owner matrix must cover every registered route"

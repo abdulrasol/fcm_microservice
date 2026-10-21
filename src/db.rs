@@ -1,4 +1,4 @@
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
+use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, VecDeque};
 use std::env;
@@ -725,7 +725,10 @@ pub struct Campaign {
     pub condition: String,
     pub status: String,
     pub review_note: Option<String>,
+    pub reviewer: Option<String>,
+    pub fcm_response: Option<String>,
     pub created_at: String,
+    pub decided_at: Option<String>,
     pub sent_at: Option<String>,
 }
 
@@ -743,7 +746,10 @@ fn campaign_from_row(row: SqliteRow) -> Campaign {
         condition: row.get("condition"),
         status: row.get("status"),
         review_note: row.get("review_note"),
+        reviewer: row.get("reviewer"),
+        fcm_response: row.get("fcm_response"),
         created_at: row.get("created_at"),
+        decided_at: row.get("decided_at"),
         sent_at: row.get("sent_at"),
     }
 }
@@ -898,17 +904,80 @@ pub async fn list_campaigns(
 
 /// Moves a campaign from `pending_review` to `sending` exactly once.
 ///
-/// T9 creates campaigns that already need no review; the T10 approve route uses
-/// this to claim a pending campaign.
-#[allow(dead_code)]
-pub async fn claim_for_sending(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
+/// The reviewer and the decision time are written in the same statement as the
+/// status change, so a campaign can never be `sending` without knowing who
+/// approved it. The optional note is stored as the review note.
+pub async fn claim_for_sending(
+    pool: &SqlitePool,
+    id: i64,
+    reviewer: &str,
+    note: Option<&str>,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE campaigns SET status = 'sending' WHERE id = ? AND status = 'pending_review'",
+        "UPDATE campaigns SET status = 'sending', reviewer = ?, decided_at = CURRENT_TIMESTAMP, \
+         review_note = COALESCE(?, review_note) \
+         WHERE id = ? AND status = 'pending_review'",
     )
+    .bind(reviewer)
+    .bind(note)
     .bind(id)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Moves a campaign from `pending_review` to `rejected` exactly once.
+///
+/// The reviewer, the decision time and the note are written in the same
+/// statement as the status change.
+pub async fn reject_campaign(
+    pool: &SqlitePool,
+    id: i64,
+    reviewer: &str,
+    note: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE campaigns SET status = 'rejected', reviewer = ?, decided_at = CURRENT_TIMESTAMP, \
+         review_note = ? WHERE id = ? AND status = 'pending_review'",
+    )
+    .bind(reviewer)
+    .bind(note)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Lists an app's campaigns for the dashboard, with an optional status filter.
+///
+/// `limit` is capped at 100; `offset` is passed through.
+pub async fn list_campaigns_filtered(
+    pool: &SqlitePool,
+    app: &str,
+    status: Option<&str>,
+    entity_id: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Campaign>, sqlx::Error> {
+    let limit = i64::from(limit.min(100));
+    let offset = i64::from(offset);
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new("SELECT * FROM campaigns WHERE app = ");
+    query.push_bind(app.to_string());
+    if let Some(status) = status {
+        query.push(" AND status = ");
+        query.push_bind(status.to_string());
+    }
+    if let Some(entity_id) = entity_id {
+        query.push(" AND entity_id = ");
+        query.push_bind(entity_id.to_string());
+    }
+    query.push(" ORDER BY id DESC LIMIT ");
+    query.push_bind(limit);
+    query.push(" OFFSET ");
+    query.push_bind(offset);
+
+    let rows = query.build().fetch_all(pool).await?;
+    Ok(rows.into_iter().map(campaign_from_row).collect())
 }
 
 /// Cancels a pending campaign of the given app and entity.
@@ -1457,17 +1526,30 @@ mod tests {
         let pool = memory_pool().await;
         let pending = raw_campaign(&pool, "e1", "pending_review", 10).await;
 
-        assert!(claim_for_sending(&pool, pending)
+        assert!(claim_for_sending(&pool, pending, "owner@example.com", None)
             .await
             .expect("the claim must run"));
-        assert!(!claim_for_sending(&pool, pending)
-            .await
-            .expect("the second claim must run"));
+        assert!(
+            !claim_for_sending(&pool, pending, "owner@example.com", None)
+                .await
+                .expect("the second claim must run")
+        );
 
         let sent = raw_campaign(&pool, "e1", "sent", 10).await;
-        assert!(!claim_for_sending(&pool, sent)
+        assert!(!claim_for_sending(&pool, sent, "owner@example.com", None)
             .await
             .expect("the claim must run"));
+
+        // The reviewer and the decision time are written with the status.
+        let row: (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, reviewer, decided_at FROM campaigns WHERE id = ?")
+                .bind(pending)
+                .fetch_one(&pool)
+                .await
+                .expect("the row must exist");
+        assert_eq!(row.0, "sending");
+        assert_eq!(row.1.as_deref(), Some("owner@example.com"));
+        assert!(row.2.is_some(), "the decision time must be written");
     }
 
     #[tokio::test]
