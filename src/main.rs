@@ -7,10 +7,11 @@ mod datasource;
 mod db;
 mod identity;
 mod ratelimit;
+mod roles;
 mod topics;
 mod validation;
 
-use auth::{AdminIdentity, AuthConfig, AuthError, AuthService, FirestoreHttp, GoogleJwkProvider};
+use auth::{AdminIdentity, AuthConfig, AuthError, AuthService};
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
@@ -20,6 +21,9 @@ use axum::{
 };
 use config::store::ConfigStore;
 use credentials::{AuthMap, ProjectIdMap};
+use datasource::registry::DataSourceRegistry;
+use identity::jwt::SystemEnv;
+use identity::registry::IdentityRegistry;
 use ratelimit::RateLimiter;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -55,6 +59,12 @@ struct AppState {
     config: Arc<ConfigStore>,
     /// T2: dashboard accounts and sessions.
     tool_auth: Arc<admin::ToolAuth>,
+    /// T3: identity providers per app. Used from T6.
+    #[allow(dead_code)]
+    identity: Arc<IdentityRegistry>,
+    /// T4: data sources per app. Used from T6.
+    #[allow(dead_code)]
+    datasource: Arc<DataSourceRegistry>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -126,7 +136,13 @@ async fn main() {
         }
     };
 
-    let client = match Client::builder().timeout(Duration::from_secs(30)).build() {
+    let client = match Client::builder()
+        .timeout(Duration::from_secs(30))
+        // The signed resolver contract never follows a redirect: a redirect
+        // would move the request away from the path that was signed.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(client) => client,
         Err(error) => {
             tracing::error!("Failed to build the HTTP client: {}", error);
@@ -141,17 +157,6 @@ async fn main() {
     credentials::scan_credentials_dir(&creds_dir, auth_map.clone(), project_map.clone()).await;
     credentials::watch_credentials_dir(creds_dir.clone(), auth_map.clone(), project_map.clone());
 
-    let auth = AuthService::new(
-        project_map.clone(),
-        Arc::new(GoogleJwkProvider::new(client.clone())),
-        Arc::new(FirestoreHttp::new(client.clone(), auth_map.clone())),
-        AuthConfig {
-            service_api_key,
-            legacy_api_key,
-            legacy_enabled,
-        },
-    );
-
     let config_store = match ConfigStore::new(db_pool.clone()).await {
         Ok(store) => Arc::new(store),
         Err(error) => {
@@ -162,6 +167,32 @@ async fn main() {
     tracing::info!(
         "Config store loaded with {} app(s)",
         config_store.app_count()
+    );
+
+    let identity_registry = Arc::new(IdentityRegistry::new(
+        config_store.clone(),
+        project_map.clone(),
+        client.clone(),
+        Arc::new(SystemEnv),
+    ));
+    let datasource_registry = Arc::new(DataSourceRegistry::new(
+        config_store.clone(),
+        project_map.clone(),
+        auth_map.clone(),
+        client.clone(),
+        Arc::new(SystemEnv),
+    ));
+
+    let auth = AuthService::new(
+        project_map.clone(),
+        identity_registry.clone(),
+        datasource_registry.clone(),
+        config_store.clone(),
+        AuthConfig {
+            service_api_key,
+            legacy_api_key,
+            legacy_enabled,
+        },
     );
 
     let tool_auth = match admin::ToolAuth::new(db_pool.clone()).await {
@@ -184,6 +215,8 @@ async fn main() {
         auth_fail_limiter: RateLimiter::new(AUTH_FAILURE_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
         config: config_store,
         tool_auth,
+        identity: identity_registry,
+        datasource: datasource_registry,
     });
 
     // Serve static files from "dist", fallback to index.html for SPA routing

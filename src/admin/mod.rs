@@ -240,7 +240,7 @@ pub fn spawn_session_cleanup(tool_auth: Arc<ToolAuth>) {
 mod tests {
     use super::*;
     use crate::admin::auth::Role;
-    use crate::auth::{AuthConfig, AuthService, FirestoreHttp, GoogleJwkProvider};
+    use crate::auth::{AuthConfig, AuthService};
     use crate::config::store::ConfigStore;
     use crate::credentials::{AuthMap, ProjectIdMap};
     use axum::body::Body;
@@ -280,20 +280,34 @@ mod tests {
             .expect("the test client must build");
         let auth_map: AuthMap = Arc::new(RwLock::new(HashMap::new()));
         let project_map: ProjectIdMap = Arc::new(RwLock::new(HashMap::new()));
+        let config = Arc::new(
+            ConfigStore::new(pool.clone())
+                .await
+                .expect("the config store must open"),
+        );
+        let identity = Arc::new(crate::identity::registry::IdentityRegistry::new(
+            config.clone(),
+            project_map.clone(),
+            client.clone(),
+            Arc::new(crate::identity::jwt::SystemEnv),
+        ));
+        let datasource = Arc::new(crate::datasource::registry::DataSourceRegistry::new(
+            config.clone(),
+            project_map.clone(),
+            auth_map.clone(),
+            client.clone(),
+            Arc::new(crate::identity::jwt::SystemEnv),
+        ));
         let auth = AuthService::new(
             project_map.clone(),
-            Arc::new(GoogleJwkProvider::new(client.clone())),
-            Arc::new(FirestoreHttp::new(client.clone(), auth_map.clone())),
+            identity.clone(),
+            datasource.clone(),
+            config.clone(),
             AuthConfig {
                 service_api_key: None,
                 legacy_api_key: None,
                 legacy_enabled: false,
             },
-        );
-        let config = Arc::new(
-            ConfigStore::new(pool.clone())
-                .await
-                .expect("the config store must open"),
         );
         let tool_auth = Arc::new(ToolAuth {
             pool: pool.clone(),
@@ -316,6 +330,8 @@ mod tests {
             auth_fail_limiter: RateLimiter::new(10, Duration::from_secs(60)),
             config,
             tool_auth,
+            identity,
+            datasource,
         })
     }
 

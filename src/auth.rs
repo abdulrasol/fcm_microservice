@@ -1,38 +1,40 @@
 //! Authorization helpers built on top of the identity providers.
 //!
 //! Design notes:
-//! - ID tokens are verified by [`FirebaseVerifier`] (RS256 against Google's
-//!   public JWKs), so the service account private key never signs user tokens.
-//! - Admin status is read from Firestore `users/{uid}` using the per-app service
-//!   account with the `datastore` scope. Results are cached for 60 seconds.
+//! - Tokens are verified by the provider chosen per app from its stored
+//!   configuration. An app with no configuration keeps the historical Firebase
+//!   behavior.
+//! - The role is read from `identity.role`: a token claim or a data-source
+//!   document. An app with no configuration keeps `users/{uid}.role` with
+//!   `admin` as the only admin role.
 //! - The service key and the legacy API key are compared in constant time and are
 //!   never logged.
 
-use crate::credentials::AuthMap;
-use crate::identity::is_valid_uid;
-use crate::identity::jwks::JwksCache;
-use crate::identity::{Identity, IdentityError, MAX_TOKEN_LENGTH};
-use async_trait::async_trait;
+use crate::config::store::ConfigStore;
+use crate::config::{IdentityProvider as ProviderConfig, RoleSource, WebSubscribe};
+use crate::credentials::ProjectIdMap;
+use crate::datasource::registry::DataSourceRegistry;
+use crate::datasource::DataSource;
+use crate::identity::registry::IdentityRegistry;
+use crate::identity::{Identity, IdentityError, IdentityProvider, MAX_TOKEN_LENGTH};
+use crate::roles::{
+    is_admin_role, legacy_policy, topic_matches, IdentityPolicy, NoSource, RoleError, RoleResolver,
+};
 use axum::http::{header, HeaderMap, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
-pub use crate::identity::firebase::FirebaseVerifier;
-#[cfg(test)]
-pub use crate::identity::jwks::FetchedJwks;
-pub use crate::identity::jwks::{GoogleJwkProvider, JwkProvider};
+/// The privileged topics that signed-in users may always use when an app has no
+/// stored configuration (the historical behavior).
+pub const LEGACY_SIGNED_IN_TOPICS: [&str; 3] = ["users", "companies", "technicals"];
 
-use crate::credentials::ProjectIdMap;
-
-const ADMIN_CACHE_TTL: Duration = Duration::from_secs(60);
-const ADMIN_CACHE_MAX_ENTRIES: usize = 4096;
-const FIRESTORE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Never verify one token against more than this many candidate apps.
+const MAX_CANDIDATE_APPS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminIdentity {
@@ -110,132 +112,36 @@ pub struct AuthConfig {
     pub legacy_enabled: bool,
 }
 
-#[async_trait]
-pub trait FirestoreReader: Send + Sync {
-    /// Returns `Ok(None)` when the user document does not exist. Any transport,
-    /// authentication or permission problem must be returned as `Err`, so callers
-    /// can fail closed with `503`.
-    async fn read_user(
-        &self,
-        app: &str,
-        project_id: &str,
-        uid: &str,
-    ) -> Result<Option<Value>, String>;
-}
-
-pub struct FirestoreHttp {
-    client: reqwest::Client,
-    auth_map: AuthMap,
-}
-
-impl FirestoreHttp {
-    pub fn new(client: reqwest::Client, auth_map: AuthMap) -> Self {
-        Self { client, auth_map }
-    }
-}
-
-#[async_trait]
-impl FirestoreReader for FirestoreHttp {
-    async fn read_user(
-        &self,
-        app: &str,
-        project_id: &str,
-        uid: &str,
-    ) -> Result<Option<Value>, String> {
-        if !is_valid_uid(uid) {
-            return Err("refusing to read a Firestore document for an invalid uid".to_string());
-        }
-        let encoded_uid = encode_path_segment(uid);
-
-        let auth = {
-            let map = self.auth_map.read().await;
-            map.get(app).cloned()
-        }
-        .ok_or_else(|| format!("no service account is loaded for app '{app}'"))?;
-
-        let token = auth
-            .token(&["https://www.googleapis.com/auth/datastore"])
-            .await
-            .map_err(|_| {
-                "could not obtain a service-account access token for Firestore".to_string()
-            })?;
-        let access_token = token
-            .token()
-            .ok_or_else(|| "service account returned an empty access token".to_string())?;
-
-        let url = format!(
-            "https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/users/{encoded_uid}"
-        );
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(access_token)
-            .timeout(FIRESTORE_TIMEOUT)
-            .send()
-            .await
-            .map_err(|_| "could not reach Firestore".to_string())?;
-
-        let status = response.status();
-        if status == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Err(
-                "Firestore denied the request; grant the app service account a role that can read Firestore (for example roles/datastore.viewer) in the Firebase project"
-                    .to_string(),
-            );
-        }
-        if !status.is_success() {
-            return Err(format!("Firestore returned HTTP {status}"));
-        }
-
-        response
-            .json::<Value>()
-            .await
-            .map(Some)
-            .map_err(|_| "Firestore returned an invalid JSON document".to_string())
-    }
-}
-
-struct AdminCache {
-    entries: HashMap<(String, String), (bool, Instant)>,
-}
-
 pub struct AuthService {
     project_map: ProjectIdMap,
-    verifier: FirebaseVerifier,
-    firestore: Arc<dyn FirestoreReader>,
-    config: AuthConfig,
-    /// The Firebase JWKS cache, shared with the verifier. It is kept as a field
-    /// so tests can simulate a stale cache.
-    #[allow(dead_code)]
-    jwk_cache: Arc<Mutex<JwksCache>>,
-    admin_cache: Mutex<AdminCache>,
+    identity: Arc<IdentityRegistry>,
+    datasource: Arc<DataSourceRegistry>,
+    config: Arc<ConfigStore>,
+    auth_config: AuthConfig,
+    roles: RoleResolver,
 }
 
 impl AuthService {
     pub fn new(
         project_map: ProjectIdMap,
-        jwks: Arc<dyn JwkProvider>,
-        firestore: Arc<dyn FirestoreReader>,
-        config: AuthConfig,
+        identity: Arc<IdentityRegistry>,
+        datasource: Arc<DataSourceRegistry>,
+        config: Arc<ConfigStore>,
+        auth_config: AuthConfig,
     ) -> Self {
-        let jwk_cache = Arc::new(Mutex::new(JwksCache::new()));
         Self {
             project_map,
-            verifier: FirebaseVerifier::with_cache(jwks, jwk_cache.clone()),
-            firestore,
+            identity,
+            datasource,
             config,
-            jwk_cache,
-            admin_cache: Mutex::new(AdminCache {
-                entries: HashMap::new(),
-            }),
+            auth_config,
+            roles: RoleResolver::new(),
         }
     }
 
     /// Pure constant-time comparison of two secrets.
     pub fn verify_service_key(&self, headers: &HeaderMap) -> bool {
-        let Some(expected) = self.config.service_api_key.as_deref() else {
+        let Some(expected) = self.auth_config.service_api_key.as_deref() else {
             return false;
         };
         if expected.is_empty() {
@@ -248,10 +154,10 @@ impl AuthService {
     }
 
     fn verify_legacy_key(&self, headers: &HeaderMap) -> bool {
-        if !self.config.legacy_enabled {
+        if !self.auth_config.legacy_enabled {
             return false;
         }
-        let Some(expected) = self.config.legacy_api_key.as_deref() else {
+        let Some(expected) = self.auth_config.legacy_api_key.as_deref() else {
             return false;
         };
         if expected.is_empty() {
@@ -272,17 +178,18 @@ impl AuthService {
             return Ok(AdminIdentity::service());
         }
 
-        let project_id = self.project_for(app).await?;
-        let claims = self.verify_id_token(headers, &project_id).await?;
-        if !self.uid_is_admin(app, &project_id, &claims.uid).await? {
+        let (policy, version) = self.policy_for(app);
+        let identity = self.verify_identity(headers, app).await?;
+        let role = self.resolve_role(app, version, &policy, &identity).await?;
+        if !is_admin_role(role.as_deref(), &policy.admin_roles) {
             return Err(AuthError::Forbidden(
-                "the Firebase user is not an admin for this app".to_string(),
+                "the user is not an admin for this app".to_string(),
             ));
         }
 
         Ok(AdminIdentity {
-            uid: claims.uid,
-            email: claims.email,
+            uid: identity.uid,
+            email: identity.email,
         })
     }
 
@@ -307,22 +214,31 @@ impl AuthService {
         self.authenticate_admin(headers, app).await
     }
 
-    /// Returns a valid ID-token identity for any user (no role check).
+    /// Returns a valid identity for any user (no role check).
     /// Invalid or missing tokens (including unrecognised legacy keys) yield `None`.
+    ///
+    /// The topic route uses [`Self::authorize_topic`], which needs the full
+    /// identity; this entry point stays public for the routes wired in T6.
+    #[allow(dead_code)]
     pub async fn authenticate_user(&self, headers: &HeaderMap, app: &str) -> Option<UserIdentity> {
-        let project_id = self.project_for(app).await.ok()?;
-        self.verify_id_token(headers, &project_id)
+        let token = bearer_token(headers)?;
+        let provider = self.identity.provider_for(app).await.ok()?;
+        provider
+            .verify(token)
             .await
             .ok()
-            .map(|claims| UserIdentity { uid: claims.uid })
+            .map(|identity| UserIdentity { uid: identity.uid })
     }
 
     /// Admin authentication for `/apps` and app-less admin queries.
     ///
-    /// The token audience (unverified) only selects candidate apps from the
-    /// server-side project map; the signature is always verified against that
-    /// app's project before any admin lookup. Returns the identity and the list of
-    /// apps where the user is an admin (`None` means the service key: all apps).
+    /// Candidate apps come from the server-side project map. A Firebase app (or
+    /// an app without configuration) is selected by the unverified `aud` claim,
+    /// a JWT app by the unverified `iss` claim. The signature is always verified
+    /// against each candidate app before any role lookup. At most
+    /// [`MAX_CANDIDATE_APPS`] apps are tried. Returns the identity and the list
+    /// of apps where the user is an admin (`None` means the service key: all
+    /// apps).
     pub async fn authenticate_admin_any(
         &self,
         headers: &HeaderMap,
@@ -336,118 +252,182 @@ impl AuthService {
             return Err(AuthError::Unauthorized("token is too long"));
         }
 
-        let audience = unverified_audience(token)
-            .ok_or(AuthError::Unauthorized("token has no usable audience"))?;
-
-        let candidates: Vec<String> = {
-            let map = self.project_map.read().await;
-            let mut apps: Vec<String> = map
-                .iter()
-                .filter(|(_, project)| project.as_str() == audience)
-                .map(|(app, _)| app.clone())
-                .collect();
-            apps.sort();
-            apps
-        };
-
+        let selection = unverified_selection(token).ok_or(AuthError::Unauthorized(
+            "token has no usable audience or issuer",
+        ))?;
+        let mut candidates = self.candidate_apps(&selection).await;
         if candidates.is_empty() {
             return Err(AuthError::Unauthorized(
-                "token audience does not match a registered app",
+                "token audience or issuer does not match a registered app",
+            ));
+        }
+        if candidates.len() > MAX_CANDIDATE_APPS {
+            tracing::warn!(
+                candidates = candidates.len(),
+                limit = MAX_CANDIDATE_APPS,
+                "too many candidate apps for this token; verifying the first ones only"
+            );
+            candidates.truncate(MAX_CANDIDATE_APPS);
+        }
+
+        let mut verified = Vec::new();
+        for app in &candidates {
+            let provider = self
+                .identity
+                .provider_for(app)
+                .await
+                .map_err(map_identity_error)?;
+            match provider.verify(token).await {
+                Ok(identity) => verified.push((app.clone(), identity)),
+                Err(IdentityError::Invalid(_)) => {}
+                Err(IdentityError::Unavailable(reason)) => {
+                    return Err(AuthError::Unavailable(reason))
+                }
+            }
+        }
+        if verified.is_empty() {
+            return Err(AuthError::Unauthorized(
+                "token is not valid for any registered app",
             ));
         }
 
-        let claims = self.verify_token(token, &audience).await?;
         let mut admin_apps = Vec::new();
-        for app in candidates {
-            if self.uid_is_admin(&app, &audience, &claims.uid).await? {
+        let mut first_admin = None;
+        for (app, identity) in verified {
+            if self.is_admin_identity(&app, &identity).await? {
+                if first_admin.is_none() {
+                    first_admin = Some(identity);
+                }
                 admin_apps.push(app);
             }
         }
 
-        if admin_apps.is_empty() {
-            return Err(AuthError::Forbidden(
-                "the Firebase user is not an admin for any registered app".to_string(),
-            ));
-        }
-
-        Ok((
-            AdminIdentity {
-                uid: claims.uid,
-                email: claims.email,
-            },
-            Some(admin_apps),
-        ))
-    }
-
-    /// Role check for an already verified uid. Used by topic subscription to allow
-    /// admins to use privileged topics.
-    pub async fn is_admin(&self, app: &str, uid: &str) -> Result<bool, AuthError> {
-        let project_id = self.project_for(app).await?;
-        self.uid_is_admin(app, &project_id, uid).await
-    }
-
-    async fn project_for(&self, app: &str) -> Result<String, AuthError> {
-        let map = self.project_map.read().await;
-        match map.get(app) {
-            Some(project) if !project.trim().is_empty() => Ok(project.clone()),
-            _ => Err(AuthError::AppNotFound(app.to_string())),
+        match first_admin {
+            Some(identity) => Ok((
+                AdminIdentity {
+                    uid: identity.uid,
+                    email: identity.email,
+                },
+                Some(admin_apps),
+            )),
+            None => Err(AuthError::Forbidden(
+                "the user is not an admin for any registered app".to_string(),
+            )),
         }
     }
 
-    async fn verify_id_token(
-        &self,
-        headers: &HeaderMap,
-        project_id: &str,
-    ) -> Result<Identity, AuthError> {
-        let token = bearer_token(headers).ok_or(AuthError::Unauthorized("missing bearer token"))?;
-        self.verify_token(token, project_id).await
-    }
-
-    async fn verify_token(&self, token: &str, project_id: &str) -> Result<Identity, AuthError> {
-        self.verifier
-            .verify(token, project_id)
-            .await
-            .map_err(|error| match error {
-                IdentityError::Invalid(reason) => AuthError::Unauthorized(reason),
-                IdentityError::Unavailable(reason) => AuthError::Unavailable(reason),
-            })
-    }
-
-    async fn uid_is_admin(
+    /// Role check for an already verified identity. Used by topic subscription to
+    /// allow admins to use privileged topics.
+    pub async fn is_admin_identity(
         &self,
         app: &str,
-        project_id: &str,
-        uid: &str,
+        identity: &Identity,
     ) -> Result<bool, AuthError> {
-        let key = (app.to_string(), uid.to_string());
-        {
-            let cache = lock(&self.admin_cache);
-            if let Some((is_admin, expires_at)) = cache.entries.get(&key) {
-                if Instant::now() < *expires_at {
-                    return Ok(*is_admin);
-                }
+        let (policy, version) = self.policy_for(app);
+        let role = self.resolve_role(app, version, &policy, identity).await?;
+        Ok(is_admin_role(role.as_deref(), &policy.admin_roles))
+    }
+
+    /// The role policy and configuration version of an app, or the legacy policy
+    /// for an app that has no stored configuration.
+    fn policy_for(&self, app: &str) -> (IdentityPolicy, i64) {
+        match self.config.get(app) {
+            Some(snapshot) => (snapshot.config.identity.clone(), snapshot.version),
+            None => (legacy_policy(), 0),
+        }
+    }
+
+    async fn resolve_role(
+        &self,
+        app: &str,
+        version: i64,
+        policy: &IdentityPolicy,
+        identity: &Identity,
+    ) -> Result<Option<String>, AuthError> {
+        let source: Arc<dyn DataSource> = match &policy.role {
+            RoleSource::Claim { .. } => Arc::new(NoSource),
+            RoleSource::DataSource { .. } => {
+                self.datasource.source_for(app).await.map_err(|error| {
+                    tracing::warn!(
+                        app = %app,
+                        error = ?error,
+                        "the data source for the role lookup is unavailable"
+                    );
+                    AuthError::Unavailable("role lookup failed".to_string())
+                })?
+            }
+        };
+        self.roles
+            .role(app, version, policy, identity, source.as_ref())
+            .await
+            .map_err(|RoleError::Unavailable(reason)| AuthError::Unavailable(reason))
+    }
+
+    /// Verifies a bearer token with the provider configured for `app`.
+    async fn verify_identity(&self, headers: &HeaderMap, app: &str) -> Result<Identity, AuthError> {
+        let token = bearer_token(headers).ok_or(AuthError::Unauthorized("missing bearer token"))?;
+        let provider = self.configured_provider(app).await?;
+        provider.verify(token).await.map_err(map_identity_error)
+    }
+
+    /// Returns the provider for `app` and keeps the historical `404` for an app
+    /// that has neither configuration nor loaded credentials.
+    async fn configured_provider(&self, app: &str) -> Result<Arc<dyn IdentityProvider>, AuthError> {
+        if self.config.get(app).is_none() {
+            let known = {
+                let projects = self.project_map.read().await;
+                projects
+                    .get(app)
+                    .is_some_and(|project| !project.trim().is_empty())
+            };
+            if !known {
+                return Err(AuthError::AppNotFound(app.to_string()));
             }
         }
-
-        let document = self
-            .firestore
-            .read_user(app, project_id, uid)
+        self.identity
+            .provider_for(app)
             .await
-            .map_err(|reason| {
-                AuthError::Unavailable(format!("admin role lookup failed: {reason}"))
-            })?;
-        let is_admin = document.as_ref().map(role_is_admin).unwrap_or(false);
-
-        let mut cache = lock(&self.admin_cache);
-        let now = Instant::now();
-        cache.entries.retain(|_, (_, expires_at)| now < *expires_at);
-        if cache.entries.len() >= ADMIN_CACHE_MAX_ENTRIES {
-            cache.entries.clear();
-        }
-        cache.entries.insert(key, (is_admin, now + ADMIN_CACHE_TTL));
-
-        Ok(is_admin)
+            .map_err(map_identity_error)
     }
+
+    async fn candidate_apps(&self, selection: &TokenSelection) -> Vec<String> {
+        let projects = { self.project_map.read().await.clone() };
+        let mut apps: Vec<String> = projects.keys().cloned().collect();
+        // Alphabetical order keeps the truncation deterministic.
+        apps.sort();
+        apps.retain(|app| match self.config.get(app) {
+            Some(snapshot) => match &snapshot.config.identity.provider {
+                ProviderConfig::Jwt { issuer, .. } => {
+                    selection.issuer.as_deref() == Some(issuer.as_str())
+                }
+                ProviderConfig::Firebase => {
+                    audience_matches_project(&projects, app, selection.audience.as_deref())
+                }
+            },
+            None => audience_matches_project(&projects, app, selection.audience.as_deref()),
+        });
+        apps
+    }
+}
+
+fn map_identity_error(error: IdentityError) -> AuthError {
+    match error {
+        IdentityError::Invalid(reason) => AuthError::Unauthorized(reason),
+        IdentityError::Unavailable(reason) => AuthError::Unavailable(reason),
+    }
+}
+
+fn audience_matches_project(
+    projects: &HashMap<String, String>,
+    app: &str,
+    audience: Option<&str>,
+) -> bool {
+    let Some(audience) = audience else {
+        return false;
+    };
+    projects
+        .get(app)
+        .is_some_and(|project| project.trim() == audience)
 }
 
 /// Access level resolved for a topic subscription request.
@@ -458,15 +438,35 @@ pub enum TopicAccess {
     Admin,
 }
 
-/// Anonymous clients may only use public topics. Authenticated users additionally
-/// get the role topics. Admins may use every valid topic.
-pub fn topic_allowed(topic: &str, access: TopicAccess) -> bool {
+/// Anonymous clients may only use topics allowed by `web_subscribe.anonymous`.
+/// Authenticated users additionally get `web_subscribe.signed_in`. Admins may
+/// use every valid topic.
+///
+/// `None` means the app has no stored configuration: the historical behavior is
+/// kept exactly (`all`, `country_xx`, `lang_xx` and the three role topics for
+/// signed-in users).
+pub fn topic_allowed(
+    topic: &str,
+    access: TopicAccess,
+    web_subscribe: Option<&WebSubscribe>,
+) -> bool {
     match access {
         TopicAccess::Admin => true,
-        TopicAccess::User => {
-            is_public_topic(topic) || matches!(topic, "users" | "companies" | "technicals")
-        }
-        TopicAccess::Anonymous => is_public_topic(topic),
+        TopicAccess::User => match web_subscribe {
+            None => is_public_topic(topic) || LEGACY_SIGNED_IN_TOPICS.contains(&topic),
+            Some(web_subscribe) => web_subscribe
+                .anonymous
+                .iter()
+                .chain(web_subscribe.signed_in.iter())
+                .any(|pattern| topic_matches(pattern, topic)),
+        },
+        TopicAccess::Anonymous => match web_subscribe {
+            None => is_public_topic(topic),
+            Some(web_subscribe) => web_subscribe
+                .anonymous
+                .iter()
+                .any(|pattern| topic_matches(pattern, topic)),
+        },
     }
 }
 
@@ -491,10 +491,12 @@ fn is_two_ascii_letters(value: &str) -> bool {
 impl AuthService {
     /// Topic-subscription authorization.
     ///
-    /// - A valid ID token is accepted as a normal user (role topics + public).
-    /// - Missing or invalid ID tokens are treated as anonymous (public topics only),
-    ///   so a bad header is ignored instead of rejecting the request.
-    /// - Privileged topics require an admin; a Firestore failure returns `503`.
+    /// - The service key is accepted as an admin.
+    /// - A valid identity may use the `web_subscribe` patterns for signed-in
+    ///   users; an admin role also gets every valid topic.
+    /// - Missing or invalid tokens are treated as anonymous, so a bad header is
+    ///   ignored instead of rejecting the request.
+    /// - A role lookup failure returns `503` only when the role is needed.
     pub async fn authorize_topic(
         &self,
         headers: &HeaderMap,
@@ -505,32 +507,34 @@ impl AuthService {
             return Ok((TopicAccess::Admin, None));
         }
 
-        if let Some(user) = self.authenticate_user(headers, app).await {
-            if topic_allowed(topic, TopicAccess::User) {
-                return Ok((TopicAccess::User, Some(user)));
+        if let Some(identity) = self.authenticated_identity(headers, app).await {
+            if topic_allowed(topic, TopicAccess::User, None) {
+                return Ok((TopicAccess::User, Some(UserIdentity { uid: identity.uid })));
             }
-            if self.is_admin(app, &user.uid).await? {
-                return Ok((TopicAccess::Admin, Some(user)));
+            if self.is_admin_identity(app, &identity).await? {
+                return Ok((TopicAccess::Admin, Some(UserIdentity { uid: identity.uid })));
             }
             return Err(AuthError::Forbidden(format!(
-                "topic '{topic}' requires an admin ID token"
+                "topic '{topic}' requires an admin token"
             )));
         }
 
-        if topic_allowed(topic, TopicAccess::Anonymous) {
+        if topic_allowed(topic, TopicAccess::Anonymous, None) {
             Ok((TopicAccess::Anonymous, None))
         } else {
             Err(AuthError::Forbidden(format!(
-                "topic '{topic}' requires an authenticated admin"
+                "topic '{topic}' requires a signed-in user"
             )))
         }
     }
-}
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Best-effort verification for topic subscription: any failure means the
+    /// caller is anonymous (the historical behavior).
+    async fn authenticated_identity(&self, headers: &HeaderMap, app: &str) -> Option<Identity> {
+        let token = bearer_token(headers)?;
+        let provider = self.identity.provider_for(app).await.ok()?;
+        provider.verify(token).await.ok()
+    }
 }
 
 /// Constant-time comparison that does not short-circuit on length: both inputs
@@ -555,41 +559,32 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     }
 }
 
-fn unverified_audience(token: &str) -> Option<String> {
+struct TokenSelection {
+    audience: Option<String>,
+    issuer: Option<String>,
+}
+
+fn unverified_selection(token: &str) -> Option<TokenSelection> {
     #[derive(Deserialize)]
-    struct AudOnly {
-        aud: Value,
+    struct SelectionClaims {
+        #[serde(default)]
+        aud: Option<Value>,
+        #[serde(default)]
+        iss: Option<String>,
     }
 
-    let data = jsonwebtoken::dangerous::insecure_decode::<AudOnly>(token).ok()?;
-    match data.claims.aud {
-        Value::String(aud) => Some(aud),
-        Value::Array(values) => values.first()?.as_str().map(ToString::to_string),
-        _ => None,
+    let data = jsonwebtoken::dangerous::insecure_decode::<SelectionClaims>(token).ok()?;
+    let audience = match data.claims.aud {
+        Some(Value::String(audience)) => Some(audience),
+        Some(Value::Array(values)) => values.first()?.as_str().map(ToString::to_string),
+        Some(_) => None,
+        None => None,
+    };
+    let issuer = data.claims.iss.filter(|issuer| !issuer.is_empty());
+    if audience.is_none() && issuer.is_none() {
+        return None;
     }
-}
-
-fn role_is_admin(document: &Value) -> bool {
-    document
-        .get("fields")
-        .and_then(|fields| fields.get("role"))
-        .and_then(|role| role.get("stringValue"))
-        .and_then(Value::as_str)
-        == Some("admin")
-}
-
-/// Percent-encode a Firestore document id safely (slashes must not create new
-/// path segments).
-fn encode_path_segment(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
+    Some(TokenSelection { audience, issuer })
 }
 
 /// Client IP for rate limiting. `X-Forwarded-For` is only trusted behind a proxy.
@@ -614,20 +609,285 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, trust_proxy: boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::firebase::SECURETOKEN_ISSUER_PREFIX;
-    use crate::identity::jwks::{parse_cache_max_age, MIN_JWK_REFRESH};
+    use crate::config::store::ConfigStore;
+    use crate::config::AppConfig;
+    use crate::credentials::AuthMap;
+    use crate::datasource::test_support::{json as json_response, TestServer};
+    use crate::identity::firebase::FirebaseVerifier;
+    use crate::identity::is_valid_uid;
+    use crate::identity::jwks::{
+        parse_cache_max_age, FetchedJwks, JwkProvider, JwksCache, MIN_JWK_REFRESH,
+    };
+    use crate::identity::jwt::EnvSource;
+    use crate::identity::registry::IdentityRegistry;
     use crate::identity::MAX_UID_LENGTH;
+    use async_trait::async_trait;
     use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
     use rand::rngs::OsRng;
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
     use rsa::RsaPrivateKey;
-    use serde_json::json;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::OnceLock;
+    use serde_json::{json, Map, Value};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::collections::HashMap;
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
     use tokio::sync::RwLock;
 
-    const PROJECT: &str = "test-project";
     const APP: &str = "test-app";
+    const PROJECT: &str = "test-project";
+    const ISSUER: &str = "https://issuer.example.com/";
+    const AUDIENCE: &str = "test-audience";
+    const JWT_SECRET_ENV: &str = "CLIENT_JWT_SECRET";
+    const JWT_SECRET: &str = "jwt-test-secret-jwt-test-secret-0123456789";
+    const RESOLVER_SECRET_ENV: &str = "RESOLVER_SECRET";
+    const RESOLVER_SECRET: &str = "resolver-secret-resolver-secret-0001";
+
+    struct FakeEnv {
+        values: HashMap<String, String>,
+    }
+
+    impl FakeEnv {
+        fn new(pairs: &[(&str, &str)]) -> Self {
+            Self {
+                values: pairs
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect(),
+            }
+        }
+
+        fn jwt() -> Self {
+            Self::new(&[
+                (JWT_SECRET_ENV, JWT_SECRET),
+                (RESOLVER_SECRET_ENV, RESOLVER_SECRET),
+            ])
+        }
+    }
+
+    impl EnvSource for FakeEnv {
+        fn get(&self, name: &str) -> Option<String> {
+            self.values.get(name).cloned()
+        }
+    }
+
+    /// A data source that answers from memory, for the legacy role document.
+    struct RoleDocSource {
+        doc: Option<Value>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl DataSource for RoleDocSource {
+        async fn get_doc(
+            &self,
+            _path: &str,
+        ) -> Result<Option<crate::datasource::Doc>, crate::datasource::DataError> {
+            if self.fail {
+                return Err(crate::datasource::DataError::Unavailable(
+                    "the backend is down".to_string(),
+                ));
+            }
+            Ok(self.doc.clone())
+        }
+
+        async fn members(
+            &self,
+            _collection: &str,
+            _field: &str,
+            _value: &str,
+            _limit: usize,
+        ) -> Result<Vec<String>, crate::datasource::DataError> {
+            Err(crate::datasource::DataError::Unavailable(
+                "unused in auth tests".to_string(),
+            ))
+        }
+    }
+
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    async fn memory_store() -> Arc<ConfigStore> {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .expect("the options must parse")
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("the in-memory database must open");
+        crate::db::migrate(&pool)
+            .await
+            .expect("the migration must run");
+        Arc::new(
+            ConfigStore::new(pool)
+                .await
+                .expect("the config store must open"),
+        )
+    }
+
+    async fn save_app(store: &ConfigStore, app: &str, sections: &[(&str, Value)]) {
+        store
+            .create_app(app, "tester")
+            .await
+            .expect("the app must be created");
+        let mut version = 1;
+        for (section, value) in sections {
+            version = store
+                .save_section(app, section, value.clone(), "tester", version)
+                .await
+                .expect("the section must be saved");
+        }
+    }
+
+    fn auth_service(
+        store: Arc<ConfigStore>,
+        projects: &[(&str, &str)],
+        env: Arc<FakeEnv>,
+    ) -> AuthService {
+        let project_map: ProjectIdMap = Arc::new(RwLock::new(
+            projects
+                .iter()
+                .map(|(app, project)| ((*app).to_string(), (*project).to_string()))
+                .collect(),
+        ));
+        let auth_map: AuthMap = Arc::new(RwLock::new(HashMap::new()));
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("the test client must build");
+        let env: Arc<dyn EnvSource> = env;
+        let identity = Arc::new(IdentityRegistry::new(
+            store.clone(),
+            project_map.clone(),
+            client.clone(),
+            env.clone(),
+        ));
+        let datasource = Arc::new(DataSourceRegistry::new(
+            store.clone(),
+            project_map.clone(),
+            auth_map,
+            client,
+            env,
+        ));
+        AuthService::new(
+            project_map,
+            identity,
+            datasource,
+            store,
+            AuthConfig {
+                service_api_key: Some("service-secret".to_string()),
+                legacy_api_key: Some("legacy-secret".to_string()),
+                legacy_enabled: true,
+            },
+        )
+    }
+
+    fn jwt_identity(role: Value, admin_roles: &[&str]) -> Value {
+        json!({
+            "provider": {
+                "type": "jwt",
+                "algorithms": ["HS256"],
+                "hs256_secret_env": JWT_SECRET_ENV,
+                "issuer": ISSUER,
+                "audience": AUDIENCE,
+                "uid_claim": "sub",
+                "max_age_seconds": 3600
+            },
+            "role": role,
+            "admin_roles": admin_roles
+        })
+    }
+
+    fn claim_role(claim: &str) -> Value {
+        json!({ "source": "claim", "claim": claim })
+    }
+
+    fn legacy_web_subscribe() -> Value {
+        json!({
+            "anonymous": ["all", "country_*", "lang_*"],
+            "signed_in": ["users", "companies", "technicals"]
+        })
+    }
+
+    async fn claim_service(admin_roles: &[&str]) -> AuthService {
+        let store = memory_store().await;
+        save_app(
+            &store,
+            APP,
+            &[("identity", jwt_identity(claim_role("role"), admin_roles))],
+        )
+        .await;
+        auth_service(store, &[(APP, PROJECT)], Arc::new(FakeEnv::jwt()))
+    }
+
+    async fn unconfigured_service() -> AuthService {
+        auth_service(
+            memory_store().await,
+            &[(APP, PROJECT)],
+            Arc::new(FakeEnv::jwt()),
+        )
+    }
+
+    fn claims_value(issuer: &str, audience: &str, uid: &str, role: &str) -> Value {
+        let now = jsonwebtoken::get_current_timestamp();
+        json!({
+            "sub": uid,
+            "aud": audience,
+            "iss": issuer,
+            "exp": now + 3600,
+            "iat": now - 10,
+            "role": role,
+            "email": "admin@example.com",
+        })
+    }
+
+    fn sign_claims(secret: &str, claims: &Value) -> String {
+        encode(
+            &Header::new(Algorithm::HS256),
+            claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("the token must encode")
+    }
+
+    fn token(uid: &str, role: &str) -> String {
+        sign_claims(JWT_SECRET, &claims_value(ISSUER, AUDIENCE, uid, role))
+    }
+
+    fn token_with(uid: &str, role: &str, mutate: impl FnOnce(&mut Map<String, Value>)) -> String {
+        let mut claims = claims_value(ISSUER, AUDIENCE, uid, role);
+        mutate(claims.as_object_mut().expect("the claims object"));
+        sign_claims(JWT_SECRET, &claims)
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("header value"),
+        );
+        headers
+    }
+
+    async fn expect_unauthorized(result: Result<AdminIdentity, AuthError>) {
+        match result {
+            Err(AuthError::Unauthorized(_)) => {}
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+    }
+
+    async fn expect_forbidden(result: Result<AdminIdentity, AuthError>) {
+        match result {
+            Err(AuthError::Forbidden(_)) => {}
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+    }
+
+    // ---------- Firebase verifier guards (kept from the old AuthService) ----------
 
     struct TestKeys {
         private_pem: String,
@@ -635,7 +895,7 @@ mod tests {
     }
 
     fn generate_keys() -> TestKeys {
-        let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("generate RSA key");
+        let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("RSA key");
         let private_pem = private
             .to_pkcs8_pem(LineEnding::LF)
             .expect("private key PEM")
@@ -651,11 +911,6 @@ mod tests {
     }
 
     fn keys() -> &'static TestKeys {
-        static KEYS: OnceLock<TestKeys> = OnceLock::new();
-        KEYS.get_or_init(generate_keys)
-    }
-
-    fn other_keys() -> &'static TestKeys {
         static KEYS: OnceLock<TestKeys> = OnceLock::new();
         KEYS.get_or_init(generate_keys)
     }
@@ -689,84 +944,26 @@ mod tests {
                 .unwrap_or_default();
             Ok(FetchedJwks {
                 keys,
-                max_age: Duration::from_secs(3600),
+                max_age: std::time::Duration::from_secs(3600),
             })
         }
-    }
-
-    struct FakeFirestore {
-        role: Option<&'static str>,
-        fail: AtomicBool,
-    }
-
-    impl FakeFirestore {
-        fn with_role(role: Option<&'static str>) -> Self {
-            Self {
-                role,
-                fail: AtomicBool::new(false),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl FirestoreReader for FakeFirestore {
-        async fn read_user(
-            &self,
-            _app: &str,
-            _project_id: &str,
-            _uid: &str,
-        ) -> Result<Option<Value>, String> {
-            if self.fail.load(Ordering::SeqCst) {
-                return Err("permission denied".to_string());
-            }
-            Ok(self.role.map(|role| {
-                json!({
-                    "name": "projects/test/databases/(default)/documents/users/uid",
-                    "fields": { "role": { "stringValue": role } }
-                })
-            }))
-        }
-    }
-
-    fn project_map() -> ProjectIdMap {
-        Arc::new(RwLock::new(HashMap::from([(
-            APP.to_string(),
-            PROJECT.to_string(),
-        )])))
-    }
-
-    fn service(jwks: Arc<dyn JwkProvider>, firestore: Arc<dyn FirestoreReader>) -> AuthService {
-        AuthService::new(
-            project_map(),
-            jwks,
-            firestore,
-            AuthConfig {
-                service_api_key: Some("service-secret".to_string()),
-                legacy_api_key: Some("legacy-secret".to_string()),
-                legacy_enabled: true,
-            },
-        )
     }
 
     fn jwks_with(kid: &str, key: DecodingKey) -> HashMap<String, DecodingKey> {
         HashMap::from([(kid.to_string(), key)])
     }
 
-    fn claims(uid: &str, kid: &str, key: &TestKeys) -> String {
-        token_with(uid, kid, key, |_| {})
-    }
-
-    fn token_with(
+    fn firebase_token_with(
         uid: &str,
         kid: &str,
         key: &TestKeys,
-        mutate: impl FnOnce(&mut serde_json::Map<String, Value>),
+        mutate: impl FnOnce(&mut Map<String, Value>),
     ) -> String {
         let now = jsonwebtoken::get_current_timestamp();
         let mut payload = json!({
             "sub": uid,
             "aud": PROJECT,
-            "iss": format!("{SECURETOKEN_ISSUER_PREFIX}{PROJECT}"),
+            "iss": format!("https://securetoken.google.com/{PROJECT}"),
             "exp": now + 3600,
             "iat": now - 10,
             "auth_time": now - 10,
@@ -783,31 +980,17 @@ mod tests {
         .expect("encode token")
     }
 
-    fn bearer(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {token}").parse().expect("header value"),
-        );
-        headers
+    fn firebase_token(uid: &str, kid: &str, key: &TestKeys) -> String {
+        firebase_token_with(uid, kid, key, |_| {})
     }
 
-    async fn expect_unauthorized(result: Result<AdminIdentity, AuthError>) {
-        match result {
-            Err(AuthError::Unauthorized(_)) => {}
-            other => panic!("expected Unauthorized, got {other:?}"),
-        }
-    }
+    // ---------- AuthService tests ----------
 
     #[tokio::test]
     async fn accepts_valid_admin_token() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("admin"))));
+        let service = claim_service(&["admin"]).await;
         let identity = service
-            .authenticate_admin(&bearer(&claims("uid-1", "k1", keys())), APP)
+            .authenticate_admin(&bearer(&token("uid-1", "admin")), APP)
             .await
             .expect("valid admin token");
         assert_eq!(identity.uid, "uid-1");
@@ -816,43 +999,34 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_expired_token() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("admin"))));
-        let token = token_with("uid-1", "k1", keys(), |claims| {
+        let service = claim_service(&["admin"]).await;
+        let expired = token_with("uid-1", "admin", |claims| {
             claims.insert("exp".into(), json!(1000));
         });
-        expect_unauthorized(service.authenticate_admin(&bearer(&token), APP).await).await;
+        expect_unauthorized(service.authenticate_admin(&bearer(&expired), APP).await).await;
     }
 
     #[tokio::test]
     async fn rejects_wrong_issuer_and_audience() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("admin"))));
-        let wrong_iss = token_with("uid-1", "k1", keys(), |claims| {
-            claims.insert("iss".into(), json!("https://securetoken.google.com/other"));
+        let service = claim_service(&["admin"]).await;
+        let wrong_iss = token_with("uid-1", "admin", |claims| {
+            claims.insert("iss".into(), json!("https://other.example.com/"));
         });
         expect_unauthorized(service.authenticate_admin(&bearer(&wrong_iss), APP).await).await;
 
-        let wrong_aud = token_with("uid-1", "k1", keys(), |claims| {
-            claims.insert("aud".into(), json!("other-project"));
+        let wrong_aud = token_with("uid-1", "admin", |claims| {
+            claims.insert("aud".into(), json!("other-audience"));
         });
         expect_unauthorized(service.authenticate_admin(&bearer(&wrong_aud), APP).await).await;
     }
 
     #[tokio::test]
     async fn rejects_signature_from_another_key() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("admin"))));
-        let token = claims("uid-1", "k1", other_keys());
+        let service = claim_service(&["admin"]).await;
+        let token = sign_claims(
+            "another-secret-another-secret-0123456789",
+            &claims_value(ISSUER, AUDIENCE, "uid-1", "admin"),
+        );
         expect_unauthorized(service.authenticate_admin(&bearer(&token), APP).await).await;
     }
 
@@ -866,21 +1040,16 @@ mod tests {
         let payload = URL_SAFE_NO_PAD.encode(
             json!({
                 "sub": "uid-1",
-                "aud": PROJECT,
-                "iss": format!("{SECURETOKEN_ISSUER_PREFIX}{PROJECT}"),
+                "aud": AUDIENCE,
+                "iss": ISSUER,
                 "exp": now + 3600,
                 "iat": now - 10,
-                "auth_time": now - 10,
             })
             .to_string(),
         );
         let token = format!("{header}.{payload}.");
 
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("admin"))));
+        let service = claim_service(&["admin"]).await;
         expect_unauthorized(service.authenticate_admin(&bearer(&token), APP).await).await;
     }
 
@@ -890,78 +1059,67 @@ mod tests {
         let mut second = first.clone();
         second.insert("k2".to_string(), keys().decoding.clone());
         let jwks = Arc::new(StaticJwks::new(vec![first, second]));
-        let service = service(
-            jwks.clone(),
-            Arc::new(FakeFirestore::with_role(Some("admin"))),
-        );
+        let cache = Arc::new(Mutex::new(JwksCache::new()));
+        let verifier = FirebaseVerifier::with_cache(jwks.clone(), cache.clone());
 
         // Warm the cache with k1 (refresh #1).
-        service
-            .authenticate_admin(&bearer(&claims("uid-1", "k1", keys())), APP)
+        let identity = verifier
+            .verify(&firebase_token("uid-1", "k1", keys()), PROJECT)
             .await
             .expect("warm cache");
+        assert_eq!(identity.uid, "uid-1");
         assert_eq!(jwks.calls(), 1);
 
         // Pretend the cache was loaded a while ago, then use a rotated kid.
         {
-            let mut cache = lock(&service.jwk_cache);
-            cache.last_refresh = Instant::now() - MIN_JWK_REFRESH;
+            let mut cache = lock(&cache);
+            cache.last_refresh = std::time::Instant::now() - MIN_JWK_REFRESH;
         }
-        service
-            .authenticate_admin(&bearer(&claims("uid-1", "k2", keys())), APP)
+        verifier
+            .verify(&firebase_token("uid-1", "k2", keys()), PROJECT)
             .await
             .expect("rotated kid accepted after refresh");
         assert_eq!(jwks.calls(), 2);
 
         // A second unknown kid must not trigger another refresh inside the window.
-        let unknown = token_with("uid-1", "k3", keys(), |_| {});
-        expect_unauthorized(service.authenticate_admin(&bearer(&unknown), APP).await).await;
+        let unknown = firebase_token("uid-1", "k3", keys());
+        let error = verifier
+            .verify(&unknown, PROJECT)
+            .await
+            .expect_err("an unknown kid must be rejected");
+        assert!(matches!(error, IdentityError::Invalid(_)));
         assert_eq!(jwks.calls(), 2);
     }
 
     #[tokio::test]
     async fn non_admin_role_is_forbidden() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("user"))));
-        match service
-            .authenticate_admin(&bearer(&claims("uid-1", "k1", keys())), APP)
-            .await
-        {
-            Err(AuthError::Forbidden(_)) => {}
-            other => panic!("expected Forbidden, got {other:?}"),
-        }
+        let service = claim_service(&["admin"]).await;
+        expect_forbidden(
+            service
+                .authenticate_admin(&bearer(&token("uid-1", "user")), APP)
+                .await,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn missing_user_document_is_not_admin() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(None)));
-        match service
-            .authenticate_admin(&bearer(&claims("uid-1", "k1", keys())), APP)
-            .await
-        {
-            Err(AuthError::Forbidden(_)) => {}
-            other => panic!("expected Forbidden, got {other:?}"),
-        }
+        let server = TestServer::start(vec![json_response(404, "Not Found", "")]).await;
+        let service = data_source_service(&server.base_url).await;
+        expect_forbidden(
+            service
+                .authenticate_admin(&bearer(&token("uid-1", "admin")), APP)
+                .await,
+        )
+        .await;
     }
 
     #[tokio::test]
-    async fn firestore_failure_fails_closed_with_503() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let firestore = Arc::new(FakeFirestore::with_role(Some("admin")));
-        let service = service(jwks, firestore.clone());
-        firestore.fail.store(true, Ordering::SeqCst);
+    async fn role_lookup_failure_is_503_not_403() {
+        let server = TestServer::start(vec![json_response(500, "Internal Server Error", "")]).await;
+        let service = data_source_service(&server.base_url).await;
         match service
-            .authenticate_admin(&bearer(&claims("uid-1", "k1", keys())), APP)
+            .authenticate_admin(&bearer(&token("uid-1", "admin")), APP)
             .await
         {
             Err(AuthError::Unavailable(_)) => {}
@@ -971,29 +1129,21 @@ mod tests {
 
     #[tokio::test]
     async fn authenticate_user_ignores_invalid_and_legacy_tokens() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("user"))));
+        let service = claim_service(&["admin"]).await;
 
         assert!(service
             .authenticate_user(&bearer("legacy-secret"), APP)
             .await
             .is_none());
         assert!(service
-            .authenticate_user(&bearer(&claims("uid-1", "k1", keys())), APP)
+            .authenticate_user(&bearer(&token("uid-1", "user")), APP)
             .await
             .is_some());
     }
 
     #[tokio::test]
     async fn service_key_is_constant_time_and_enables_admin() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("user"))));
+        let service = unconfigured_service().await;
 
         assert!(service.verify_service_key(&bearer("service-secret")));
         assert!(!service.verify_service_key(&bearer("service-secret-wrong")));
@@ -1008,11 +1158,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_key_only_works_when_enabled_and_only_for_send() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("user"))));
+        let service = unconfigured_service().await;
 
         let identity = service
             .authenticate_send(&bearer("legacy-secret"), APP)
@@ -1030,13 +1176,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_future_iat_auth_time_and_empty_subject() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("admin"))));
+        let service = claim_service(&["admin"]).await;
 
-        let future_iat = token_with("uid-1", "k1", keys(), |claims| {
+        let future_iat = token_with("uid-1", "admin", |claims| {
             claims.insert(
                 "iat".into(),
                 json!(jsonwebtoken::get_current_timestamp() + 3600),
@@ -1044,20 +1186,7 @@ mod tests {
         });
         expect_unauthorized(service.authenticate_admin(&bearer(&future_iat), APP).await).await;
 
-        let future_auth_time = token_with("uid-1", "k1", keys(), |claims| {
-            claims.insert(
-                "auth_time".into(),
-                json!(jsonwebtoken::get_current_timestamp() + 3600),
-            );
-        });
-        expect_unauthorized(
-            service
-                .authenticate_admin(&bearer(&future_auth_time), APP)
-                .await,
-        )
-        .await;
-
-        let empty_subject = token_with("uid-1", "k1", keys(), |claims| {
+        let empty_subject = token_with("uid-1", "admin", |claims| {
             claims.insert("sub".into(), json!(""));
         });
         expect_unauthorized(
@@ -1066,15 +1195,30 @@ mod tests {
                 .await,
         )
         .await;
-    }
 
-    #[tokio::test]
-    async fn anonymous_topic_access_is_limited_to_public_topics() {
+        // Firebase ID tokens carry `auth_time`; the legacy provider still rejects
+        // a future value even though JWT providers have no such claim.
         let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
             "k1",
             keys().decoding.clone(),
         )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("user"))));
+        let verifier = FirebaseVerifier::new(jwks);
+        let future_auth_time = firebase_token_with("uid-1", "k1", keys(), |claims| {
+            claims.insert(
+                "auth_time".into(),
+                json!(jsonwebtoken::get_current_timestamp() + 3600),
+            );
+        });
+        let error = verifier
+            .verify(&future_auth_time, PROJECT)
+            .await
+            .expect_err("a future auth_time must be rejected");
+        assert!(matches!(error, IdentityError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn anonymous_topic_access_is_limited_to_public_topics() {
+        let service = unconfigured_service().await;
         let headers = HeaderMap::new();
 
         for topic in ["all", "country_us", "country_IQ", "lang_ar", "lang_EN"] {
@@ -1103,12 +1247,18 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_user_gets_role_topics_but_not_admin_topics() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("user"))));
-        let headers = bearer(&claims("uid-1", "k1", keys()));
+        let store = memory_store().await;
+        save_app(
+            &store,
+            APP,
+            &[
+                ("identity", jwt_identity(claim_role("role"), &["admin"])),
+                ("web_subscribe", legacy_web_subscribe()),
+            ],
+        )
+        .await;
+        let service = auth_service(store, &[(APP, PROJECT)], Arc::new(FakeEnv::jwt()));
+        let headers = bearer(&token("uid-1", "user"));
 
         let (access, user) = service
             .authorize_topic(&headers, APP, "users")
@@ -1129,12 +1279,8 @@ mod tests {
 
     #[tokio::test]
     async fn admin_user_gets_admin_topics() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("admin"))));
-        let headers = bearer(&claims("uid-admin", "k1", keys()));
+        let service = claim_service(&["admin"]).await;
+        let headers = bearer(&token("uid-admin", "admin"));
 
         let (access, _) = service
             .authorize_topic(&headers, APP, "admins")
@@ -1145,11 +1291,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_legacy_header_is_ignored_for_public_topics() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("admin"))));
+        let service = unconfigured_service().await;
         let headers = bearer("legacy-secret");
 
         let (access, _) = service
@@ -1166,17 +1308,260 @@ mod tests {
 
     #[tokio::test]
     async fn service_key_can_use_privileged_topics() {
-        let jwks = Arc::new(StaticJwks::new(vec![jwks_with(
-            "k1",
-            keys().decoding.clone(),
-        )]));
-        let service = service(jwks, Arc::new(FakeFirestore::with_role(Some("user"))));
+        let service = unconfigured_service().await;
         let (access, user) = service
             .authorize_topic(&bearer("service-secret"), APP, "admins")
             .await
             .expect("service key is admin");
         assert_eq!(access, TopicAccess::Admin);
         assert!(user.is_none());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_app_keeps_legacy_admin_behavior() {
+        let service = unconfigured_service().await;
+        let (policy, version) = service.policy_for(APP);
+        assert_eq!(version, 0);
+        assert_eq!(policy, AppConfig::default_firebase().identity);
+        assert!(matches!(&policy.provider, ProviderConfig::Firebase));
+        assert_eq!(policy.admin_roles, vec!["admin".to_string()]);
+        match &policy.role {
+            RoleSource::DataSource {
+                doc,
+                field,
+                cache_seconds,
+            } => {
+                assert_eq!(doc, "users/{uid}");
+                assert_eq!(field, "role");
+                assert_eq!(*cache_seconds, 60);
+            }
+            other => panic!("expected the legacy data source role, got {other:?}"),
+        }
+
+        let identity = Identity {
+            uid: "uid-1".to_string(),
+            email: None,
+            name: None,
+            claims: json!({}),
+        };
+        let admin = RoleDocSource {
+            doc: Some(json!({ "role": "admin" })),
+            fail: false,
+        };
+        let role = service
+            .roles
+            .role(APP, version, &policy, &identity, &admin)
+            .await
+            .expect("the legacy role document must be read");
+        assert!(is_admin_role(role.as_deref(), &policy.admin_roles));
+
+        let missing = RoleDocSource {
+            doc: None,
+            fail: false,
+        };
+        let other_identity = Identity {
+            uid: "uid-2".to_string(),
+            email: None,
+            name: None,
+            claims: json!({}),
+        };
+        let role = service
+            .roles
+            .role(APP, version, &policy, &other_identity, &missing)
+            .await
+            .expect("a missing legacy document is not an error");
+        assert!(!is_admin_role(role.as_deref(), &policy.admin_roles));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_app_keeps_legacy_topics() {
+        let service = unconfigured_service().await;
+        let headers = HeaderMap::new();
+
+        for topic in ["all", "country_us", "lang_ar"] {
+            let (access, _) = service
+                .authorize_topic(&headers, APP, topic)
+                .await
+                .expect("the legacy public topics must stay public");
+            assert_eq!(access, TopicAccess::Anonymous);
+        }
+        for topic in ["users", "companies", "technicals", "admins"] {
+            match service.authorize_topic(&headers, APP, topic).await {
+                Err(AuthError::Forbidden(_)) => {}
+                other => panic!("{topic} must stay forbidden, got {other:?}"),
+            }
+        }
+
+        let (access, _) = service
+            .authorize_topic(&bearer("legacy-secret"), APP, "all")
+            .await
+            .expect("an invalid token is anonymous");
+        assert_eq!(access, TopicAccess::Anonymous);
+    }
+
+    #[tokio::test]
+    async fn configured_claim_role_grants_admin() {
+        let service = claim_service(&["admin"]).await;
+        let identity = service
+            .authenticate_admin(&bearer(&token("uid-1", "admin")), APP)
+            .await
+            .expect("the claim role must grant admin");
+        assert_eq!(identity.uid, "uid-1");
+    }
+
+    #[tokio::test]
+    async fn configured_data_source_role_grants_admin() {
+        let server = TestServer::start(vec![json_response(200, "OK", r#"{"role":"admin"}"#)]).await;
+        let service = data_source_service(&server.base_url).await;
+        let identity = service
+            .authenticate_admin(&bearer(&token("uid-1", "user")), APP)
+            .await
+            .expect("the data source role must grant admin");
+        assert_eq!(identity.uid, "uid-1");
+    }
+
+    #[tokio::test]
+    async fn custom_admin_roles_list_is_honored() {
+        let service = claim_service(&["manager"]).await;
+        service
+            .authenticate_admin(&bearer(&token("uid-1", "manager")), APP)
+            .await
+            .expect("the configured admin role is accepted");
+        expect_forbidden(
+            service
+                .authenticate_admin(&bearer(&token("uid-1", "admin")), APP)
+                .await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn authenticate_admin_any_jwt_app_selected_by_issuer() {
+        const OTHER_APP: &str = "other-app";
+        const OTHER_ISSUER: &str = "https://issuer-b.example.com/";
+        const OTHER_SECRET_ENV: &str = "OTHER_JWT_SECRET";
+        const OTHER_SECRET: &str = "other-jwt-secret-other-jwt-secret-012345";
+
+        let store = memory_store().await;
+        save_app(
+            &store,
+            APP,
+            &[("identity", jwt_identity(claim_role("role"), &["admin"]))],
+        )
+        .await;
+        let mut other_identity = jwt_identity(claim_role("role"), &["admin"]);
+        other_identity["provider"]["issuer"] = json!(OTHER_ISSUER);
+        other_identity["provider"]["hs256_secret_env"] = json!(OTHER_SECRET_ENV);
+        save_app(&store, OTHER_APP, &[("identity", other_identity)]).await;
+
+        let env = Arc::new(FakeEnv::new(&[
+            (JWT_SECRET_ENV, JWT_SECRET),
+            (OTHER_SECRET_ENV, OTHER_SECRET),
+        ]));
+        let service = auth_service(store, &[(APP, PROJECT), (OTHER_APP, "other-project")], env);
+        let token = token("uid-1", "admin");
+
+        let (identity, apps) = service
+            .authenticate_admin_any(&bearer(&token))
+            .await
+            .expect("the JWT issuer selects the app");
+        assert_eq!(identity.uid, "uid-1");
+        assert_eq!(apps, Some(vec![APP.to_string()]));
+    }
+
+    #[tokio::test]
+    async fn authenticate_admin_any_limits_candidates() {
+        let store = memory_store().await;
+        let mut projects = Vec::new();
+        for index in 0..10 {
+            let app = format!("app-{index:02}");
+            save_app(
+                &store,
+                &app,
+                &[("identity", jwt_identity(claim_role("role"), &["admin"]))],
+            )
+            .await;
+            projects.push((app, PROJECT));
+        }
+        let project_refs: Vec<(&str, &str)> = projects
+            .iter()
+            .map(|(app, project)| (app.as_str(), *project))
+            .collect();
+        let service = auth_service(store, project_refs.as_slice(), Arc::new(FakeEnv::jwt()));
+
+        let (_, apps) = service
+            .authenticate_admin_any(&bearer(&token("uid-1", "admin")))
+            .await
+            .expect("the first candidate apps are verified");
+        let apps = apps.expect("the service key was not used");
+        assert_eq!(apps.len(), MAX_CANDIDATE_APPS);
+        assert_eq!(apps.first().map(String::as_str), Some("app-00"));
+        assert_eq!(apps.last().map(String::as_str), Some("app-07"));
+    }
+
+    #[tokio::test]
+    async fn jwt_app_admin_end_to_end() {
+        let service = claim_service(&["admin"]).await;
+        let token = token("uid-1", "admin");
+
+        let identity = service
+            .authenticate_admin(&bearer(&token), APP)
+            .await
+            .expect("the HS256 provider from the fake environment must verify");
+        assert_eq!(identity.uid, "uid-1");
+
+        let send = service
+            .authenticate_send(&bearer(&token), APP)
+            .await
+            .expect("a verified admin can send");
+        assert_eq!(send.uid, "uid-1");
+
+        let (access, user) = service
+            .authorize_topic(&bearer(&token), APP, "admins")
+            .await
+            .expect("an admin can use every valid topic");
+        assert_eq!(access, TopicAccess::Admin);
+        assert_eq!(user.map(|value| value.uid).as_deref(), Some("uid-1"));
+    }
+
+    async fn data_source_service(base_url: &str) -> AuthService {
+        let store = memory_store().await;
+        let identity = json!({
+            "provider": {
+                "type": "jwt",
+                "algorithms": ["HS256"],
+                "hs256_secret_env": JWT_SECRET_ENV,
+                "issuer": ISSUER,
+                "audience": AUDIENCE,
+                "uid_claim": "sub",
+                "max_age_seconds": 3600
+            },
+            "role": {
+                "source": "data_source",
+                "doc": "users/{uid}",
+                "field": "role",
+                "cache_seconds": 60
+            },
+            "admin_roles": ["admin"]
+        });
+        save_app(
+            &store,
+            APP,
+            &[
+                ("identity", identity),
+                (
+                    "data_source",
+                    json!({
+                        "type": "http",
+                        "base_url": format!("{base_url}/internal/fcm"),
+                        "secret_env": RESOLVER_SECRET_ENV,
+                        "timeout_ms": 3000
+                    }),
+                ),
+            ],
+        )
+        .await;
+        auth_service(store, &[(APP, PROJECT)], Arc::new(FakeEnv::jwt()))
     }
 
     #[test]
@@ -1189,16 +1574,16 @@ mod tests {
         assert!(!is_public_topic("lang_"));
         assert!(!is_public_topic("ALL"));
         assert!(!is_public_topic("admins"));
-        assert!(topic_allowed("users", TopicAccess::User));
-        assert!(!topic_allowed("users", TopicAccess::Anonymous));
-        assert!(topic_allowed("anything", TopicAccess::Admin));
+        assert!(topic_allowed("users", TopicAccess::User, None));
+        assert!(!topic_allowed("users", TopicAccess::Anonymous, None));
+        assert!(topic_allowed("anything", TopicAccess::Admin, None));
     }
 
     #[test]
     fn parses_cache_control_max_age() {
         assert_eq!(
             parse_cache_max_age("public, max-age=7200, must-revalidate"),
-            Some(Duration::from_secs(7200))
+            Some(std::time::Duration::from_secs(7200))
         );
         assert_eq!(parse_cache_max_age("no-store"), None);
         assert_eq!(parse_cache_max_age("max-age=oops"), None);
@@ -1206,10 +1591,16 @@ mod tests {
 
     #[test]
     fn encodes_firestore_path_segments() {
-        assert_eq!(encode_path_segment("abcDEF123_-"), "abcDEF123_-");
-        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
-        assert_eq!(encode_path_segment("../../etc"), "..%2F..%2Fetc");
-        assert_eq!(encode_path_segment("a b@c"), "a%20b%40c");
+        assert_eq!(
+            crate::datasource::percent_encode("abcDEF123_-"),
+            "abcDEF123_-"
+        );
+        assert_eq!(crate::datasource::percent_encode("a/b"), "a%2Fb");
+        assert_eq!(
+            crate::datasource::percent_encode("../../etc"),
+            "..%2F..%2Fetc"
+        );
+        assert_eq!(crate::datasource::percent_encode("a b@c"), "a%20b%40c");
         assert!(is_valid_uid("abc"));
         assert!(!is_valid_uid(""));
         assert!(!is_valid_uid(&"a".repeat(MAX_UID_LENGTH + 1)));
