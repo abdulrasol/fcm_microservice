@@ -143,6 +143,26 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // T11: the application keys. Only the SHA-256 hash of a key is stored;
+    // `hint` is the last four characters, so the list can show which key it
+    // is without revealing it.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS app_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT NULL, name TEXT NOT NULL,
+            key_hash TEXT UNIQUE NOT NULL, hint TEXT NOT NULL, created_by TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_used_at DATETIME,
+            revoked_at DATETIME
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_app_keys_app ON app_keys(app)")
+        .execute(pool)
+        .await?;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS tool_sessions (
