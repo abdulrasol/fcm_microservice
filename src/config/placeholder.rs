@@ -1,0 +1,285 @@
+//! محلّل لغة القوالب (الخطة 3.6).
+//!
+//! الصيغ المدعومة: `{p.NAME}` و`{sender.uid|name|role}` و`{doc.PATH}` و
+//! `{entity.PATH}` و`{VARNAME}`، وفلتر اختياري `|int` بعد المرجع.
+//!
+//! لا أحرف هروب: `{` بلا إغلاق صحيح أو `}` يتيمة أو محتوى غير مطابق ⇒ خطأ
+//! مع تحديد الموضع (fail-closed).
+
+/// المرجع داخل `{}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ref {
+    /// `{p.name}` — معامل من العميل.
+    Param(String),
+    /// `{sender.uid}` — من التوكن.
+    Sender(SenderField),
+    /// `{doc.path}` — من وثيقة `context.doc`.
+    Doc(String),
+    /// `{entity.path}` — من وثيقة الشركة (الحملات).
+    Entity(String),
+    /// `{name}` — من خريطة `vars`.
+    Var(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SenderField {
+    Uid,
+    Name,
+    Role,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placeholder {
+    pub r: Ref,
+    /// هل كُتب الفلتر `|int` بعد المرجع؟
+    pub int_filter: bool,
+}
+
+const MAX_NAME_LEN: usize = 30;
+const MAX_PATH_SEGMENTS: usize = 5;
+
+/// يستخرج كل الـ placeholders من نص.
+///
+/// يعيد `Err` مع رسالة تحدد الموضع عند أي خطأ صياغة.
+pub fn extract(s: &str) -> Result<Vec<Placeholder>, String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                let open = i;
+                let close = match find_close(bytes, i) {
+                    Some(pos) => pos,
+                    None => return Err(format!("unclosed '{{' at position {}", open)),
+                };
+                let inner = &s[open + 1..close];
+                if inner.contains('{') {
+                    return Err(format!(
+                        "nested '{{' inside placeholder at position {}",
+                        open
+                    ));
+                }
+                out.push(parse_placeholder(inner, open)?);
+                i = close + 1;
+            }
+            b'}' => {
+                return Err(format!("stray '}}' at position {}", i));
+            }
+            _ => i += 1,
+        }
+    }
+
+    Ok(out)
+}
+
+/// هل النص خام بلا أي placeholder؟
+///
+/// النص الذي فيه خطأ صياغة ليس «خاماً» ⇒ `false` (fail-closed).
+pub fn is_literal(s: &str) -> bool {
+    matches!(extract(s), Ok(placeholders) if placeholders.is_empty())
+}
+
+/// يجد موضع `}` المقابِل (بدون دعم الأقواس المتداخلة).
+fn find_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_placeholder(inner: &str, position: usize) -> Result<Placeholder, String> {
+    // الفلتر:آخر `|` هو الفاصل (المرجع نفسه لا يحتوي `|`).
+    let (reference, int_filter) = match inner.rfind('|') {
+        Some(pos) => {
+            let filter = &inner[pos + 1..];
+            if filter != "int" {
+                return Err(format!(
+                    "unknown filter '{}' at position {} (only 'int' is supported)",
+                    filter, position
+                ));
+            }
+            (&inner[..pos], true)
+        }
+        None => (inner, false),
+    };
+
+    if reference.is_empty() {
+        return Err(format!("empty placeholder at position {}", position));
+    }
+
+    let r = if let Some(rest) = reference.strip_prefix("p.") {
+        if !is_name(rest) {
+            return Err(format!(
+                "invalid parameter name '{}' at position {}",
+                rest, position
+            ));
+        }
+        Ref::Param(rest.to_string())
+    } else if let Some(rest) = reference.strip_prefix("sender.") {
+        let field = match rest {
+            "uid" => SenderField::Uid,
+            "name" => SenderField::Name,
+            "role" => SenderField::Role,
+            other => {
+                return Err(format!(
+                    "unknown sender field '{}' at position {} (uid|name|role)",
+                    other, position
+                ))
+            }
+        };
+        Ref::Sender(field)
+    } else if let Some(rest) = reference.strip_prefix("doc.") {
+        if !is_path(rest) {
+            return Err(format!(
+                "invalid document path '{}' at position {}",
+                rest, position
+            ));
+        }
+        Ref::Doc(rest.to_string())
+    } else if let Some(rest) = reference.strip_prefix("entity.") {
+        if !is_path(rest) {
+            return Err(format!(
+                "invalid entity path '{}' at position {}",
+                rest, position
+            ));
+        }
+        Ref::Entity(rest.to_string())
+    } else {
+        if !is_name(reference) {
+            return Err(format!(
+                "invalid placeholder reference '{}' at position {}",
+                reference, position
+            ));
+        }
+        Ref::Var(reference.to_string())
+    };
+
+    Ok(Placeholder { r, int_filter })
+}
+
+/// اسم معامل أو متغير: `[a-z][a-z0-9_]{0,29}`.
+pub fn is_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    if value.len() > MAX_NAME_LEN {
+        return false;
+    }
+    value
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// مسار نقطي: حتى 5 مقاطع، كل مقطع `[A-Za-z_][A-Za-z0-9_]*`.
+pub fn is_path(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let segments: Vec<&str> = value.split('.').collect();
+    if segments.len() > MAX_PATH_SEGMENTS {
+        return false;
+    }
+    segments.iter().all(|segment| {
+        let mut chars = segment.chars();
+        match chars.next() {
+            Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+            _ => return false,
+        }
+        segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholder_parses_all_forms() {
+        let found = extract(
+            "طلب {p.order_id} من {sender.uid} باسم {sender.name} دور {sender.role} \
+             رقم {doc.order_number} sum {doc.total|int} shop {entity.name} حالة {status_text}",
+        )
+        .expect("all forms must parse");
+
+        assert_eq!(found.len(), 8);
+        assert_eq!(found[0].r, Ref::Param("order_id".to_string()));
+        assert_eq!(found[1].r, Ref::Sender(SenderField::Uid));
+        assert_eq!(found[2].r, Ref::Sender(SenderField::Name));
+        assert_eq!(found[3].r, Ref::Sender(SenderField::Role));
+        assert_eq!(found[4].r, Ref::Doc("order_number".to_string()));
+        assert_eq!(found[5].r, Ref::Doc("total".to_string()));
+        assert_eq!(found[6].r, Ref::Entity("name".to_string()));
+        assert_eq!(found[7].r, Ref::Var("status_text".to_string()));
+        assert!(!found[0].int_filter);
+    }
+
+    #[test]
+    fn placeholder_rejects_stray_braces() {
+        let unclosed = extract("نص {p.name").expect_err("unclosed brace must fail");
+        assert!(unclosed.contains("unclosed"), "message: {}", unclosed);
+
+        let stray = extract("نص } آخر").expect_err("stray brace must fail");
+        assert!(stray.contains("stray"), "message: {}", stray);
+
+        let nested = extract("{p.{name}}").expect_err("nested brace must fail");
+        assert!(nested.contains("nested"), "message: {}", nested);
+    }
+
+    #[test]
+    fn placeholder_rejects_unknown_filter() {
+        let error = extract("{doc.total|float}").expect_err("unknown filter must fail");
+        assert!(error.contains("unknown filter"), "message: {}", error);
+        assert!(error.contains("float"), "message: {}", error);
+    }
+
+    #[test]
+    fn placeholder_int_filter_flag() {
+        let found = extract("{doc.total|int}").expect("int filter must parse");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].int_filter);
+        assert_eq!(found[0].r, Ref::Doc("total".to_string()));
+
+        let plain = extract("{doc.total}").expect("plain ref must parse");
+        assert!(!plain[0].int_filter);
+    }
+
+    #[test]
+    fn placeholder_rejects_bad_names_and_paths() {
+        assert!(extract("{p.OrderId}").is_err(), "uppercase name must fail");
+        assert!(extract("{p.}").is_err(), "empty name must fail");
+        assert!(extract("{doc.}").is_err(), "empty path must fail");
+        assert!(
+            extract("{doc.a.b.c.d.e.f}").is_err(),
+            "6 segments must fail"
+        );
+        assert!(
+            extract("{sender.email}").is_err(),
+            "unknown sender field must fail"
+        );
+    }
+
+    #[test]
+    fn placeholder_is_literal() {
+        assert!(is_literal("نص بلا placeholders"));
+        assert!(!is_literal("نص {p.name}"));
+        assert!(!is_literal("نص {مكسور"), "malformed text is not literal");
+    }
+}

@@ -16,5 +16,6 @@ Cargo.lock
 !.env.example
 *.json
 !package.json
+!policies/*.example.json
 service-account.json
 test.sh

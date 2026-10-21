@@ -1,4 +1,6 @@
 mod auth;
+mod cli;
+mod config;
 mod credentials;
 mod db;
 mod ratelimit;
@@ -13,6 +15,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use config::store::ConfigStore;
 use credentials::{AuthMap, ProjectIdMap};
 use ratelimit::RateLimiter;
 use reqwest::Client;
@@ -44,6 +47,9 @@ struct AppState {
     trust_proxy: bool,
     topics_limiter: RateLimiter,
     auth_fail_limiter: RateLimiter,
+    /// T1: مخزن الإعدادات. يُستخدم من T7/T8.
+    #[allow(dead_code)]
+    config: Arc<ConfigStore>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -69,6 +75,14 @@ struct TopicRequest {
 async fn main() {
     tracing_subscriber::fmt::init();
     let _ = dotenvy::dotenv();
+
+    // CLI first: `import` and `export` must work before the CORS check and
+    // before the port is opened. Without arguments the server starts as usual.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        let code = cli::run(&args).await;
+        std::process::exit(code);
+    }
 
     let cors = match build_cors_layer() {
         Ok(layer) => layer,
@@ -133,6 +147,18 @@ async fn main() {
         },
     );
 
+    let config_store = match ConfigStore::new(db_pool.clone()).await {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            tracing::error!("Failed to load the config store: {}", error);
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        "Config store loaded with {} app(s)",
+        config_store.app_count()
+    );
+
     let state = Arc::new(AppState {
         db: db_pool,
         auth_map,
@@ -142,6 +168,7 @@ async fn main() {
         trust_proxy,
         topics_limiter: RateLimiter::new(TOPICS_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
         auth_fail_limiter: RateLimiter::new(AUTH_FAILURE_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
+        config: config_store,
     });
 
     // Serve static files from "dist", fallback to index.html for SPA routing

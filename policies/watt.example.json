@@ -1,0 +1,120 @@
+{
+  "version": 1,
+
+  "identity": {
+    "provider": { "type": "firebase" },
+    "role": { "source": "data_source", "doc": "users/{uid}", "field": "role", "cache_seconds": 60 },
+    "admin_roles": ["admin"],
+    "role_members": { "collection": "users", "field": "role", "cache_seconds": 300, "max": 50 }
+  },
+
+  "data_source": { "type": "firestore" },
+
+  "devices": { "max_per_uid": 5 },
+
+  "web_subscribe": {
+    "anonymous": ["all", "country_*", "lang_*", "promos", "cat_*", "company_*"],
+    "signed_in": ["users", "companies", "technicals"]
+  },
+
+  "templates": {
+    "admin_alert": {
+      "description": "تنبيه للأدمن من أي مستخدم (تسجيل، تغيير دور، ماركة/منتج جديد، طلب اعتماد)",
+      "enabled": true,
+      "senders": ["user", "company", "technical", "admin"],
+      "params": {
+        "title": { "type": "text", "max": 80 },
+        "body":  { "type": "text", "max": 300 },
+        "route": { "type": "pattern", "pattern": "^/[a-z0-9/_-]*$", "max": 100 }
+      },
+      "to": { "role": "admin" },
+      "title": "{p.title}",
+      "body": "{p.body}",
+      "data": { "action": "open_page", "target": "{p.route}" },
+      "rate": { "per_uid_per_hour": 10 }
+    },
+
+    "order_new": {
+      "description": "إشعار البائع بطلب جديد",
+      "enabled": true,
+      "senders": ["user", "company", "technical"],
+      "params": { "order_id": { "type": "pattern", "pattern": "^[A-Za-z0-9_-]{1,64}$" } },
+      "context": {
+        "doc": "store_orders/{p.order_id}",
+        "require": { "buyer_id": "{sender.uid}" }
+      },
+      "to": { "uid": "{doc.seller_id}" },
+      "title": "طلب جديد #{doc.order_number}",
+      "body": "طلب جديد من {doc.buyer_name} بقيمة {doc.total|int} {doc.currency}",
+      "data": { "action": "open_page", "target": "/store/orders/{p.order_id}", "order_id": "{p.order_id}", "role": "seller" },
+      "dedupe": { "key": "{p.order_id}", "seconds": 600 },
+      "rate": { "per_uid_per_hour": 30 }
+    },
+
+    "order_status": {
+      "description": "إشعار المشتري بتغيّر حالة طلبه",
+      "enabled": true,
+      "senders": ["company", "technical", "user"],
+      "params": { "order_id": { "type": "pattern", "pattern": "^[A-Za-z0-9_-]{1,64}$" } },
+      "context": {
+        "doc": "store_orders/{p.order_id}",
+        "require": { "seller_id": "{sender.uid}" }
+      },
+      "vars": {
+        "status_text": {
+          "from": "doc.status",
+          "map": {
+            "confirmed": "تم تأكيد طلبك #{doc.order_number} من قِبل {doc.seller_name}",
+            "preparing": "طلبك #{doc.order_number} قيد التجهيز الآن",
+            "shipped":   "تم شحن طلبك #{doc.order_number} وهو في الطريق إليك",
+            "delivered": "تم تسليم طلبك #{doc.order_number} بنجاح",
+            "cancelled": "تم إلغاء الطلب #{doc.order_number}",
+            "rejected":  "تعذّر قبول طلبك #{doc.order_number} من قِبل {doc.seller_name}",
+            "pending":   "طلبك #{doc.order_number} قيد المراجعة"
+          }
+        }
+      },
+      "to": { "uid": "{doc.buyer_id}" },
+      "title": "تحديث الطلب #{doc.order_number}",
+      "body": "{status_text}",
+      "data": { "action": "open_page", "target": "/store/orders/{p.order_id}", "order_id": "{p.order_id}", "role": "buyer", "new_status": "{doc.status}" },
+      "dedupe": { "key": "{p.order_id}:{doc.status}", "seconds": 600 },
+      "rate": { "per_uid_per_hour": 120 }
+    }
+  },
+
+  "campaigns": {
+    "enabled": true,
+    "senders": ["company"],
+    "entity": {
+      "param": "company_id",
+      "doc": "companies/{p.company_id}",
+      "require": { "user_id": "{sender.uid}", "status": "approved" },
+      "name_field": "name"
+    },
+    "audience": {
+      "allowed_topics": ["country_*", "lang_*", "users", "technicals", "cat_*", "company_{p.company_id}"],
+      "required_topic": "promos",
+      "max_topics": 5
+    },
+    "content": {
+      "title_prefix": "{entity.name}: ",
+      "title_max": 60,
+      "body_max": 240,
+      "forbid_links": true,
+      "image_hosts": ["firebasestorage.googleapis.com"],
+      "actions": {
+        "open_company": { "data": { "action": "open_company", "company_id": "{p.company_id}" } },
+        "open_product": {
+          "params": { "product_id": { "type": "pattern", "pattern": "^[A-Za-z0-9_-]{1,64}$" } },
+          "check": { "doc": "store_products/{p.product_id}", "require": { "owner_id": "{sender.uid}", "status": "approved" } },
+          "data": { "action": "open_product", "product_id": "{p.product_id}" }
+        }
+      }
+    },
+    "quota": { "per_entity_per_day": 1, "per_entity_per_week": 5 },
+    "review": { "mode": "first_n", "n": 3 }
+  },
+
+  "app_check": { "mode": "off", "project_number": "919552016311" }
+}
