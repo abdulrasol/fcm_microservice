@@ -9,6 +9,7 @@ pub mod auth;
 pub mod campaigns;
 pub mod diagnostics;
 pub mod history;
+pub mod keys;
 pub mod password;
 pub mod session;
 pub mod templates;
@@ -508,6 +509,14 @@ pub(crate) fn admin_routes() -> Vec<AdminRoute> {
             true,
             post(diagnostics::data_source_test),
         ),
+        ("GET", "/apps/:app/keys", true, get(keys::list_keys)),
+        ("POST", "/apps/:app/keys", true, post(keys::create_key)),
+        (
+            "DELETE",
+            "/apps/:app/keys/:id",
+            true,
+            delete(keys::revoke_key),
+        ),
     ]
 }
 
@@ -626,7 +635,7 @@ pub(crate) mod tests {
             env,
         ));
         let app_keys = Arc::new(crate::appkeys::AppKeyStore::new(pool.clone()));
-        let auth = AuthService::with_app_keys(
+        let auth = AuthService::new(
             project_map.clone(),
             identity.clone(),
             datasource.clone(),
@@ -636,8 +645,8 @@ pub(crate) mod tests {
                 legacy_api_key: None,
                 legacy_enabled: false,
             },
-            app_keys,
-        );
+        )
+        .with_app_keys(app_keys);
         let tool_auth = Arc::new(ToolAuth {
             pool: pool.clone(),
             cookie: session::CookieConfig::with_hours(true, 12),
@@ -1954,6 +1963,13 @@ pub(crate) mod tests {
                 "/apps/:app/data_source/test",
                 Some(json!({ "path": "users/u1" })),
             ),
+            MatrixCase::new(Method::GET, "/apps/:app/keys", None),
+            MatrixCase::new(
+                Method::POST,
+                "/apps/:app/keys",
+                Some(json!({ "name": "matrix" })),
+            ),
+            MatrixCase::new(Method::DELETE, "/apps/:app/keys/:id", None),
         ];
         for section in [
             "identity",

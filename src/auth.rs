@@ -152,23 +152,9 @@ impl AuthService {
     }
 
     /// The same service with the application keys of the tool.
-    pub fn with_app_keys(
-        project_map: ProjectIdMap,
-        identity: Arc<IdentityRegistry>,
-        datasource: Arc<DataSourceRegistry>,
-        config: Arc<ConfigStore>,
-        auth_config: AuthConfig,
-        app_keys: Arc<AppKeyStore>,
-    ) -> Self {
-        Self {
-            project_map,
-            identity,
-            datasource,
-            config,
-            auth_config,
-            roles: RoleResolver::new(),
-            app_keys: Some(app_keys),
-        }
+    pub fn with_app_keys(mut self, app_keys: Arc<AppKeyStore>) -> Self {
+        self.app_keys = Some(app_keys);
+        self
     }
 
     /// The application keys of the tool, when the service knows them.

@@ -39,8 +39,8 @@ pub enum KeyError {
     Invalid(&'static str),
     /// The app already holds the largest number of live keys.
     TooMany,
-    /// The storage failed.
-    Database(sqlx::Error),
+    /// The storage failed. The detail is in the log, never in the answer.
+    Database,
 }
 
 impl std::fmt::Display for KeyError {
@@ -48,17 +48,22 @@ impl std::fmt::Display for KeyError {
         match self {
             KeyError::Invalid(message) => write!(formatter, "{}", message),
             KeyError::TooMany => {
-                write!(formatter, "the app already holds the maximum number of keys")
+                write!(
+                    formatter,
+                    "the app already holds the maximum number of keys"
+                )
             }
             // The database error never holds a key.
-            KeyError::Database(_) => write!(formatter, "the key storage failed"),
+            KeyError::Database => write!(formatter, "the key storage failed"),
         }
     }
 }
 
 impl From<sqlx::Error> for KeyError {
     fn from(error: sqlx::Error) -> Self {
-        KeyError::Database(error)
+        // The SQL error never holds a key.
+        tracing::error!(error = %error, "the key storage failed");
+        KeyError::Database
     }
 }
 
@@ -308,9 +313,9 @@ impl AppKeyStore {
 pub fn is_valid_app_name(app: &str) -> bool {
     !app.is_empty()
         && app.len() <= 40
-        && app
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-')
+        && app.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        })
 }
 
 /// The last four characters of a key, shown in the list.
@@ -394,7 +399,11 @@ mod tests {
         for column in row.columns() {
             let name = column.name();
             if let Some(value) = row.try_get::<Option<String>, _>(name).ok().flatten() {
-                assert!(!value.contains(&created.key), "the column {} holds the raw key", name);
+                assert!(
+                    !value.contains(&created.key),
+                    "the column {} holds the raw key",
+                    name
+                );
             }
         }
     }
@@ -410,7 +419,10 @@ mod tests {
         assert_eq!(keys[0].created_by, "owner@example.com");
         let text = format!("{:?}", keys[0]);
         assert!(!text.contains(&created.key), "the list never holds the key");
-        assert!(!text.contains(&hash_token(&created.key)), "the list has no hash");
+        assert!(
+            !text.contains(&hash_token(&created.key)),
+            "the list has no hash"
+        );
     }
 
     #[tokio::test]
@@ -429,10 +441,7 @@ mod tests {
         let (store, _pool) = store().await;
         let created = create(&store, "watt", "backend").await;
 
-        assert_eq!(
-            store.check(&created.key, "other").await,
-            KeyCheck::WrongApp
-        );
+        assert_eq!(store.check(&created.key, "other").await, KeyCheck::WrongApp);
     }
 
     #[tokio::test]
@@ -455,10 +464,7 @@ mod tests {
         let (store, _pool) = store().await;
 
         // Too short.
-        assert_eq!(
-            store.check("fcm_watt_abc", "watt").await,
-            KeyCheck::Invalid
-        );
+        assert_eq!(store.check("fcm_watt_abc", "watt").await, KeyCheck::Invalid);
         // A character outside base64url.
         assert_eq!(
             store
@@ -565,11 +571,12 @@ mod tests {
         let (store, pool) = store().await;
         let created = create(&store, "watt", "backend").await;
 
-        let before: Option<String> = sqlx::query_scalar("SELECT last_used_at FROM app_keys WHERE id = ?")
-            .bind(created.id)
-            .fetch_one(&pool)
-            .await
-            .expect("the row must exist");
+        let before: Option<String> =
+            sqlx::query_scalar("SELECT last_used_at FROM app_keys WHERE id = ?")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .expect("the row must exist");
         assert!(before.is_none(), "a new key was never used");
 
         assert_eq!(
@@ -577,11 +584,12 @@ mod tests {
             KeyCheck::Valid { id: created.id }
         );
 
-        let after: Option<String> = sqlx::query_scalar("SELECT last_used_at FROM app_keys WHERE id = ?")
-            .bind(created.id)
-            .fetch_one(&pool)
-            .await
-            .expect("the row must exist");
+        let after: Option<String> =
+            sqlx::query_scalar("SELECT last_used_at FROM app_keys WHERE id = ?")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .expect("the row must exist");
         assert!(after.is_some(), "the use is recorded");
     }
 
@@ -591,12 +599,10 @@ mod tests {
         let created = create(&store, "watt", "backend").await;
 
         // A trigger counts the writes of the usage time.
-        sqlx::query(
-            "CREATE TABLE touch_log (id INTEGER)",
-        )
-        .execute(&pool)
-        .await
-        .expect("the table must be created");
+        sqlx::query("CREATE TABLE touch_log (id INTEGER)")
+            .execute(&pool)
+            .await
+            .expect("the table must be created");
         sqlx::query(
             "CREATE TRIGGER count_touch AFTER UPDATE OF last_used_at ON app_keys \
              BEGIN INSERT INTO touch_log (id) VALUES (NEW.id); END",
@@ -627,6 +633,9 @@ mod tests {
             .expect_err("the app name must be refused");
         let text = error.to_string();
         assert!(!text.contains(&created.key), "the error holds no key");
-        assert!(!text.contains("fcm_watt"), "the error holds no key material");
+        assert!(
+            !text.contains("fcm_watt"),
+            "the error holds no key material"
+        );
     }
 }

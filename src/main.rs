@@ -266,7 +266,7 @@ async fn main() {
     // The application keys live in their own store, shared with the auth
     // service that checks them.
     let app_keys = Arc::new(appkeys::AppKeyStore::new(db_pool.clone()));
-    let auth = AuthService::with_app_keys(
+    let auth = AuthService::new(
         project_map.clone(),
         identity_registry.clone(),
         datasource_registry.clone(),
@@ -276,8 +276,8 @@ async fn main() {
             legacy_api_key,
             legacy_enabled,
         },
-        app_keys.clone(),
-    );
+    )
+    .with_app_keys(app_keys.clone());
 
     let tool_auth = match admin::ToolAuth::new(db_pool.clone()).await {
         Ok(tool_auth) => tool_auth,
@@ -1449,7 +1449,7 @@ async fn authorize_campaign_sender(
         .auth
         .trusted_sender(headers, app)
         .await
-        .map_err(|error| auth_error_with_limit(&state, &headers, peer, error))?
+        .map_err(|error| auth_error_with_limit(state, headers, peer, error))?
     {
         Some(appkeys::TrustedSender::Service) => {
             return Ok((
@@ -2070,7 +2070,7 @@ mod tests {
             env,
         ));
         let app_keys = Arc::new(appkeys::AppKeyStore::new(pool.clone()));
-        let auth = AuthService::with_app_keys(
+        let auth = AuthService::new(
             project_map.clone(),
             identity.clone(),
             datasource.clone(),
@@ -2080,8 +2080,8 @@ mod tests {
                 legacy_api_key: Some(LEGACY_KEY.to_string()),
                 legacy_enabled: true,
             },
-            app_keys.clone(),
-        );
+        )
+        .with_app_keys(app_keys.clone());
         let tool_auth = Arc::new(ToolAuth {
             pool: pool.clone(),
             cookie: CookieConfig::with_hours(true, 12),
@@ -4510,7 +4510,7 @@ mod tests {
         body: Option<Value>,
         token: &str,
     ) -> Request<Body> {
-        let mut builder = Request::builder()
+        let builder = Request::builder()
             .method(method)
             .uri(uri)
             .header(header::CONTENT_TYPE, "application/json")
@@ -4641,10 +4641,7 @@ mod tests {
 
         let (status, body) = call_json(
             &template_router(harness.state.clone()),
-            template_request(
-                json!({ "app": APP, "template": "news" }),
-                Some(&key.key),
-            ),
+            template_request(json!({ "app": APP, "template": "news" }), Some(&key.key)),
         )
         .await;
 
@@ -4673,19 +4670,17 @@ mod tests {
 
         let (status, _) = call_json(
             &template_router(harness.state.clone()),
-            template_request(
-                json!({ "app": APP, "template": "news" }),
-                Some(&key.key),
-            ),
+            template_request(json!({ "app": APP, "template": "news" }), Some(&key.key)),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        let sender_uid: Option<String> =
-            sqlx::query_scalar("SELECT sender_uid FROM notifications_history ORDER BY id DESC LIMIT 1")
-                .fetch_one(&harness.pool)
-                .await
-                .expect("the history row must exist");
+        let sender_uid: Option<String> = sqlx::query_scalar(
+            "SELECT sender_uid FROM notifications_history ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&harness.pool)
+        .await
+        .expect("the history row must exist");
         assert_eq!(
             sender_uid.as_deref(),
             Some(format!("key:{}", key.id).as_str()),
@@ -4737,9 +4732,10 @@ mod tests {
         assert_eq!(body["status"], "pending_review");
         let id = body["id"].as_i64().expect("an id");
 
-        let (status, body) = get_campaigns_call(&harness, &format!("app={}", APP), Some(&key.key)).await;
+        let (status, body) =
+            get_campaigns_call(&harness, &format!("app={}", APP), Some(&key.key)).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.as_array().expect("an array").len() >= 1);
+        assert!(!body.as_array().expect("an array").is_empty());
 
         let (status, body) = call_json(
             &campaign_router(harness.state.clone()),
@@ -4775,7 +4771,12 @@ mod tests {
         // The key of another app is refused.
         let (status, _) = call(
             &topics_router(state.clone()),
-            bearer_request(Method::POST, "/topics/subscribe", Some(body.clone()), &other.key),
+            bearer_request(
+                Method::POST,
+                "/topics/subscribe",
+                Some(body.clone()),
+                &other.key,
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -4909,10 +4910,7 @@ mod tests {
             warn_about_service_key(Some("a-service-key")),
             "the warning is written when the key is set"
         );
-        assert!(
-            !warn_about_service_key(None),
-            "no warning without the key"
-        );
+        assert!(!warn_about_service_key(None), "no warning without the key");
 
         // The warning is in the startup path.
         let source = include_str!("main.rs");
