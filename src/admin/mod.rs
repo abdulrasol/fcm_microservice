@@ -7,6 +7,7 @@
 pub mod apps;
 pub mod auth;
 pub mod campaigns;
+pub mod diagnostics;
 pub mod history;
 pub mod password;
 pub mod session;
@@ -495,6 +496,18 @@ pub(crate) fn admin_routes() -> Vec<AdminRoute> {
         ),
         ("DELETE", "/users/:id", true, delete(users::delete_user)),
         ("PUT", "/auth/test-uid", true, put(auth::set_test_uid)),
+        (
+            "POST",
+            "/apps/:app/identity/test",
+            true,
+            post(diagnostics::identity_test),
+        ),
+        (
+            "POST",
+            "/apps/:app/data_source/test",
+            true,
+            post(diagnostics::data_source_test),
+        ),
     ]
 }
 
@@ -1415,12 +1428,22 @@ pub(crate) mod tests {
     pub(crate) const APP: &str = "watt";
     pub(crate) const OTHER_APP: &str = "other";
     pub(crate) const DATASOURCE_SECRET_ENV: &str = "ADMIN_TEST_DS_SECRET";
+    /// The identity secret of the tests.
+    pub(crate) const JWT_SECRET_ENV: &str = "ADMIN_TEST_JWT_SECRET";
+    /// A long enough HS256 secret for the tests.
+    pub(crate) const JWT_SECRET: &str = "a-very-long-test-secret-value-1234567890";
 
     pub(crate) struct FakeEnv;
 
     impl crate::identity::jwt::EnvSource for FakeEnv {
         fn get(&self, name: &str) -> Option<String> {
-            (name == DATASOURCE_SECRET_ENV).then(|| "0123456789abcdef0123456789abcdef".to_string())
+            if name == DATASOURCE_SECRET_ENV {
+                Some("0123456789abcdef0123456789abcdef".to_string())
+            } else if name == JWT_SECRET_ENV {
+                Some(JWT_SECRET.to_string())
+            } else {
+                None
+            }
         }
     }
 
@@ -1756,6 +1779,30 @@ pub(crate) mod tests {
             .call(Method::GET, &format!("/apps/{}/export", APP), None)
             .await;
 
+        // The data source check must not reach a real service: the app gets a
+        // source whose secret the environment does not hold.
+        let version = harness
+            .state
+            .config
+            .get(APP)
+            .expect("the app exists")
+            .version;
+        let _ = harness
+            .state
+            .config
+            .save_section(
+                APP,
+                "data_source",
+                json!({
+                    "type": "http",
+                    "base_url": "http://127.0.0.1:1",
+                    "secret_env": "ADMIN_TEST_MISSING_DS_SECRET"
+                }),
+                "tester",
+                version,
+            )
+            .await;
+
         // The account routes act on a manager, so one is created first.
         let (_, created) = harness
             .call(
@@ -1895,6 +1942,16 @@ pub(crate) mod tests {
                 "/auth/test-uid",
                 Some(json!({ "test_uid": "matrix-user" })),
             ),
+            MatrixCase::new(
+                Method::POST,
+                "/apps/:app/identity/test",
+                Some(json!({ "token": "matrix" })),
+            ),
+            MatrixCase::new(
+                Method::POST,
+                "/apps/:app/data_source/test",
+                Some(json!({ "path": "users/u1" })),
+            ),
         ];
         for section in [
             "identity",
@@ -2013,6 +2070,33 @@ pub(crate) mod tests {
             "/apps/:app/history/:id",
             "/apps/:app/send",
             "/apps/:app/devices/stats",
+        ] {
+            assert!(
+                covered.iter().any(|(_, known)| known == pattern),
+                "the matrix must cover {}",
+                pattern
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_includes_users_and_diagnostics_routes() {
+        let harness = setup("owner", &[]).await;
+        harness.reauth().await;
+        let cases = owner_matrix_cases(&harness).await;
+        let (registered, covered) = matrix_coverage(&cases);
+        assert_eq!(
+            covered, registered,
+            "the owner matrix must cover every registered route"
+        );
+
+        for pattern in [
+            "/users",
+            "/users/:id",
+            "/users/:id/reset-password",
+            "/auth/test-uid",
+            "/apps/:app/identity/test",
+            "/apps/:app/data_source/test",
         ] {
             assert!(
                 covered.iter().any(|(_, known)| known == pattern),
