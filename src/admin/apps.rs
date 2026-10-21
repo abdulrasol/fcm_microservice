@@ -25,7 +25,13 @@ pub async fn list_apps(
 ) -> Result<Json<Value>, AdminError> {
     let project_map = state.project_map.read().await;
     let mut names: Vec<String> = match user.role {
-        Role::Owner => project_map.keys().cloned().collect(),
+        // The union of the configured apps and the apps that only have
+        // credentials, so an app is never hidden from its owner.
+        Role::Owner => {
+            let mut names = state.config.app_names();
+            names.extend(project_map.keys().cloned());
+            names
+        }
         Role::Manager => user.apps.clone(),
     };
     names.sort();
@@ -410,6 +416,31 @@ mod tests {
             other => panic!("unknown section {}", other),
         }
         .expect("the section must serialize")
+    }
+
+    #[tokio::test]
+    async fn list_apps_owner_includes_configured_without_credentials() {
+        let harness = setup("owner", &[]).await;
+        harness
+            .state
+            .config
+            .create_app("configured_only", "tester")
+            .await
+            .expect("the app configuration must be created");
+
+        let (status, body) = harness.call(Method::GET, "/apps", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let items = body.as_array().expect("an array");
+        let configured_only = items
+            .iter()
+            .find(|item| item["app"] == "configured_only")
+            .expect("the configured app must be listed");
+        assert_eq!(configured_only["configured"], true);
+        assert_eq!(configured_only["has_credentials"], false);
+        assert!(configured_only["project_id"].is_null());
+
+        // The apps with credentials are still listed.
+        assert!(items.iter().any(|item| item["app"] == APP));
     }
 
     #[tokio::test]

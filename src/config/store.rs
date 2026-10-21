@@ -197,6 +197,20 @@ impl ConfigStore {
         cache.len()
     }
 
+    /// The names of the configured apps, sorted.
+    ///
+    /// The dashboard needs the configured apps to list them next to the apps
+    /// that only have credentials.
+    pub fn app_names(&self) -> Vec<String> {
+        let cache = self
+            .cache
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut names: Vec<String> = cache.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Creates an app with the default settings. A duplicate is `Conflict`.
     pub async fn create_app(&self, app: &str, actor: &str) -> Result<(), ConfigError> {
         let _guard = self.write_lock.lock().await;
@@ -1082,6 +1096,26 @@ mod tests {
             .await
             .expect("the row must exist");
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn app_names_sorted_and_includes_configured() {
+        let (store, _pool) = memory_store().await;
+        assert!(store.app_names().is_empty(), "a fresh store has no apps");
+
+        store
+            .create_app("watt", "tester")
+            .await
+            .expect("creation must work");
+        store
+            .create_app("alpha", "tester")
+            .await
+            .expect("creation must work");
+
+        assert_eq!(
+            store.app_names(),
+            vec!["alpha".to_string(), "watt".to_string()]
+        );
     }
 
     #[tokio::test]
