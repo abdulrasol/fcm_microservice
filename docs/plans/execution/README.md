@@ -24,4 +24,5 @@ S0 ← T1 ← T2 ← T3 ← T4 ← T5 ← T6 ← T7 ← T8 ← T9 ← T10 ← T1
 |---|---|---|
 | S0 | ⬜ أمر جاهز | |
 | T1 | ✅ | مخزن الإعدادات والقوالب: structs + تحقق + SQLite + إصدارات + استيراد/تصدير. بلا ربط بالطلبات الحية — **راجع T2-0** (إصلاحات القفل و`last_used_at` و`[G6]`) |
-| T2 | 🔄 بانتظار المراجعة | حسابات الداشبورد والجلسات: `tool_users`/`tool_sessions` + argon2id + كوكي + CSRF + `create-owner`/`reset-owner-password`. التقرير: `docs/plans/reports/T2-report.md` |
+| T2 | ✅ | حسابات الداشبورد والجلسات: `tool_users`/`tool_sessions` + argon2id + كوكي + CSRF + `create-owner`/`reset-owner-password`. القرارات: CORS يُحل بـ proxy في Vite ضمن T12 ولا يُعدَّل الآن؛ كود الخطأ `internal` معتمد. التقرير: `docs/plans/reports/T2-report.md` |
+| T3 | 🔄 بانتظار المراجعة | مزودات الهوية: نقل JWKS/Firebase من `auth.rs` إلى `src/identity/` + مزود JWT عام (JWKS/HS256) + سجل لكل تطبيق، **بلا ربط بمسارات الإرسال**. التقرير: `docs/plans/reports/T3-report.md` |
