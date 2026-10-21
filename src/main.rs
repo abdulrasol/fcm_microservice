@@ -1,5 +1,6 @@
 mod admin;
 mod auth;
+mod campaigns;
 mod cli;
 mod config;
 mod credentials;
