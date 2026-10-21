@@ -62,7 +62,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS app_configs (
-            app TEXT PRIMARY KEY, config TEXT NOT NULL,           -- JSON بلا templates
+            app TEXT PRIMARY KEY, config TEXT NOT NULL,           -- JSON without templates
             version INTEGER NOT NULL DEFAULT 1,
             updated_by TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );

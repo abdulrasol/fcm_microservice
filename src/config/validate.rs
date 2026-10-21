@@ -1,7 +1,7 @@
-//! التحقق من الإعدادات والقوالب (T1).
+//! Configuration and template validation (T1).
 //!
-//! كل خطأ يحمل رمز القاعدة بين قوسين مثل `[V3]` ليُعرف سببه.
-//! `validate_all` تُرجع **كل** الأخطاء ولا تتوقف عند الأول.
+//! Every error carries its rule code in brackets, e.g. `[V3]`, so the cause is clear.
+//! `validate_all` returns **all** errors and never stops at the first one.
 
 use crate::config::placeholder::{self, Ref};
 use crate::config::{
@@ -11,10 +11,10 @@ use crate::config::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// خطأ تحقق واحد.
+/// A single validation error.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Issue {
-    /// مسار الحقل داخل الإعداد، مثل `templates.order_new.to`.
+    /// The field path inside the configuration, e.g. `templates.order_new.to`.
     pub path: String,
     pub message: String,
 }
@@ -28,7 +28,7 @@ impl Issue {
     }
 }
 
-// ---------- أنماط عامة ----------
+// ---------- shared patterns ----------
 
 /// `^[A-Za-z0-9_-]{1,40}$`
 pub fn is_app_name(value: &str) -> bool {
@@ -39,7 +39,7 @@ pub fn is_app_name(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// `^[a-z0-9_]{1,32}$` (أدوار)
+/// `^[a-z0-9_]{1,32}$` (roles)
 pub fn is_role(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 32
@@ -48,7 +48,7 @@ pub fn is_role(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// `^[A-Z][A-Z0-9_]{0,63}$` (أسماء متغيرات البيئة)
+/// `^[A-Z][A-Z0-9_]{0,63}$` (environment variable names)
 pub fn is_env_name(value: &str) -> bool {
     let mut chars = value.chars();
     match chars.next() {
@@ -61,7 +61,7 @@ pub fn is_env_name(value: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// `^[a-z][a-z0-9_]{0,39}$` (مفتاح قالب)
+/// `^[a-z][a-z0-9_]{0,39}$` (template key)
 pub fn is_template_key(value: &str) -> bool {
     let mut chars = value.chars();
     match chars.next() {
@@ -74,12 +74,12 @@ pub fn is_template_key(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// `^[a-z][a-z0-9_]{0,29}$` (اسم معامل أو متغير)
+/// `^[a-z][a-z0-9_]{0,29}$` (parameter or variable name)
 pub fn is_param_name(value: &str) -> bool {
     placeholder::is_name(value)
 }
 
-/// `^[A-Za-z0-9_.~%-]{1,100}$` (topic حرفي)
+/// `^[A-Za-z0-9_.~%-]{1,100}$` (literal topic)
 pub fn is_plain_topic(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 100
@@ -88,13 +88,13 @@ pub fn is_plain_topic(value: &str) -> bool {
         })
 }
 
-/// `^[A-Za-z0-9_.~%-]{1,100}\*?$` (نمط topic: حرفي أو ينتهي بنجمة واحدة)
+/// `^[A-Za-z0-9_.~%-]{1,100}\*?$` (topic pattern: literal or one trailing star)
 pub fn is_topic_pattern(value: &str) -> bool {
     let body = value.strip_suffix('*').unwrap_or(value);
     is_plain_topic(body)
 }
 
-/// `^[a-z0-9.-]{3,100}$` (اسم مضيف صورة بلا مخطط ولا مسار)
+/// `^[a-z0-9.-]{3,100}$` (image host name, no scheme and no path)
 pub fn is_image_host(value: &str) -> bool {
     value.len() >= 3
         && value.len() <= 100
@@ -103,7 +103,7 @@ pub fn is_image_host(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
 }
 
-/// مفاتيح `data` المحجوزة لـ FCM.
+/// `data` keys reserved by FCM.
 pub fn is_reserved_data_key(key: &str) -> bool {
     key == "from"
         || key == "notification"
@@ -112,9 +112,9 @@ pub fn is_reserved_data_key(key: &str) -> bool {
         || key.starts_with("gcm.")
 }
 
-// ---------- التحقق العام ----------
+// ---------- general validation ----------
 
-/// [V1] اسم التطبيق.
+/// [V1] the app name.
 pub fn validate_app_name(app: &str) -> Vec<Issue> {
     if is_app_name(app) {
         Vec::new()
@@ -126,7 +126,7 @@ pub fn validate_app_name(app: &str) -> Vec<Issue> {
     }
 }
 
-/// يتحقق من الإعداد كله وكل القوالب، ويُرجع **كل** الأخطاء.
+/// Validates the whole configuration and every template, returning **all** errors.
 pub fn validate_all(cfg: &AppConfig, templates: &BTreeMap<String, Template>) -> Vec<Issue> {
     let mut issues = Vec::new();
 
@@ -190,7 +190,7 @@ pub fn validate_all(cfg: &AppConfig, templates: &BTreeMap<String, Template>) -> 
     issues
 }
 
-// ---------- الهوية ----------
+// ---------- identity ----------
 
 fn validate_identity(cfg: &AppConfig, issues: &mut Vec<Issue>) {
     if let IdentityProvider::Jwt {
@@ -399,9 +399,9 @@ fn validate_data_source(cfg: &AppConfig, issues: &mut Vec<Issue>) {
     }
 }
 
-// ---------- القوالب ----------
+// ---------- templates ----------
 
-/// يتحقق من قالب واحد في سياق الإعداد الكامل.
+/// Validates one template in the context of the whole configuration.
 pub fn validate_template(key: &str, template: &Template, cfg: &AppConfig) -> Vec<Issue> {
     let mut issues = Vec::new();
     let base = format!("templates.{}", key);
@@ -413,14 +413,14 @@ pub fn validate_template(key: &str, template: &Template, cfg: &AppConfig) -> Vec
         ));
     }
 
-    // [T1] المرسلون
+    // [T1] senders
     if template.senders.is_empty() {
         issues.push(Issue::new(
             format!("{}.senders", base),
             "[T1] senders must not be empty".to_string(),
         ));
     }
-    // [V3] أدوار المرسلين
+    // [V3] sender roles
     for (index, sender) in template.senders.iter().enumerate() {
         if !is_role(sender) {
             issues.push(Issue::new(
@@ -430,7 +430,7 @@ pub fn validate_template(key: &str, template: &Template, cfg: &AppConfig) -> Vec
         }
     }
 
-    // [T2] المعاملات
+    // [T2] parameters
     for (name, param) in &template.params {
         let path = format!("{}.params.{}", base, name);
         if !is_param_name(name) {
@@ -491,7 +491,7 @@ pub fn validate_template(key: &str, template: &Template, cfg: &AppConfig) -> Vec
         }
     }
 
-    // [T3] المراجع داخل النصوص
+    // [T3] references inside the texts
     check_template_placeholders(
         &template.title,
         &format!("{}.title", base),
@@ -591,7 +591,7 @@ pub fn validate_template(key: &str, template: &Template, cfg: &AppConfig) -> Vec
         }
     }
 
-    // [T5] context و vars من الوثيقة يتطلبان مصدر بيانات
+    // [T5] context and vars from the document need a data source
     if matches!(cfg.data_source, DataSource::None) {
         if template.context.is_some() {
             issues.push(Issue::new(
@@ -610,7 +610,7 @@ pub fn validate_template(key: &str, template: &Template, cfg: &AppConfig) -> Vec
         }
     }
 
-    // [T6] مفاتيح data المحجوزة
+    // [T6] reserved data keys
     for key in template.data.keys() {
         if is_reserved_data_key(key) {
             issues.push(Issue::new(
@@ -620,7 +620,7 @@ pub fn validate_template(key: &str, template: &Template, cfg: &AppConfig) -> Vec
         }
     }
 
-    // [T7] الحدود
+    // [T7] limits
     if let Some(dedupe) = &template.dedupe {
         if dedupe.seconds < 1 || dedupe.seconds > 86_400 {
             issues.push(Issue::new(
@@ -638,17 +638,17 @@ pub fn validate_template(key: &str, template: &Template, cfg: &AppConfig) -> Vec
         }
     }
 
-    // [T4] حقل واحد في `to` — يضمنه تعريف الـ enum.
+    // [T4] a single field in `to` -- guaranteed by the enum definition.
 
-    // حواجز الأمان لغير الأدمن
+    // Safety guards for templates that are not admin-only
     if !is_admin_only(template, cfg) {
-        validate_non_admin_guards(key, template, &base, &mut issues);
+        validate_non_admin_guards(key, template, cfg, &base, &mut issues);
     }
 
     issues
 }
 
-/// القالب كل مرسليه أدمن ⇒ معفى من G1..G5.
+/// Every sender is an admin, so G1..G5 do not apply.
 fn is_admin_only(template: &Template, cfg: &AppConfig) -> bool {
     if template.senders.is_empty() || cfg.identity.admin_roles.is_empty() {
         return false;
@@ -659,10 +659,16 @@ fn is_admin_only(template: &Template, cfg: &AppConfig) -> bool {
         .all(|sender| cfg.identity.admin_roles.contains(sender))
 }
 
-fn validate_non_admin_guards(key: &str, template: &Template, base: &str, issues: &mut Vec<Issue>) {
+fn validate_non_admin_guards(
+    key: &str,
+    template: &Template,
+    cfg: &AppConfig,
+    base: &str,
+    issues: &mut Vec<Issue>,
+) {
     let target_is_broadcast = matches!(template.to, Target::Topic(_) | Target::Condition(_));
 
-    // [G1] بثّ حر لمصادر broadcast ⇒ لا معامل نصي ولا هدف من معامل
+    // [G1] free broadcast from a broadcast source: no text parameter, no target from a parameter
     if target_is_broadcast {
         if template.params.values().any(|param| param.is_text()) {
             issues.push(Issue::new(
@@ -680,7 +686,7 @@ fn validate_non_admin_guards(key: &str, template: &Template, base: &str, issues:
         }
     }
 
-    // [G2] uid/role لا يُبنَيان من معامل
+    // [G2] uid/role must not be built from a parameter
     if matches!(template.to, Target::Uid(_) | Target::Role(_)) && target_uses_param(&template.to) {
         issues.push(Issue::new(
             format!("{}.to.{}", base, template.to.kind()),
@@ -688,7 +694,7 @@ fn validate_non_admin_guards(key: &str, template: &Template, base: &str, issues:
         ));
     }
 
-    // [G3] حد السرعة إلزامي لغير الأدمن
+    // [G3] a rate limit is mandatory for non-admin templates
     if template.rate.is_none() {
         issues.push(Issue::new(
             format!("{}.rate", base),
@@ -696,7 +702,7 @@ fn validate_non_admin_guards(key: &str, template: &Template, base: &str, issues:
         ));
     }
 
-    // [G4] سياق ⇒ require غير فارغ وفيه {sender.uid}
+    // [G4] context needs a non-empty require with {sender.uid}
     if let Some(context) = &template.context {
         if context.require.is_empty() {
             issues.push(Issue::new(
@@ -715,7 +721,7 @@ fn validate_non_admin_guards(key: &str, template: &Template, base: &str, issues:
         }
     }
 
-    // [G5] topic 'all' ممنوع لغير الأدمن
+    // [G5] the 'all' topic is not allowed for templates that are not admin-only
     if let Target::Topic(topic) = &template.to {
         if topic == "all" {
             issues.push(Issue::new(
@@ -735,16 +741,27 @@ fn validate_non_admin_guards(key: &str, template: &Template, base: &str, issues:
         }
     }
 
+    // [G6] a role target must be a literal admin role: otherwise a non-admin
+    // could broadcast text to every member of an ordinary role.
+    if let Target::Role(role) = &template.to {
+        if !cfg.identity.admin_roles.contains(role) {
+            issues.push(Issue::new(
+                format!("{}.to.role", base),
+                "[G6] a non-admin template may only target an admin role".to_string(),
+            ));
+        }
+    }
+
     let _ = key;
 }
 
-/// هل يحتوي الهدف على مرجع معامل `p.*`؟
+/// Does the target contain a parameter reference `p.*`?
 fn target_uses_param(target: &Target) -> bool {
     match placeholder::extract(target.value()) {
         Ok(found) => found
             .iter()
             .any(|placeholder| matches!(placeholder.r, Ref::Param(_))),
-        // نص مكسور ⇒ [T3] أبلغ عنه؛ لا نُصدر خطأ G مزدوجاً.
+        // Malformed text is reported as [T3]; do not emit a second G error.
         Err(_) => false,
     }
 }
@@ -803,7 +820,7 @@ fn check_template_placeholders(
     }
 }
 
-/// قيم `vars.map` لا يجوز أن تشير إلى متغيرات أخرى.
+/// `vars.map` values must not reference other variables.
 fn check_map_value(text: &str, path: &str, template: &Template, issues: &mut Vec<Issue>) {
     let found = match placeholder::extract(text) {
         Ok(found) => found,
@@ -854,13 +871,13 @@ fn check_map_value(text: &str, path: &str, template: &Template, issues: &mut Vec
     }
 }
 
-// ---------- الحملات ----------
+// ---------- campaigns ----------
 
 fn validate_campaigns(cfg: &AppConfig, issues: &mut Vec<Issue>) {
     let campaigns: &Campaigns = &cfg.campaigns;
     let entity_params: BTreeSet<String> = std::iter::once(campaigns.entity.param.clone()).collect();
 
-    // [C1] المرسلون والشركة
+    // [C1] senders and the company
     if campaigns.senders.is_empty() {
         issues.push(Issue::new(
             "campaigns.senders",
@@ -927,7 +944,7 @@ fn validate_campaigns(cfg: &AppConfig, issues: &mut Vec<Issue>) {
         );
     }
 
-    // [C2] الجمهور
+    // [C2] audience
     if campaigns.audience.allowed_topics.is_empty() {
         issues.push(Issue::new(
             "campaigns.audience.allowed_topics",
@@ -958,7 +975,7 @@ fn validate_campaigns(cfg: &AppConfig, issues: &mut Vec<Issue>) {
         }
     }
 
-    // [C3] الموضوع الإلزامي وعدد المواضيع
+    // [C3] required subject and topic count
     if !is_plain_topic(&campaigns.audience.required_topic) {
         issues.push(Issue::new(
             "campaigns.audience.required_topic",
@@ -972,7 +989,7 @@ fn validate_campaigns(cfg: &AppConfig, issues: &mut Vec<Issue>) {
         ));
     }
 
-    // [C4] المحتوى
+    // [C4] content
     match placeholder::extract(&campaigns.content.title_prefix) {
         Ok(found) => {
             for item in found {
@@ -1010,7 +1027,7 @@ fn validate_campaigns(cfg: &AppConfig, issues: &mut Vec<Issue>) {
         }
     }
 
-    // [C5] الإجراءات
+    // [C5] actions
     if campaigns.content.actions.is_empty() {
         issues.push(Issue::new(
             "campaigns.content.actions",
@@ -1048,7 +1065,7 @@ fn validate_campaigns(cfg: &AppConfig, issues: &mut Vec<Issue>) {
         }
     }
 
-    // [C6] الحصة
+    // [C6] quota
     if campaigns.quota.per_entity_per_day < 1 {
         issues.push(Issue::new(
             "campaigns.quota.per_entity_per_day",
@@ -1062,7 +1079,7 @@ fn validate_campaigns(cfg: &AppConfig, issues: &mut Vec<Issue>) {
         ));
     }
 
-    // [C7] المراجعة
+    // [C7] review
     if campaigns.review.mode == ReviewMode::FirstN {
         match campaigns.review.n {
             None => issues.push(Issue::new(
@@ -1078,7 +1095,7 @@ fn validate_campaigns(cfg: &AppConfig, issues: &mut Vec<Issue>) {
     }
 }
 
-/// نمط topic مسموح: V7 حرفي، أو V7 مع مرجع معامل واحد على الأكثر.
+/// An allowed topic pattern: V7 literal, or V7 with at most one parameter reference.
 fn is_allowed_topic_pattern(pattern: &str, entity_param: &str) -> bool {
     if !pattern.contains('{') {
         return is_topic_pattern(pattern);
@@ -1101,7 +1118,7 @@ fn is_allowed_topic_pattern(pattern: &str, entity_param: &str) -> bool {
     count > 0 && count <= 1 && is_plain_topic(&rest)
 }
 
-/// الجزء الحرفي من نمط topic (بدون النجمة وبدون الأقواس).
+/// The literal part of a topic pattern (without the star and the braces).
 fn literal_part(pattern: &str) -> String {
     let mut literal = pattern.to_string();
     if let Some(position) = literal.find('{') {
@@ -1113,7 +1130,7 @@ fn literal_part(pattern: &str) -> String {
     literal
 }
 
-/// في الحملات: `p.*` من مجموعة محددة و`sender.*` فقط.
+/// In campaigns: `p.*` from a fixed set and `sender.*` only.
 fn check_campaign_placeholders(
     text: &str,
     path: &str,
@@ -1218,7 +1235,7 @@ mod tests {
             context: None,
             vars: BTreeMap::new(),
             to: Target::Role("admin".to_string()),
-            title: "طلب {p.order_id}".to_string(),
+            title: "order {p.order_id}".to_string(),
             body: "b".to_string(),
             image: None,
             data: BTreeMap::new(),
@@ -1244,7 +1261,7 @@ mod tests {
             context: None,
             vars: BTreeMap::new(),
             to: Target::Role("admin".to_string()),
-            title: "طلب {doc.order_number}".to_string(),
+            title: "order {doc.order_number}".to_string(),
             body: "b".to_string(),
             image: None,
             data: BTreeMap::new(),
@@ -1270,7 +1287,7 @@ mod tests {
             context: None,
             vars: BTreeMap::new(),
             to: Target::Role("admin".to_string()),
-            title: "حالة {status_text}".to_string(),
+            title: "state {status_text}".to_string(),
             body: "b".to_string(),
             image: None,
             data: BTreeMap::new(),
@@ -1705,6 +1722,48 @@ mod tests {
         let issues = validate_all(&config, &templates);
         assert!(
             has_code(&issues, "[V8]"),
+            "issues: {:?}",
+            issue_codes(&issues)
+        );
+    }
+
+    fn non_admin_role_template(role: &str) -> Template {
+        Template {
+            description: "t".to_string(),
+            enabled: true,
+            senders: vec!["user".to_string()],
+            params: BTreeMap::new(),
+            context: None,
+            vars: BTreeMap::new(),
+            to: Target::Role(role.to_string()),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            image: None,
+            data: BTreeMap::new(),
+            dedupe: None,
+            rate: Some(crate::config::Rate {
+                per_uid_per_hour: 10,
+            }),
+        }
+    }
+
+    #[test]
+    fn g6_non_admin_role_target_must_be_admin_role() {
+        let design = non_admin_role_template("member");
+        let issues = validate_template("t", &design, &example_config());
+        assert!(
+            has_code(&issues, "[G6]"),
+            "issues: {:?}",
+            issue_codes(&issues)
+        );
+    }
+
+    #[test]
+    fn g6_admin_role_target_allowed() {
+        let design = non_admin_role_template("admin");
+        let issues = validate_template("t", &design, &example_config());
+        assert!(
+            !has_code(&issues, "[G6]"),
             "issues: {:?}",
             issue_codes(&issues)
         );

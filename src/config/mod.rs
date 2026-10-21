@@ -1,10 +1,10 @@
 #![allow(dead_code)]
-// يُزال عند ربط المخزن في T7/T8
+// removed once the store is wired in T7/T8
 
-//! نماذج بيانات إعدادات التطبيقات والقوالب (T1).
+//! Data models for the app configuration and its templates (T1).
 //!
-//! مطابقة للمثال في `docs/plans/secure-sending-plan.md` القسم 3.2 حرفياً.
-//! كل النماذج `deny_unknown_fields`: أي حقل غير معروف يُرفض عند التحليل.
+//! They mirror `docs/plans/secure-sending-plan.md` section 3.2 exactly.
+//! Every model uses `deny_unknown_fields`: any unknown field is rejected.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ pub mod placeholder;
 pub mod store;
 pub mod validate;
 
-// ---------- قيم افتراضية ----------
+// ---------- default values ----------
 
 fn default_true() -> bool {
     true
@@ -67,7 +67,7 @@ fn default_per_entity_per_week() -> u32 {
     5
 }
 
-// ---------- إعدادات التطبيق ----------
+// ---------- app configuration ----------
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -85,8 +85,8 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    /// الإعداد الافتراضي لتطبيق Firebase: هوية من `users/{uid}.role`،
-    /// مصدر بيانات Firestore، بلا قوالب ولا حملات.
+    /// The default for a Firebase app: identity from `users/{uid}.role`,
+    /// a Firestore data source, and no templates or campaigns.
     pub fn default_firebase() -> Self {
         AppConfig {
             identity: Identity {
@@ -115,7 +115,7 @@ impl AppConfig {
         }
     }
 
-    /// يبني مستند التصدير (الصيغة نفسها المستوردة) من الإعداد والقوالب.
+    /// Builds the export document (the same format that is imported) from the
     pub fn to_document(&self, templates: &BTreeMap<String, Template>) -> ConfigDocument {
         ConfigDocument {
             version: 1,
@@ -130,7 +130,7 @@ impl AppConfig {
     }
 }
 
-// ---------- الهوية ----------
+// ---------- identity ----------
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -164,7 +164,7 @@ pub enum IdentityProvider {
     },
 }
 
-/// خوارزميات JWT المدعومة فقط. `none` غير موجود أصلاً ⇒ يفشل التحليل.
+/// Supported JWT algorithms only. `none` does not exist here, so it fails to parse.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum JwtAlgorithm {
@@ -204,7 +204,7 @@ pub struct RoleMembers {
     pub max: u32,
 }
 
-// ---------- مصدر البيانات ----------
+// ---------- data source ----------
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -219,7 +219,7 @@ pub enum DataSource {
     None,
 }
 
-// ---------- أقسام بسيطة ----------
+// ---------- simple sections ----------
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -270,7 +270,7 @@ pub enum AppCheckMode {
     Enforce,
 }
 
-// ---------- القوالب ----------
+// ---------- templates ----------
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -356,7 +356,7 @@ pub enum Target {
 }
 
 impl Target {
-    /// اسم الحقل الوحيد داخل `to` (وهي مبنية كـenum فلا تحتمل حقلين).
+    /// The single field name inside `to` (it is an enum, so two fields cannot coexist).
     pub fn kind(&self) -> &'static str {
         match self {
             Target::Uid(_) => "uid",
@@ -386,7 +386,7 @@ pub struct Rate {
     pub per_uid_per_hour: u32,
 }
 
-// ---------- الحملات ----------
+// ---------- campaigns ----------
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -576,7 +576,7 @@ pub enum ReviewMode {
     FirstN,
 }
 
-// ---------- مستند التصدير/الاستيراد ----------
+// ---------- export/import document ----------
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -597,7 +597,7 @@ pub struct ConfigDocument {
 }
 
 impl ConfigDocument {
-    /// يحوّل المستند إلى إعداد + قوالب.
+    /// Splits the document into a configuration and its templates.
     pub fn into_parts(self) -> (AppConfig, BTreeMap<String, Template>) {
         let config = AppConfig {
             identity: self.identity,

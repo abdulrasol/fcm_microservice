@@ -1,11 +1,11 @@
-//! أوامر سطر الأوامر (T1): `import` و`export`.
+//! Command line commands (T1): `import` and `export`.
 //!
-//! بلا مكتبة جديدة: `std::env::args` فقط. يعملان على `DATABASE_URL` كالمعتاد،
-//! ولا يحتاجان `credentials/` ولا `CORS_ALLOWED_ORIGINS`.
+//! No new crate: only `std::env::args`. They work on `DATABASE_URL` as usual
+//! and need neither `credentials/` nor `CORS_ALLOWED_ORIGINS`.
 
 use crate::config::store::{ConfigError, ConfigStore};
 use crate::db;
-/// رسالة الاستخدام.
+/// The usage message.
 pub fn usage() -> String {
     [
         "Usage:",
@@ -15,9 +15,9 @@ pub fn usage() -> String {
     .join("\n")
 }
 
-/// ينفّذ أمر سطر الأوامر ويعيد رمز الخروج.
+/// Runs a command line command and returns the exit code.
 ///
-/// يُستدعى فقط عندما هناك وسيط واحد على الأقل؛ الوسيط غير المعروف ⇒ كود 2.
+/// Only called when at least one argument exists; an unknown one => code 2.
 pub async fn run(args: &[String]) -> i32 {
     let command = args.get(1).map(String::as_str).unwrap_or_default();
 

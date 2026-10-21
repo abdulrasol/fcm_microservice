@@ -1,23 +1,23 @@
-//! محلّل لغة القوالب (الخطة 3.6).
+//! Template language parser (plan 3.6).
 //!
-//! الصيغ المدعومة: `{p.NAME}` و`{sender.uid|name|role}` و`{doc.PATH}` و
-//! `{entity.PATH}` و`{VARNAME}`، وفلتر اختياري `|int` بعد المرجع.
+//! Supported forms: `{p.NAME}`, `{sender.uid|name|role}`, `{doc.PATH}`,
+//! `{entity.PATH}` and `{VARNAME}`, with an optional `|int` filter after the reference.
 //!
-//! لا أحرف هروب: `{` بلا إغلاق صحيح أو `}` يتيمة أو محتوى غير مطابق ⇒ خطأ
-//! مع تحديد الموضع (fail-closed).
+//! No escape characters: an unclosed `{`, a stray `}` or malformed content is
+//! an error that points at the position (fail-closed).
 
-/// المرجع داخل `{}`.
+/// The reference inside `{}`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ref {
-    /// `{p.name}` — معامل من العميل.
+    /// `{p.name}` -- a parameter supplied by the client.
     Param(String),
-    /// `{sender.uid}` — من التوكن.
+    /// `{sender.uid}` -- from the token.
     Sender(SenderField),
-    /// `{doc.path}` — من وثيقة `context.doc`.
+    /// `{doc.path}` -- from the `context.doc` document.
     Doc(String),
-    /// `{entity.path}` — من وثيقة الشركة (الحملات).
+    /// `{entity.path}` -- from the company document (campaigns).
     Entity(String),
-    /// `{name}` — من خريطة `vars`.
+    /// `{name}` -- from the `vars` map.
     Var(String),
 }
 
@@ -31,16 +31,16 @@ pub enum SenderField {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placeholder {
     pub r: Ref,
-    /// هل كُتب الفلتر `|int` بعد المرجع؟
+    /// Was the `|int` filter written after the reference?
     pub int_filter: bool,
 }
 
 const MAX_NAME_LEN: usize = 30;
 const MAX_PATH_SEGMENTS: usize = 5;
 
-/// يستخرج كل الـ placeholders من نص.
+/// Extracts every placeholder from a text.
 ///
-/// يعيد `Err` مع رسالة تحدد الموضع عند أي خطأ صياغة.
+/// Returns `Err` with a message that pinpoints the position on any syntax error.
 pub fn extract(s: &str) -> Result<Vec<Placeholder>, String> {
     let bytes = s.as_bytes();
     let mut out = Vec::new();
@@ -74,14 +74,14 @@ pub fn extract(s: &str) -> Result<Vec<Placeholder>, String> {
     Ok(out)
 }
 
-/// هل النص خام بلا أي placeholder؟
+/// Is the text literal, without any placeholder?
 ///
-/// النص الذي فيه خطأ صياغة ليس «خاماً» ⇒ `false` (fail-closed).
+/// Text with a syntax error is not "literal", so this returns `false` (fail-closed).
 pub fn is_literal(s: &str) -> bool {
     matches!(extract(s), Ok(placeholders) if placeholders.is_empty())
 }
 
-/// يجد موضع `}` المقابِل (بدون دعم الأقواس المتداخلة).
+/// Finds the matching `}` (nested braces are not supported).
 fn find_close(bytes: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = open;
@@ -102,7 +102,7 @@ fn find_close(bytes: &[u8], open: usize) -> Option<usize> {
 }
 
 fn parse_placeholder(inner: &str, position: usize) -> Result<Placeholder, String> {
-    // الفلتر:آخر `|` هو الفاصل (المرجع نفسه لا يحتوي `|`).
+    // Filter: the last `|` is the separator (a reference never contains `|`).
     let (reference, int_filter) = match inner.rfind('|') {
         Some(pos) => {
             let filter = &inner[pos + 1..];
@@ -171,7 +171,7 @@ fn parse_placeholder(inner: &str, position: usize) -> Result<Placeholder, String
     Ok(Placeholder { r, int_filter })
 }
 
-/// اسم معامل أو متغير: `[a-z][a-z0-9_]{0,29}`.
+/// A parameter or variable name: `[a-z][a-z0-9_]{0,29}`.
 pub fn is_name(value: &str) -> bool {
     let mut chars = value.chars();
     match chars.next() {
@@ -186,7 +186,7 @@ pub fn is_name(value: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// مسار نقطي: حتى 5 مقاطع، كل مقطع `[A-Za-z_][A-Za-z0-9_]*`.
+/// A dotted path: at most 5 segments of `[A-Za-z_][A-Za-z0-9_]*`.
 pub fn is_path(value: &str) -> bool {
     if value.is_empty() {
         return false;
@@ -214,8 +214,8 @@ mod tests {
     #[test]
     fn placeholder_parses_all_forms() {
         let found = extract(
-            "طلب {p.order_id} من {sender.uid} باسم {sender.name} دور {sender.role} \
-             رقم {doc.order_number} sum {doc.total|int} shop {entity.name} حالة {status_text}",
+            "order {p.order_id} from {sender.uid} named {sender.name} role {sender.role} \
+             number {doc.order_number} sum {doc.total|int} shop {entity.name} state {status_text}",
         )
         .expect("all forms must parse");
 
@@ -233,10 +233,10 @@ mod tests {
 
     #[test]
     fn placeholder_rejects_stray_braces() {
-        let unclosed = extract("نص {p.name").expect_err("unclosed brace must fail");
+        let unclosed = extract("text {p.name").expect_err("unclosed brace must fail");
         assert!(unclosed.contains("unclosed"), "message: {}", unclosed);
 
-        let stray = extract("نص } آخر").expect_err("stray brace must fail");
+        let stray = extract("text } more").expect_err("stray brace must fail");
         assert!(stray.contains("stray"), "message: {}", stray);
 
         let nested = extract("{p.{name}}").expect_err("nested brace must fail");
@@ -278,8 +278,8 @@ mod tests {
 
     #[test]
     fn placeholder_is_literal() {
-        assert!(is_literal("نص بلا placeholders"));
-        assert!(!is_literal("نص {p.name}"));
-        assert!(!is_literal("نص {مكسور"), "malformed text is not literal");
+        assert!(is_literal("text without placeholders"));
+        assert!(!is_literal("text {p.name}"));
+        assert!(!is_literal("text {broken"), "malformed text is not literal");
     }
 }

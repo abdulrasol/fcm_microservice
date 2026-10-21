@@ -47,7 +47,7 @@ struct AppState {
     trust_proxy: bool,
     topics_limiter: RateLimiter,
     auth_fail_limiter: RateLimiter,
-    /// T1: مخزن الإعدادات. يُستخدم من T7/T8.
+    /// T1: the configuration store. Used from T7/T8.
     #[allow(dead_code)]
     config: Arc<ConfigStore>,
 }
