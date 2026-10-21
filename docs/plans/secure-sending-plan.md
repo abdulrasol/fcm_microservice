@@ -538,7 +538,8 @@ CREATE TABLE IF NOT EXISTS tool_sessions (
 );
 CREATE TABLE IF NOT EXISTS app_keys (
   id INTEGER PRIMARY KEY AUTOINCREMENT, app TEXT NOT NULL, name TEXT NOT NULL,
-  key_hash TEXT UNIQUE NOT NULL, created_by TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  key_hash TEXT UNIQUE NOT NULL, hint TEXT NOT NULL,        -- آخر 4 أحرف من المفتاح للعرض فقط
+  created_by TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   last_used_at DATETIME, revoked_at DATETIME
 );
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -700,7 +701,7 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
   حذف قالب مستخدم حديثاً ⇐ 409. كل تعديل يظهر في `audit_log`.
 
 ### T11 — مفاتيح التطبيقات
-- **الحالة:** ⬜
+- **الحالة:** 🔄
 - **الملفات:** `src/auth.rs`، `src/admin/keys.rs`.
 - **الخطوات:** كما في 3.10. `SERVICE_API_KEY` من env يبقى للتوافق مع تحذير في السجل.
 - **طريقة الفحص:** المفتاح يُعرض مرة. استخدامه لتطبيق آخر ⇐ 403. بعد الإلغاء ⇐ 401. `last_used_at` يتحدث.
@@ -888,3 +889,5 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
 | 2026-10-22 | T10-B — حملات الداشبورد والسجل والإرسال الحر | 🔄 بانتظار المراجعة | `src/admin/campaigns.rs`: قائمة الحملات (`status` مجهول ⇒ 400، `limit` ≤ 100) وموافقة/رفض بحركة ذرية `UPDATE ... WHERE status = 'pending_review'` تكتب `reviewer` و`decided_at` و`review_note` مع الحالة، والحظر في معاملة واحدة (upsert + إلغاء المعلقة). `src/admin/history.rs`: السجل (بمُرشِّح `kind` و`status`، `payload` في التفاصيل فقط) والإرسال الحر (هدف واحد من topic/condition/uid، لا توكن خام، حد 30/دقيقة) وإحصاءات الأجهزة (أعداد فقط). `db.rs`: `fail_stale_sending` واستدعاؤه عند الإقلاع بعد فتح المخزن وقبل الاستماع. `ConfigStore::app_names` واتحادها مع `project_map` في `GET /apps`. 497 اختباراً ناجحاً (47 جديداً)، clippy 0، 5 تجارب سلبية مستعادة بـ`sha256`. التقرير: `docs/plans/reports/T10B-report.md` |
 | 2026-10-22 | T10-B — قرار المراجع | ✅ | (1) تسجيل مسار القسم على المسار الثابت `put_campaigns_section` مقبول: تُوثَّق في خطة T12 أن الواجهة تستعمل `PUT /apps/{app}/campaigns` للقسم و`GET /apps/{app}/campaigns` للقائمة؛ (2) اختبار الحظر عبر `is_entity_blocked` بدل مسار T9 كامل مقبول (الراوتر داخل `main()`) — متابعة T13: استخراج `build_router(state)` ليُختبر end-to-end؛ (3) حد الإرسال الحر على `topics_limiter` مقبول مؤقتاً (متابعة T13 مع حد test-send)؛ (4) `condition` يبقى ظاهراً في قائمة الحملات للأدمن؛ (5) `review_note` على الموافقة اختياري ومقبول |
 | 2026-10-22 | T10-C — حسابات الأداة وفحوص الاتصال | 🔄 بانتظار المراجعة | `src/admin/users.rs`: `GET/POST /users` و`PUT/DELETE /users/{id}` و`POST /users/{id}/reset-password` (owner فقط؛ **مدير فقط** يُنشأ، والمالك بالـCLI؛ كلمة مرور مؤقتة مرة واحدة مع `Cache-Control: no-store`، ولا تُخزَّن ولا تُدقَّق) + `PUT /auth/test-uid` (على النفس فقط) + `src/admin/diagnostics.rs`: `POST /apps/{app}/identity/test` (أسماء الـclaims فقط، لا قيمها، ولا يُعاد التوكن) و`POST /apps/{app}/data_source/test` (أسماء الحقول وأنواعها، أو عدد الأعضاء) + إصلاح سباق الحظر: `claim_for_sending` فيه `NOT EXISTS` للحظر ذرّياً. 538 اختباراً ناجحاً (41 جديداً)، clippy 0، 5 تجارب سلبية مستعادة بـ`sha256`. التقرير: `docs/plans/reports/T10C-report.md` |
+| 2026-10-22 | T10-C — قرار المراجع | ✅ | (1) `cli.rs` دون تغيير مقبول؛ (2) إعادة استعمال المحدد 20/دقيقة بمفاتيح مميزة مقبول مؤقتاً (متابعة T13 مع بقية المحددات)؛ (3) 400 قبل فحص الدور عند جسم مشوّه مقبول لأن `AuthedUser` يسبق الجسم في الاستخراج، فغير المصادَق عليه يرى 401 دائماً (أُضيف اختبار `malformed_body_unauthenticated_is_401`)؛ (4) إعادة كتابة commit محلي بـrebase غير مدفوع مقبول لمرة واحدة، ولا تكرر |
+| 2026-10-22 | T11 — مفاتيح التطبيقات | 🔄 بانتظار المراجعة | `src/appkeys.rs`: `AppKeyStore` (مفتاح `fcm_<app>_<43>` base64url، sha256 فقط + `hint` من آخر 4 أحرف، حد 20 مفتاحاً حيّاً لكل تطبيق، إلغاء فوري بلا مخبأ، `last_used_at` بخنق دقيقة) + جدول `app_keys` في `migrate`؛ `src/auth.rs`: `trusted_sender` الواحد (مفتاح الخدمة، ثم مفتاح التطبيق: `Valid`/`WrongApp` 403/`Invalid` 401) ومقبول في المسارات التي تحمل `app`: `/send` و`/send/template` و`/campaigns` و`/topics/subscribe|unsubscribe` ولا يُقبل في `/admin/*` ولا `/devices/*` ولا في المسارات بلا `app`؛ `src/admin/keys.rs`: `GET/POST /apps/{app}/keys` و`DELETE /apps/{app}/keys/{id}` (owner فقط، المفتاح يظهر مرة واحدة مع `no-store`)؛ وإصلاح T11-0: `expect` أُزيل من `src/admin/diagnostics.rs`. 578 اختباراً ناجحاً (39 جديداً)، clippy 0، 4 تجارب سلبية مستعادة بـ`sha256`. التقرير: `docs/plans/reports/T11-report.md` |
