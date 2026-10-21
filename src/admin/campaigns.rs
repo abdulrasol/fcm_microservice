@@ -188,6 +188,14 @@ pub async fn approve(
         .await
         .map_err(|error| AdminError::from_db("claim the campaign", error))?;
     if !claimed {
+        // A block may have landed between the check above and the claim, so
+        // the block is read again before the generic conflict.
+        if db::is_entity_blocked(&state.db, &app, &campaign.entity_id)
+            .await
+            .map_err(|error| AdminError::from_db("read the blocks", error))?
+        {
+            return Err(CampaignAdminError::Conflict("entity_blocked"));
+        }
         return Err(CampaignAdminError::Conflict("not_pending"));
     }
 
@@ -607,6 +615,38 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not_found");
         assert_eq!(harness.fcm.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn approve_when_block_lands_before_claim_is_409_entity_blocked() {
+        let harness = setup("owner", &[]).await;
+        let id = insert_campaign(&harness.pool, APP, "e1", "pending_review").await;
+
+        // The block lands between the route's check and the claim: the claim
+        // itself must refuse a blocked entity.
+        sqlx::query("INSERT INTO campaign_blocks (app, entity_id, blocked_by) VALUES (?, ?, ?)")
+            .bind(APP)
+            .bind("e1")
+            .bind("owner@example.com")
+            .execute(&harness.pool)
+            .await
+            .expect("the block must be inserted");
+        let claimed = db::claim_for_sending(&harness.pool, id, "user@example.com", None)
+            .await
+            .expect("the claim must run");
+        assert!(!claimed, "a blocked entity must not be claimed");
+
+        let (status, body) = approve(&harness, id).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "entity_blocked");
+        assert_eq!(harness.fcm.calls(), 0);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM campaigns WHERE id = ?")
+            .bind(id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the row must exist");
+        assert_eq!(status, "pending_review");
     }
 
     #[tokio::test]

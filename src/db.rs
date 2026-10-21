@@ -913,10 +913,15 @@ pub async fn claim_for_sending(
     reviewer: &str,
     note: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
+    // The block check is part of the same statement: a block that lands
+    // between the route's check and this claim must not let the campaign be
+    // sent.
     let result = sqlx::query(
         "UPDATE campaigns SET status = 'sending', reviewer = ?, decided_at = CURRENT_TIMESTAMP, \
          review_note = COALESCE(?, review_note) \
-         WHERE id = ? AND status = 'pending_review'",
+         WHERE id = ? AND status = 'pending_review' \
+         AND NOT EXISTS (SELECT 1 FROM campaign_blocks b \
+                         WHERE b.app = campaigns.app AND b.entity_id = campaigns.entity_id)",
     )
     .bind(reviewer)
     .bind(note)
@@ -1771,6 +1776,33 @@ mod tests {
         assert_eq!(row.0, "sending");
         assert_eq!(row.1.as_deref(), Some("owner@example.com"));
         assert!(row.2.is_some(), "the decision time must be written");
+    }
+
+    #[tokio::test]
+    async fn claim_for_sending_refuses_blocked_entity() {
+        let pool = memory_pool().await;
+        let pending = raw_campaign(&pool, "e1", "pending_review", 10).await;
+        sqlx::query("INSERT INTO campaign_blocks (app, entity_id, blocked_by) VALUES (?, ?, ?)")
+            .bind("app")
+            .bind("e1")
+            .bind("owner@example.com")
+            .execute(&pool)
+            .await
+            .expect("the block must be inserted");
+
+        assert!(
+            !claim_for_sending(&pool, pending, "owner@example.com", None)
+                .await
+                .expect("the claim must run"),
+            "a blocked entity must never be claimed"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM campaigns WHERE id = ?")
+            .bind(pending)
+            .fetch_one(&pool)
+            .await
+            .expect("the row must exist");
+        assert_eq!(status, "pending_review");
     }
 
     #[tokio::test]
