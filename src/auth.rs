@@ -230,6 +230,19 @@ impl AuthService {
             .map(|identity| UserIdentity { uid: identity.uid })
     }
 
+    /// The verified identity of a user-facing route caller (T6 devices).
+    ///
+    /// A missing or invalid token is `401`, an unavailable key source is `503`
+    /// and an app with neither configuration nor credentials is `404`. Service
+    /// and legacy keys are not identities, so they never authenticate here.
+    pub async fn authenticate_identity(
+        &self,
+        headers: &HeaderMap,
+        app: &str,
+    ) -> Result<Identity, AuthError> {
+        self.verify_identity(headers, app).await
+    }
+
     /// Admin authentication for `/apps` and app-less admin queries.
     ///
     /// Candidate apps come from the server-side project map. A Firebase app (or

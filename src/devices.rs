@@ -399,16 +399,39 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::session::CookieConfig;
+    use crate::admin::ToolAuth;
+    use crate::auth::{AuthConfig, AuthService};
+    use crate::config::store::ConfigStore;
+    use crate::credentials::{AuthMap, ProjectIdMap};
     use crate::datasource::{DataError, Doc};
-    use serde_json::json;
+    use crate::identity::jwt::EnvSource;
+    use crate::identity::registry::IdentityRegistry;
+    use crate::ratelimit::RateLimiter;
+    use crate::AppState;
     use async_trait::async_trait;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{header, Method, Request, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde_json::{json, Value};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::net::SocketAddr;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
 
     const APP: &str = "test-app";
     const OTHER_APP: &str = "other-app";
+    const JWT_SECRET_ENV: &str = "DEVICES_TEST_JWT_SECRET";
+    const JWT_SECRET: &str = "devices-jwt-secret-devices-jwt-secret-0123456789";
+    const ISSUER: &str = "https://issuer.example.com/";
+    const AUDIENCE: &str = "devices-audience";
 
     async fn memory_pool(connections: u32) -> SqlitePool {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -1063,4 +1086,322 @@ mod tests {
         assert!(tokens.is_empty());
     }
 
+    // ---------- HTTP ----------
+
+    struct FakeEnv;
+
+    impl EnvSource for FakeEnv {
+        fn get(&self, name: &str) -> Option<String> {
+            (name == JWT_SECRET_ENV).then(|| JWT_SECRET.to_string())
+        }
+    }
+
+    fn identity_config() -> Value {
+        json!({
+            "provider": {
+                "type": "jwt",
+                "algorithms": ["HS256"],
+                "hs256_secret_env": JWT_SECRET_ENV,
+                "issuer": ISSUER,
+                "audience": AUDIENCE,
+                "uid_claim": "sub",
+                "max_age_seconds": 3600
+            },
+            "role": { "source": "claim", "claim": "role" },
+            "admin_roles": ["admin"]
+        })
+    }
+
+    fn jwt(uid: &str) -> String {
+        let now = jsonwebtoken::get_current_timestamp();
+        encode(
+            &Header::new(Algorithm::HS256),
+            &json!({
+                "sub": uid,
+                "aud": AUDIENCE,
+                "iss": ISSUER,
+                "exp": now + 3600,
+                "iat": now - 10,
+                "role": "user",
+            }),
+            &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        )
+        .expect("the test token must encode")
+    }
+
+    async fn test_state(service_key: Option<&str>) -> Arc<AppState> {
+        let pool = memory_pool(1).await;
+        let config = Arc::new(
+            ConfigStore::new(pool.clone())
+                .await
+                .expect("the config store must open"),
+        );
+        config
+            .create_app(APP, "tester")
+            .await
+            .expect("the app must be created");
+        config
+            .save_section(APP, "identity", identity_config(), "tester", 1)
+            .await
+            .expect("the identity must be saved");
+
+        let project_map: ProjectIdMap = Arc::new(RwLock::new(HashMap::new()));
+        let auth_map: AuthMap = Arc::new(RwLock::new(HashMap::new()));
+        let client = reqwest::Client::builder()
+            .build()
+            .expect("the test client must build");
+        let env: Arc<dyn EnvSource> = Arc::new(FakeEnv);
+        let identity = Arc::new(IdentityRegistry::new(
+            config.clone(),
+            project_map.clone(),
+            client.clone(),
+            env.clone(),
+        ));
+        let datasource = Arc::new(crate::datasource::registry::DataSourceRegistry::new(
+            config.clone(),
+            project_map.clone(),
+            auth_map.clone(),
+            client.clone(),
+            env,
+        ));
+        let auth = AuthService::new(
+            project_map.clone(),
+            identity.clone(),
+            datasource.clone(),
+            config.clone(),
+            AuthConfig {
+                service_api_key: service_key.map(ToString::to_string),
+                legacy_api_key: None,
+                legacy_enabled: false,
+            },
+        );
+        let tool_auth = Arc::new(ToolAuth {
+            pool: pool.clone(),
+            cookie: CookieConfig::with_hours(true, 12),
+            login_limiter: RateLimiter::new(5, Duration::from_secs(900)),
+            dummy_hash: "unused in device tests".to_string(),
+            allowed_origins: Vec::new(),
+        });
+
+        Arc::new(AppState {
+            devices: Arc::new(DeviceStore::new(pool.clone())),
+            devices_limiter: RateLimiter::new(20, Duration::from_secs(60)),
+            db: pool,
+            auth_map,
+            project_map,
+            client,
+            auth,
+            trust_proxy: false,
+            topics_limiter: RateLimiter::new(30, Duration::from_secs(60)),
+            auth_fail_limiter: RateLimiter::new(10, Duration::from_secs(60)),
+            config,
+            tool_auth,
+            identity,
+            datasource,
+        })
+    }
+
+    fn test_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/devices/register", post(crate::register_device))
+            .route("/devices/unregister", post(crate::unregister_device))
+            .with_state(state)
+    }
+
+    fn request(uri: &str, body: Value, bearer: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = bearer {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let mut request = builder
+            .body(Body::from(body.to_string()))
+            .expect("the request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+        request
+    }
+
+    async fn call(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router must answer");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("the body must be readable")
+            .to_bytes();
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value)
+    }
+
+    fn register_body(token: &str) -> Value {
+        json!({ "app": APP, "token": token, "platform": "android" })
+    }
+
+    #[tokio::test]
+    async fn register_without_token_is_401() {
+        let state = test_state(None).await;
+        let router = test_router(state);
+
+        let (status, _) = call(
+            &router,
+            request("/devices/register", register_body(&token(1)), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn register_with_valid_jwt_identity_succeeds() {
+        let state = test_state(None).await;
+        let router = test_router(state.clone());
+        let token = token(1);
+
+        let (status, body) = call(
+            &router,
+            request(
+                "/devices/register",
+                register_body(&token),
+                Some(&jwt("uid-1")),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["registered"], json!(true));
+        assert_eq!(body["evicted"], json!(0));
+        assert_eq!(
+            state
+                .devices
+                .tokens_for_uid(APP, "uid-1")
+                .await
+                .expect("the tokens"),
+            vec![token]
+        );
+    }
+
+    #[tokio::test]
+    async fn register_unknown_app_is_404() {
+        let state = test_state(None).await;
+        let router = test_router(state);
+
+        let body = json!({ "app": "ghost-app", "token": token(1), "platform": "android" });
+        let (status, _) = call(
+            &router,
+            request("/devices/register", body, Some(&jwt("uid-1"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn register_unknown_field_is_400() {
+        let state = test_state(None).await;
+        let router = test_router(state);
+
+        let mut body = register_body(&token(1));
+        body["extra"] = json!(true);
+        let (status, _) = call(
+            &router,
+            request("/devices/register", body, Some(&jwt("uid-1"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn register_rate_limit_per_uid_is_429() {
+        let state = test_state(None).await;
+        let router = test_router(state);
+        let token = token(1);
+        let jwt = jwt("uid-1");
+
+        for index in 0..20 {
+            let (status, _) = call(
+                &router,
+                request("/devices/register", register_body(&token), Some(&jwt)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "request {index} must pass");
+        }
+
+        let (status, _) = call(
+            &router,
+            request("/devices/register", register_body(&token), Some(&jwt)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn unregister_foreign_token_reports_not_removed() {
+        let state = test_state(None).await;
+        let router = test_router(state.clone());
+        let token = token(1);
+        state
+            .devices
+            .register(APP, "owner-uid", &token, Platform::Android, 5)
+            .await
+            .expect("the owner registration");
+
+        let body = json!({ "app": APP, "token": token });
+        let (status, response) = call(
+            &router,
+            request("/devices/unregister", body, Some(&jwt("other-uid"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["removed"], json!(false));
+        assert_eq!(
+            state
+                .devices
+                .tokens_for_uid(APP, "owner-uid")
+                .await
+                .expect("the tokens"),
+            vec![token]
+        );
+    }
+
+    #[tokio::test]
+    async fn service_key_cannot_register_devices() {
+        let state = test_state(Some("service-secret")).await;
+        let router = test_router(state);
+
+        let (status, _) = call(
+            &router,
+            request(
+                "/devices/register",
+                register_body(&token(1)),
+                Some("service-secret"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn register_response_never_echoes_token() {
+        let state = test_state(None).await;
+        let router = test_router(state);
+        let token = token(7);
+
+        let (status, body) = call(
+            &router,
+            request(
+                "/devices/register",
+                register_body(&token),
+                Some(&jwt("uid-1")),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.to_string().contains(&token));
+    }
 }

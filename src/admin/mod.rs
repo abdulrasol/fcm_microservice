@@ -320,7 +320,7 @@ mod tests {
         });
 
         Arc::new(AppState {
-            db: pool,
+            db: pool.clone(),
             auth_map,
             project_map,
             client,
@@ -328,6 +328,8 @@ mod tests {
             trust_proxy: false,
             topics_limiter: RateLimiter::new(30, Duration::from_secs(60)),
             auth_fail_limiter: RateLimiter::new(10, Duration::from_secs(60)),
+            devices: Arc::new(crate::devices::DeviceStore::new(pool)),
+            devices_limiter: RateLimiter::new(20, Duration::from_secs(60)),
             config,
             tool_auth,
             identity,

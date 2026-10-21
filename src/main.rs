@@ -5,6 +5,7 @@ mod config;
 mod credentials;
 mod datasource;
 mod db;
+mod devices;
 mod identity;
 mod ratelimit;
 mod roles;
@@ -13,7 +14,7 @@ mod validation;
 
 use auth::{AdminIdentity, AuthConfig, AuthError, AuthService};
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{rejection::JsonRejection, ConnectInfo, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -22,6 +23,7 @@ use axum::{
 use config::store::ConfigStore;
 use credentials::{AuthMap, ProjectIdMap};
 use datasource::registry::DataSourceRegistry;
+use devices::{DeviceError, DeviceStore, Platform};
 use identity::jwt::SystemEnv;
 use identity::registry::IdentityRegistry;
 use ratelimit::RateLimiter;
@@ -43,6 +45,8 @@ use tower_http::services::{ServeDir, ServeFile};
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const TOPICS_RATE_LIMIT_PER_MINUTE: usize = 30;
 const AUTH_FAILURE_RATE_LIMIT_PER_MINUTE: usize = 10;
+/// Device registrations allowed per uid per minute (T6).
+const DEVICES_RATE_LIMIT_PER_MINUTE: usize = 20;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
 struct AppState {
@@ -59,6 +63,10 @@ struct AppState {
     config: Arc<ConfigStore>,
     /// T2: dashboard accounts and sessions.
     tool_auth: Arc<admin::ToolAuth>,
+    /// T6: token ↔ uid registry.
+    devices: Arc<DeviceStore>,
+    /// T6: per-uid registration limit.
+    devices_limiter: RateLimiter,
     /// T3: identity providers per app. Used from T6.
     #[allow(dead_code)]
     identity: Arc<IdentityRegistry>,
@@ -204,6 +212,8 @@ async fn main() {
     };
     admin::spawn_session_cleanup(tool_auth.clone());
 
+    let device_store = Arc::new(DeviceStore::new(db_pool.clone()));
+
     let state = Arc::new(AppState {
         db: db_pool,
         auth_map,
@@ -213,6 +223,8 @@ async fn main() {
         trust_proxy,
         topics_limiter: RateLimiter::new(TOPICS_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
         auth_fail_limiter: RateLimiter::new(AUTH_FAILURE_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
+        devices: device_store,
+        devices_limiter: RateLimiter::new(DEVICES_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
         config: config_store,
         tool_auth,
         identity: identity_registry,
@@ -229,6 +241,8 @@ async fn main() {
         .route("/send", post(send_notification))
         .route("/topics/subscribe", post(topics::subscribe))
         .route("/topics/unsubscribe", post(topics::unsubscribe))
+        .route("/devices/register", post(register_device))
+        .route("/devices/unregister", post(unregister_device))
         .nest("/admin", admin::router(state.clone()))
         .fallback(api_fallback)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
@@ -840,4 +854,167 @@ async fn send_notification(
             })),
         ))
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterDeviceRequest {
+    app: String,
+    token: String,
+    platform: Platform,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnregisterDeviceRequest {
+    app: String,
+    token: String,
+}
+
+/// Maps a device error to a response. The message never contains a token.
+fn device_error(error: DeviceError) -> (StatusCode, String) {
+    match error {
+        DeviceError::InvalidToken => (
+            StatusCode::BAD_REQUEST,
+            "the device token is invalid".to_string(),
+        ),
+        DeviceError::InvalidRoleValue => (
+            StatusCode::BAD_REQUEST,
+            "the role value is invalid".to_string(),
+        ),
+        DeviceError::NotConfigured => (
+            StatusCode::BAD_REQUEST,
+            "role members are not configured for this app".to_string(),
+        ),
+        DeviceError::Unavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the data source is unavailable".to_string(),
+        ),
+        DeviceError::Database(error) => {
+            tracing::error!(error = %error, "device storage failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "device storage failed".to_string(),
+            )
+        }
+    }
+}
+
+/// An app is known when it has stored configuration or loaded credentials.
+/// Keeping the historical `404` message for every other app (as `topics.rs`).
+async fn ensure_known_app(state: &AppState, app: &str) -> Result<(), (StatusCode, String)> {
+    if state.config.get(app).is_some() {
+        return Ok(());
+    }
+    let known = {
+        let projects = state.project_map.read().await;
+        projects.contains_key(app)
+    };
+    if known {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("App '{app}' not found in credentials folder."),
+        ))
+    }
+}
+
+/// Verifies a user token (never a service or legacy key) and applies the
+/// per-uid device limit. Returns the uid.
+async fn authorize_device(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    app: &str,
+) -> Result<String, (StatusCode, String)> {
+    let identity = state
+        .auth
+        .authenticate_identity(headers, app)
+        .await
+        .map_err(|error| auth_error_with_limit(state, headers, peer, error))?;
+    if !state
+        .devices_limiter
+        .check(&format!("uid:{app}:{}", identity.uid))
+    {
+        return Err(topics::too_many_requests());
+    }
+    Ok(identity.uid)
+}
+
+async fn register_device(
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<RegisterDeviceRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let Json(payload) =
+        payload.map_err(|_| (StatusCode::BAD_REQUEST, "invalid request body".to_string()))?;
+    let app = payload.app.trim().to_string();
+    if app.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "app field is required".to_string()));
+    }
+
+    ensure_known_app(&state, &app).await?;
+    topics::check_ip_limit(&state, &headers, peer)?;
+    let uid = authorize_device(&state, &headers, peer, &app).await?;
+    devices::validate_token(&payload.token).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "the device token is invalid".to_string(),
+        )
+    })?;
+
+    let max_per_uid = state
+        .config
+        .get(&app)
+        .map(|snapshot| snapshot.config.devices.max_per_uid)
+        .unwrap_or_else(|| config::Devices::default().max_per_uid);
+    let evicted = state
+        .devices
+        .register(&app, &uid, &payload.token, payload.platform, max_per_uid)
+        .await
+        .map_err(device_error)?;
+
+    // A count and a debug line only: the token is never logged.
+    tracing::debug!(event = "devices.register", app = %app, evicted, "device registered");
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "registered": true, "evicted": evicted })),
+    ))
+}
+
+async fn unregister_device(
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<UnregisterDeviceRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let Json(payload) =
+        payload.map_err(|_| (StatusCode::BAD_REQUEST, "invalid request body".to_string()))?;
+    let app = payload.app.trim().to_string();
+    if app.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "app field is required".to_string()));
+    }
+
+    ensure_known_app(&state, &app).await?;
+    topics::check_ip_limit(&state, &headers, peer)?;
+    let uid = authorize_device(&state, &headers, peer, &app).await?;
+    devices::validate_token(&payload.token).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "the device token is invalid".to_string(),
+        )
+    })?;
+
+    // `false` covers both "unknown token" and "owned by someone else", so the
+    // route is not an ownership oracle.
+    let removed = state
+        .devices
+        .unregister(&app, &uid, &payload.token)
+        .await
+        .map_err(device_error)?;
+
+    Ok((StatusCode::OK, Json(json!({ "removed": removed }))))
 }
