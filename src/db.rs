@@ -1,11 +1,13 @@
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
+use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::config::{Quota, Review, ReviewMode};
 
 pub async fn init_db() -> Result<SqlitePool, sqlx::Error> {
     let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data.db".to_string());
@@ -222,6 +224,46 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+
+    // T9: company campaigns, exactly as plan 3.14. The raw condition is kept so
+    // an approved campaign can be dispatched later; it is never returned by the
+    // list endpoint.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            app TEXT NOT NULL, entity_id TEXT NOT NULL, sender_uid TEXT NOT NULL,
+            title TEXT NOT NULL, body TEXT NOT NULL, image TEXT,
+            data TEXT NOT NULL, audience TEXT NOT NULL, condition TEXT NOT NULL,
+            status TEXT NOT NULL, review_note TEXT, reviewer TEXT, fcm_response TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP, decided_at DATETIME, sent_at DATETIME
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS campaign_blocks (
+            app TEXT NOT NULL, entity_id TEXT NOT NULL, reason TEXT,
+            blocked_by TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (app, entity_id)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_campaigns_entity ON campaigns(app, entity_id, created_at)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(app, status)")
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
@@ -476,6 +518,310 @@ impl TemplateRateLimiter {
     }
 }
 
+// ---------- T9: campaigns ----------
+
+/// One day and one week in UNIX seconds (the quota windows).
+const DAY_SECONDS: i64 = 86_400;
+const WEEK_SECONDS: i64 = 604_800;
+/// `fcm_response` is a short diagnostic, never a token and never a payload.
+const MAX_FCM_RESPONSE_CHARS: usize = 2000;
+
+/// Serializes the quota check and the insert. The plan requires one write lock
+/// around one transaction, so two concurrent creates cannot both pass the check.
+static CAMPAIGN_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A campaign row about to be inserted.
+///
+/// The review policy rides with the row because the step's signature passes the
+/// quota separately; `sender_is_service` is the trusted sender's bypass.
+pub struct NewCampaign {
+    pub app: String,
+    pub entity_id: String,
+    pub sender_uid: String,
+    pub title: String,
+    pub body: String,
+    pub image: Option<String>,
+    pub data: String,
+    pub audience: String,
+    pub condition: String,
+    pub review: Review,
+    pub sender_is_service: bool,
+}
+
+/// The id and status of an inserted campaign.
+#[derive(Debug)]
+pub struct Inserted {
+    pub id: i64,
+    pub status: String,
+}
+
+/// Why an insert was refused.
+#[derive(Debug)]
+pub enum InsertError {
+    QuotaExceeded { retry_after_seconds: i64 },
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for InsertError {
+    fn from(error: sqlx::Error) -> Self {
+        InsertError::Database(error)
+    }
+}
+
+/// A stored campaign, including the fields the list endpoint must not expose.
+pub struct Campaign {
+    pub id: i64,
+    pub app: String,
+    pub entity_id: String,
+    pub sender_uid: String,
+    pub title: String,
+    pub body: String,
+    pub image: Option<String>,
+    pub data: String,
+    pub audience: String,
+    pub condition: String,
+    pub status: String,
+    pub review_note: Option<String>,
+    pub fcm_response: Option<String>,
+    pub created_at: String,
+    pub sent_at: Option<String>,
+}
+
+fn campaign_from_row(row: SqliteRow) -> Campaign {
+    Campaign {
+        id: row.get("id"),
+        app: row.get("app"),
+        entity_id: row.get("entity_id"),
+        sender_uid: row.get("sender_uid"),
+        title: row.get("title"),
+        body: row.get("body"),
+        image: row.get("image"),
+        data: row.get("data"),
+        audience: row.get("audience"),
+        condition: row.get("condition"),
+        status: row.get("status"),
+        review_note: row.get("review_note"),
+        fcm_response: row.get("fcm_response"),
+        created_at: row.get("created_at"),
+        sent_at: row.get("sent_at"),
+    }
+}
+
+/// Inserts a campaign after checking the entity quota inside one transaction.
+///
+/// Counted statuses are `pending_review`, `sending` and `sent`; rejected,
+/// cancelled and failed campaigns never consume quota.
+pub async fn insert_campaign_checked(
+    pool: &SqlitePool,
+    new: &NewCampaign,
+    limits: &Quota,
+    now: i64,
+) -> Result<Inserted, InsertError> {
+    let _guard = CAMPAIGN_WRITE_LOCK.lock().await;
+    let mut tx = pool.begin().await?;
+
+    let timestamps: Vec<i64> = sqlx::query_scalar(
+        "SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM campaigns \
+         WHERE app = ? AND entity_id = ? AND status IN ('pending_review','sending','sent')",
+    )
+    .bind(&new.app)
+    .bind(&new.entity_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let day_start = now.saturating_sub(DAY_SECONDS);
+    let week_start = now.saturating_sub(WEEK_SECONDS);
+    let in_day = timestamps.iter().filter(|at| **at >= day_start).count();
+    let in_week = timestamps.iter().filter(|at| **at >= week_start).count();
+
+    if in_day as u64 >= u64::from(limits.per_entity_per_day) {
+        let oldest = timestamps
+            .iter()
+            .filter(|at| **at >= day_start)
+            .min()
+            .copied()
+            .unwrap_or(now);
+        let retry_after_seconds = (oldest + DAY_SECONDS - now).max(1);
+        return Err(InsertError::QuotaExceeded {
+            retry_after_seconds,
+        });
+    }
+    if in_week as u64 >= u64::from(limits.per_entity_per_week) {
+        let oldest = timestamps
+            .iter()
+            .filter(|at| **at >= week_start)
+            .min()
+            .copied()
+            .unwrap_or(now);
+        let retry_after_seconds = (oldest + WEEK_SECONDS - now).max(1);
+        return Err(InsertError::QuotaExceeded {
+            retry_after_seconds,
+        });
+    }
+
+    let reviewed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM campaigns \
+         WHERE app = ? AND entity_id = ? AND status IN ('sent','sending')",
+    )
+    .bind(&new.app)
+    .bind(&new.entity_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let needs_review = if new.sender_is_service {
+        false
+    } else {
+        match new.review.mode {
+            ReviewMode::None => false,
+            ReviewMode::Always => true,
+            ReviewMode::FirstN => reviewed < i64::from(new.review.n.unwrap_or(0)),
+        }
+    };
+    let status = if needs_review {
+        "pending_review"
+    } else {
+        "sending"
+    };
+
+    let result = sqlx::query(
+        "INSERT INTO campaigns \
+         (app, entity_id, sender_uid, title, body, image, data, audience, condition, status) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&new.app)
+    .bind(&new.entity_id)
+    .bind(&new.sender_uid)
+    .bind(&new.title)
+    .bind(&new.body)
+    .bind(&new.image)
+    .bind(&new.data)
+    .bind(&new.audience)
+    .bind(&new.condition)
+    .bind(status)
+    .execute(&mut *tx)
+    .await?;
+
+    let id = result.last_insert_rowid();
+    tx.commit().await?;
+    Ok(Inserted {
+        id,
+        status: status.to_string(),
+    })
+}
+
+/// Loads one campaign by id.
+pub async fn get_campaign(pool: &SqlitePool, id: i64) -> Result<Option<Campaign>, sqlx::Error> {
+    let row = sqlx::query("SELECT * FROM campaigns WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(campaign_from_row))
+}
+
+/// Lists an app's campaigns, optionally restricted to one entity.
+///
+/// `limit` is capped at 100; `offset` is passed through.
+pub async fn list_campaigns(
+    pool: &SqlitePool,
+    app: &str,
+    entity_id: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Campaign>, sqlx::Error> {
+    let limit = i64::from(limit.min(100));
+    let offset = i64::from(offset);
+    let rows = match entity_id {
+        Some(entity_id) => {
+            sqlx::query(
+                "SELECT * FROM campaigns WHERE app = ? AND entity_id = ? \
+                 ORDER BY id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(app)
+            .bind(entity_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query("SELECT * FROM campaigns WHERE app = ? ORDER BY id DESC LIMIT ? OFFSET ?")
+                .bind(app)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?
+        }
+    };
+    Ok(rows.into_iter().map(campaign_from_row).collect())
+}
+
+/// Moves a campaign from `pending_review` to `sending` exactly once.
+pub async fn claim_for_sending(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE campaigns SET status = 'sending' WHERE id = ? AND status = 'pending_review'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Cancels a pending campaign of the given app and entity.
+pub async fn cancel_pending(
+    pool: &SqlitePool,
+    id: i64,
+    app: &str,
+    entity_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE campaigns SET status = 'cancelled' \
+         WHERE id = ? AND app = ? AND entity_id = ? AND status = 'pending_review'",
+    )
+    .bind(id)
+    .bind(app)
+    .bind(entity_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Records the delivery outcome. `fcm_response` is truncated and never contains
+/// a token; `sent_at` is set only for a successful send.
+pub async fn finish_campaign(
+    pool: &SqlitePool,
+    id: i64,
+    status: &str,
+    fcm_response: &str,
+) -> Result<(), sqlx::Error> {
+    let response: String = fcm_response.chars().take(MAX_FCM_RESPONSE_CHARS).collect();
+    sqlx::query(
+        "UPDATE campaigns SET status = ?1, fcm_response = ?2, \
+         sent_at = CASE WHEN ?1 = 'sent' THEN CURRENT_TIMESTAMP ELSE sent_at END \
+         WHERE id = ?3",
+    )
+    .bind(status)
+    .bind(&response)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Is this entity blocked from creating campaigns?
+pub async fn is_entity_blocked(
+    pool: &SqlitePool,
+    app: &str,
+    entity_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM campaign_blocks WHERE app = ? AND entity_id = ?")
+            .bind(app)
+            .bind(entity_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(count > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,5 +1030,359 @@ mod tests {
         assert_eq!(limiter.len(), MAX_TEMPLATE_RATE_KEYS);
         assert!(limiter.allow_at(("app", "order_new", "uid-extra"), 5, start));
         assert!(limiter.len() <= MAX_TEMPLATE_RATE_KEYS);
+    }
+
+    // ---------- T9: campaigns ----------
+
+    fn quota(day: u32, week: u32) -> Quota {
+        Quota {
+            per_entity_per_day: day,
+            per_entity_per_week: week,
+        }
+    }
+
+    fn review(mode: ReviewMode, n: Option<u32>) -> Review {
+        Review { mode, n }
+    }
+
+    fn new_campaign(entity: &str, review: Review, sender_is_service: bool) -> NewCampaign {
+        NewCampaign {
+            app: "app".to_string(),
+            entity_id: entity.to_string(),
+            sender_uid: "u1".to_string(),
+            title: "Title".to_string(),
+            body: "Body".to_string(),
+            image: None,
+            data: "{}".to_string(),
+            audience: r#"{"groups":[["users"]]}"#.to_string(),
+            condition: "'promos' in topics".to_string(),
+            review,
+            sender_is_service,
+        }
+    }
+
+    async fn raw_campaign(pool: &SqlitePool, entity: &str, status: &str, age: i64) -> i64 {
+        sqlx::query(
+            "INSERT INTO campaigns \
+             (app, entity_id, sender_uid, title, body, data, audience, condition, status, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime(?, 'unixepoch'))",
+        )
+        .bind("app")
+        .bind(entity)
+        .bind("u1")
+        .bind("Title")
+        .bind("Body")
+        .bind("{}")
+        .bind(r#"{"groups":[["users"]]}"#)
+        .bind("'promos' in topics")
+        .bind(status)
+        .bind(crate::unix_seconds() - age)
+        .execute(pool)
+        .await
+        .expect("the raw campaign must insert")
+        .last_insert_rowid()
+    }
+
+    fn quota_retry(error: InsertError) -> i64 {
+        match error {
+            InsertError::QuotaExceeded {
+                retry_after_seconds,
+            } => retry_after_seconds,
+            other => panic!("expected a quota error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn campaign_tables_migration_idempotent() {
+        let pool = memory_pool().await;
+        migrate(&pool).await.expect("the second migration must run");
+
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .fetch_all(&pool)
+                .await
+                .expect("the tables must be readable");
+        assert!(tables.iter().any(|name| name == "campaigns"));
+        assert!(tables.iter().any(|name| name == "campaign_blocks"));
+
+        let indexes: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index'")
+                .fetch_all(&pool)
+                .await
+                .expect("the indexes must be readable");
+        assert!(indexes.iter().any(|name| name == "idx_campaigns_entity"));
+        assert!(indexes.iter().any(|name| name == "idx_campaigns_status"));
+    }
+
+    #[tokio::test]
+    async fn quota_day_and_week_enforced() {
+        let pool = memory_pool().await;
+
+        raw_campaign(&pool, "e1", "sent", 3_600).await;
+        let daily = insert_campaign_checked(
+            &pool,
+            &new_campaign("e1", review(ReviewMode::None, None), false),
+            &quota(1, 5),
+            crate::unix_seconds(),
+        )
+        .await
+        .expect_err("the daily quota must reject");
+        let retry = quota_retry(daily);
+        assert!((82_798..=82_800).contains(&retry), "retry was {retry}");
+
+        raw_campaign(&pool, "e2", "sent", 3 * DAY_SECONDS).await;
+        raw_campaign(&pool, "e2", "sending", 5 * DAY_SECONDS).await;
+        let weekly = insert_campaign_checked(
+            &pool,
+            &new_campaign("e2", review(ReviewMode::None, None), false),
+            &quota(10, 2),
+            crate::unix_seconds(),
+        )
+        .await
+        .expect_err("the weekly quota must reject");
+        let retry = quota_retry(weekly);
+        assert!((172_798..=172_800).contains(&retry), "retry was {retry}");
+    }
+
+    #[tokio::test]
+    async fn quota_ignores_rejected_cancelled_failed() {
+        let pool = memory_pool().await;
+        for status in ["rejected", "cancelled", "failed"] {
+            raw_campaign(&pool, "e1", status, 100).await;
+        }
+
+        let inserted = insert_campaign_checked(
+            &pool,
+            &new_campaign("e1", review(ReviewMode::None, None), false),
+            &quota(1, 5),
+            crate::unix_seconds(),
+        )
+        .await
+        .expect("non-counted statuses must not consume quota");
+        assert_eq!(inserted.status, "sending");
+    }
+
+    #[tokio::test]
+    async fn quota_retry_after_is_positive() {
+        let pool = memory_pool().await;
+
+        // One second before the window closes: at least one second remains.
+        raw_campaign(&pool, "e1", "sent", DAY_SECONDS - 1).await;
+        let edge = insert_campaign_checked(
+            &pool,
+            &new_campaign("e1", review(ReviewMode::None, None), false),
+            &quota(1, 5),
+            crate::unix_seconds(),
+        )
+        .await
+        .expect_err("the daily quota must reject");
+        let retry = quota_retry(edge);
+        assert!((1..=2).contains(&retry), "retry was {retry}");
+
+        raw_campaign(&pool, "e2", "sent", 0).await;
+        let fresh = insert_campaign_checked(
+            &pool,
+            &new_campaign("e2", review(ReviewMode::None, None), false),
+            &quota(1, 5),
+            crate::unix_seconds(),
+        )
+        .await
+        .expect_err("the daily quota must reject");
+        let retry = quota_retry(fresh);
+        assert!((86_398..=86_400).contains(&retry), "retry was {retry}");
+    }
+
+    #[tokio::test]
+    async fn quota_insert_is_race_safe() {
+        let pool = memory_pool().await;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(10));
+        let mut tasks = Vec::new();
+        for index in 0..10 {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let mut new = new_campaign("e1", review(ReviewMode::None, None), false);
+                new.title = format!("Title {index}");
+                insert_campaign_checked(&pool, &new, &quota(3, 10), crate::unix_seconds()).await
+            }));
+        }
+
+        let mut inserted = 0;
+        for task in tasks {
+            let result = task.await.expect("the insert task must not panic");
+            if result.is_ok() {
+                inserted += 1;
+            }
+        }
+        assert_eq!(inserted, 3, "the daily quota must hold under concurrency");
+
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM campaigns")
+            .fetch_one(&pool)
+            .await
+            .expect("the campaigns must be readable");
+        assert_eq!(stored, 3);
+    }
+
+    #[tokio::test]
+    async fn first_n_review_counts_sent_and_sending_only() {
+        let pool = memory_pool().await;
+        let pending = raw_campaign(&pool, "e1", "pending_review", 10).await;
+        raw_campaign(&pool, "e1", "sent", 10).await;
+        raw_campaign(&pool, "e1", "sending", 10).await;
+
+        let limits = quota(50, 50);
+        let first = insert_campaign_checked(
+            &pool,
+            &new_campaign("e1", review(ReviewMode::FirstN, Some(3)), false),
+            &limits,
+            crate::unix_seconds(),
+        )
+        .await
+        .expect("the insert must run");
+        assert_eq!(first.status, "pending_review");
+
+        // A second pending campaign does not increase the reviewed count.
+        let second = insert_campaign_checked(
+            &pool,
+            &new_campaign("e1", review(ReviewMode::FirstN, Some(3)), false),
+            &limits,
+            crate::unix_seconds(),
+        )
+        .await
+        .expect("the insert must run");
+        assert_eq!(second.status, "pending_review");
+
+        sqlx::query("UPDATE campaigns SET status = 'sent' WHERE id = ?")
+            .bind(pending)
+            .execute(&pool)
+            .await
+            .expect("the pending row must update");
+
+        let third = insert_campaign_checked(
+            &pool,
+            &new_campaign("e1", review(ReviewMode::FirstN, Some(3)), false),
+            &limits,
+            crate::unix_seconds(),
+        )
+        .await
+        .expect("the insert must run");
+        assert_eq!(third.status, "sending");
+    }
+
+    #[tokio::test]
+    async fn review_always_and_none() {
+        let pool = memory_pool().await;
+        let limits = quota(50, 50);
+
+        let always = insert_campaign_checked(
+            &pool,
+            &new_campaign("e1", review(ReviewMode::Always, None), false),
+            &limits,
+            crate::unix_seconds(),
+        )
+        .await
+        .expect("the insert must run");
+        assert_eq!(always.status, "pending_review");
+
+        let none = insert_campaign_checked(
+            &pool,
+            &new_campaign("e2", review(ReviewMode::None, None), false),
+            &limits,
+            crate::unix_seconds(),
+        )
+        .await
+        .expect("the insert must run");
+        assert_eq!(none.status, "sending");
+
+        // The trusted service sender skips review.
+        let service = insert_campaign_checked(
+            &pool,
+            &new_campaign("e3", review(ReviewMode::Always, None), true),
+            &limits,
+            crate::unix_seconds(),
+        )
+        .await
+        .expect("the insert must run");
+        assert_eq!(service.status, "sending");
+    }
+
+    #[tokio::test]
+    async fn claim_for_sending_only_from_pending() {
+        let pool = memory_pool().await;
+        let pending = raw_campaign(&pool, "e1", "pending_review", 10).await;
+
+        assert!(claim_for_sending(&pool, pending)
+            .await
+            .expect("the claim must run"));
+        assert!(!claim_for_sending(&pool, pending)
+            .await
+            .expect("the second claim must run"));
+
+        let sent = raw_campaign(&pool, "e1", "sent", 10).await;
+        assert!(!claim_for_sending(&pool, sent)
+            .await
+            .expect("the claim must run"));
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_only_from_pending() {
+        let pool = memory_pool().await;
+        let pending = raw_campaign(&pool, "e1", "pending_review", 10).await;
+
+        assert!(
+            !cancel_pending(&pool, pending, "app", "e2")
+                .await
+                .expect("the cancel must run"),
+            "another entity must not cancel the campaign"
+        );
+        assert!(cancel_pending(&pool, pending, "app", "e1")
+            .await
+            .expect("the cancel must run"));
+        assert!(!cancel_pending(&pool, pending, "app", "e1")
+            .await
+            .expect("the second cancel must run"));
+
+        let sent = raw_campaign(&pool, "e1", "sent", 10).await;
+        assert!(!cancel_pending(&pool, sent, "app", "e1")
+            .await
+            .expect("the cancel must run"));
+    }
+
+    #[tokio::test]
+    async fn list_campaigns_scoped_by_entity_and_limit_capped() {
+        let pool = memory_pool().await;
+        for index in 0..105 {
+            raw_campaign(&pool, "e1", "pending_review", index).await;
+        }
+        raw_campaign(&pool, "e2", "pending_review", 1).await;
+
+        let capped = list_campaigns(&pool, "app", Some("e1"), 500, 0)
+            .await
+            .expect("the list must run");
+        assert_eq!(capped.len(), 100, "the limit must be capped at 100");
+
+        let first_page = list_campaigns(&pool, "app", Some("e1"), 2, 0)
+            .await
+            .expect("the list must run");
+        assert_eq!(first_page.len(), 2);
+        assert!(first_page[0].id > first_page[1].id, "newest first");
+
+        let second_page = list_campaigns(&pool, "app", Some("e1"), 2, 2)
+            .await
+            .expect("the list must run");
+        assert_eq!(second_page.len(), 2);
+        assert!(second_page[0].id < first_page[1].id);
+
+        let other = list_campaigns(&pool, "app", Some("e2"), 100, 0)
+            .await
+            .expect("the list must run");
+        assert_eq!(other.len(), 1);
+        assert!(other.iter().all(|campaign| campaign.entity_id == "e2"));
+
+        let all = list_campaigns(&pool, "app", None, 100, 0)
+            .await
+            .expect("the list must run");
+        assert_eq!(all.len(), 100);
     }
 }
