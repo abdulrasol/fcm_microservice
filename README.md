@@ -1,5 +1,8 @@
 # FCM Microservice & Dashboard
 
+> ⚠️ **لا تنشر فرع `my-server` كما هو قبل إكمال خطة `docs/plans/secure-sending-plan.md`.**
+> `/send` فيه صار للأدمن فقط، فيتوقف إرسال المستخدمين والشركات والفنيين في تطبيق واط (تنبيهات الأدمن وإشعارات الطلبات).
+
 A fully integrated, ultra-lightweight Push Notification Management System built in Rust. It serves as both a high-performance REST API for sending Firebase Cloud Messaging (FCM) notifications to multiple projects and a web-based dashboard.
 
 ## Features
