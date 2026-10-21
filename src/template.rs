@@ -86,10 +86,13 @@ fn bad(message: impl Into<String>) -> RenderError {
 
 // ---------- step 1: parameters ----------
 
-/// Validates the client parameters against `template.params`.
+/// Validates a parameter map against a set of definitions.
 ///
 /// Unknown and missing parameters are errors; nothing is silently dropped.
-pub fn validate_params(template: &Template, raw: &Value) -> Result<ValidatedParams, RenderError> {
+fn validate_param_map_inner(
+    defs: &BTreeMap<String, Param>,
+    raw: &Value,
+) -> Result<BTreeMap<String, String>, RenderError> {
     let empty = serde_json::Map::new();
     let provided = match raw {
         Value::Object(map) => map,
@@ -98,19 +101,33 @@ pub fn validate_params(template: &Template, raw: &Value) -> Result<ValidatedPara
     };
 
     for key in provided.keys() {
-        if !template.params.contains_key(key) {
+        if !defs.contains_key(key) {
             return Err(bad(format!("unknown parameter '{key}'")));
         }
     }
 
     let mut values = BTreeMap::new();
-    for (name, param) in &template.params {
+    for (name, param) in defs {
         let raw_value = provided
             .get(name)
             .ok_or_else(|| bad(format!("missing parameter '{name}'")))?;
         values.insert(name.clone(), validate_param(name, param, raw_value)?);
     }
-    Ok(ValidatedParams(values))
+    Ok(values)
+}
+
+/// Validates the client parameters against `template.params`.
+pub fn validate_params(template: &Template, raw: &Value) -> Result<ValidatedParams, RenderError> {
+    validate_param_map_inner(&template.params, raw).map(ValidatedParams)
+}
+
+/// Validates a free-standing parameter map, such as a campaign action's
+/// parameters (T9), with exactly the rules of [`validate_params`].
+pub fn validate_param_map(
+    defs: &BTreeMap<String, Param>,
+    raw: &Value,
+) -> Result<BTreeMap<String, String>, RenderError> {
+    validate_param_map_inner(defs, raw)
 }
 
 fn validate_param(name: &str, param: &Param, value: &Value) -> Result<String, RenderError> {
@@ -222,6 +239,69 @@ fn build_anchored_regex(pattern: &str, name: &str) -> Result<regex::Regex, Rende
         .map_err(|_| bad(format!("pattern of parameter '{name}' is not usable")))
 }
 
+// ---------- T9: standalone snippets (campaigns) ----------
+
+/// How a standalone snippet is substituted. [`SnippetMode::Path`] applies the
+/// same one-segment rules as `context.doc`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnippetMode {
+    Text,
+    Path,
+}
+
+/// The values available to [`render_snippet`]: already validated parameters, the
+/// sender, and optional documents. There is no template and no `vars` map, so a
+/// value can never reference a variable.
+pub struct Snippet<'a> {
+    pub params: &'a BTreeMap<String, String>,
+    pub sender: &'a Sender,
+    pub doc: Option<&'a Value>,
+    pub entity: Option<&'a Value>,
+}
+
+/// Renders a standalone snippet with the same substitution rules as `render`:
+/// one pass, no re-interpretation, `|int`, and control-character rejection.
+pub fn render_snippet(
+    source: &str,
+    ctx: &Snippet<'_>,
+    mode: SnippetMode,
+) -> Result<String, RenderError> {
+    let mut renderer = Renderer {
+        template: None,
+        params: ctx.params,
+        sender: ctx.sender,
+        doc: ctx.doc,
+        entity: ctx.entity,
+        vars: BTreeMap::new(),
+    };
+    let mode = match mode {
+        SnippetMode::Text => Mode::Text,
+        SnippetMode::Path => Mode::Path,
+    };
+    renderer.render_text(source, mode, false)
+}
+
+/// Applies a `require` map to `doc`, with the same uniform
+/// [`RenderError::Forbidden`] as `context.require`.
+pub fn check_require_map(
+    require: &BTreeMap<String, String>,
+    ctx: &Snippet<'_>,
+    doc: Option<&Value>,
+) -> Result<(), RenderError> {
+    for (field, definition) in require {
+        let expected = render_snippet(definition, ctx, SnippetMode::Text)?;
+        let document = doc.ok_or(RenderError::Forbidden)?;
+        let actual = match lookup(document, field) {
+            Ok(value) => scalar_to_text(value).map_err(|_| RenderError::Forbidden)?,
+            Err(_) => return Err(RenderError::Forbidden),
+        };
+        if actual != expected {
+            return Err(RenderError::Forbidden);
+        }
+    }
+    Ok(())
+}
+
 // ---------- step 2: the context document path ----------
 
 /// Renders the context document path (`None` without a `context` section).
@@ -238,8 +318,8 @@ pub fn context_path(
         None => return Ok(None),
     };
     let mut renderer = Renderer {
-        template,
-        params,
+        template: Some(template),
+        params: &params.0,
         sender,
         doc: None,
         entity: None,
@@ -263,8 +343,8 @@ pub fn render(
     entity: Option<&Value>,
 ) -> Result<Rendered, RenderError> {
     let mut renderer = Renderer {
-        template,
-        params,
+        template: Some(template),
+        params: &params.0,
         sender,
         doc,
         entity,
@@ -398,8 +478,8 @@ enum Mode {
 }
 
 struct Renderer<'a> {
-    template: &'a Template,
-    params: &'a ValidatedParams,
+    template: Option<&'a Template>,
+    params: &'a BTreeMap<String, String>,
     sender: &'a Sender,
     doc: Option<&'a Value>,
     entity: Option<&'a Value>,
@@ -497,6 +577,7 @@ impl Renderer<'_> {
         }
         let definition = self
             .template
+            .ok_or_else(|| bad(format!("variable '{name}' is not defined")))?
             .vars
             .get(name)
             .cloned()
