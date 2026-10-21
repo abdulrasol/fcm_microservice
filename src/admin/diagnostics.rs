@@ -170,16 +170,6 @@ pub async fn data_source_test(
     check_limit(&state, &user)?;
     ensure_app_exists(&state, &app).await?;
 
-    let modes = [body.path.is_some(), body.members.is_some()]
-        .into_iter()
-        .filter(|present| *present)
-        .count();
-    if modes != 1 {
-        return Err(AdminError::invalid_request(
-            "provide exactly one of path or members",
-        ));
-    }
-
     let source = state
         .datasource
         .source_for(&app)
@@ -189,8 +179,10 @@ pub async fn data_source_test(
             DataError::Unavailable(_) => AdminError::unavailable("the data source is unavailable"),
         })?;
 
-    let outcome = if let Some(path) = &body.path {
-        match source.get_doc(path).await {
+    // Exactly one mode, and the mode decides what is read. The branch itself
+    // carries the check, so no value is unwrapped here.
+    let outcome = match (&body.path, &body.members) {
+        (Some(path), None) => match source.get_doc(path).await {
             Ok(Some(document)) => json!({
                 "ok": true,
                 "found": true,
@@ -203,24 +195,29 @@ pub async fn data_source_test(
             Err(DataError::Unavailable(_)) => {
                 json!({ "ok": false, "reason": "data source unavailable" })
             }
+        },
+        (None, Some(members)) => {
+            let limit = members
+                .limit
+                .unwrap_or(DEFAULT_MEMBERS_LIMIT)
+                .clamp(1, MAX_MEMBERS_LIMIT);
+            match source
+                .members(&members.collection, &members.field, &members.value, limit)
+                .await
+            {
+                Ok(uids) => json!({ "ok": true, "count": uids.len() }),
+                Err(DataError::InvalidPath(message)) => {
+                    return Err(AdminError::invalid_request(&message))
+                }
+                Err(DataError::Unavailable(_)) => {
+                    json!({ "ok": false, "reason": "data source unavailable" })
+                }
+            }
         }
-    } else {
-        let members = body.members.as_ref().expect("one mode");
-        let limit = members
-            .limit
-            .unwrap_or(DEFAULT_MEMBERS_LIMIT)
-            .clamp(1, MAX_MEMBERS_LIMIT);
-        match source
-            .members(&members.collection, &members.field, &members.value, limit)
-            .await
-        {
-            Ok(uids) => json!({ "ok": true, "count": uids.len() }),
-            Err(DataError::InvalidPath(message)) => {
-                return Err(AdminError::invalid_request(&message))
-            }
-            Err(DataError::Unavailable(_)) => {
-                json!({ "ok": false, "reason": "data source unavailable" })
-            }
+        _ => {
+            return Err(AdminError::invalid_request(
+                "provide exactly one of path or members",
+            ))
         }
     };
 
@@ -333,6 +330,25 @@ mod tests {
     /// The owner harness with the test environment.
     async fn owner() -> Harness {
         setup_with_env("owner", &[], Some(Arc::new(FakeEnv))).await
+    }
+
+    #[tokio::test]
+    async fn diagnostics_have_no_expect_in_production_code() {
+        // The production part of the file must not unwrap anything: the test
+        // module below is the only place where a panic is allowed.
+        let source = include_str!("diagnostics.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a test module");
+        for (number, line) in production.lines().enumerate() {
+            assert!(
+                !line.contains("expect(") && !line.contains("unwrap("),
+                "line {} unwraps in production code: {}",
+                number + 1,
+                line
+            );
+        }
     }
 
     #[tokio::test]
