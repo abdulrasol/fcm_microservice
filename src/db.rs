@@ -154,6 +154,24 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Device registrations (T6): one token per `(app, token)`, owned by one uid.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS devices (
+            app TEXT NOT NULL, token TEXT NOT NULL, uid TEXT NOT NULL,
+            platform TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (app, token)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_devices_uid ON devices(app, uid)")
+        .execute(pool)
+        .await?;
+
     // Safe migrations for existing databases. Errors (e.g. duplicate column) are
     // expected and ignored; no data is dropped.
     let _ = sqlx::query("ALTER TABLE notifications_history ADD COLUMN payload TEXT")
