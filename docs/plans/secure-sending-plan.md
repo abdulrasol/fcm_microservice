@@ -862,3 +862,4 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
 | 2026-10-21 | الخطة (المراجعة 2) | ✅ | القوالب والإعدادات من الداشبورد + دعم باك إند غير Firebase + حسابات الأداة + مفاتيح التطبيقات |
 | 2026-10-21 | الخطة (المراجعة 2.1) | ✅ | رفع service account وإضافة تطبيق من الداشبورد (3.13، T16، D12) |
 | 2026-10-21 | T1 — مخزن الإعدادات والقوالب | ✅ | النماذج + التحقق + SQLite (إصدارات وسجل) + استيراد/تصدير + أمرا CLI. DDL: `app_configs` صار فيه `version` |
+| 2026-10-21 | T2 — حسابات الداشبورد والجلسات | 🔄 بانتظار المراجعة | T2-0: قفل كتابات `ConfigStore` + حفظ `last_used_at` + حاجز `[G6]` + إنجليزية `src/`. T2: `tool_users`/`tool_user_apps`/`tool_sessions` (أوقات INTEGER epoch) + argon2id + كوكي `__Host-` + CSRF + `create-owner`/`reset-owner-password`. 118 اختباراً ناجحاً |
