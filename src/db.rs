@@ -1036,6 +1036,89 @@ pub async fn is_entity_blocked(
     Ok(count > 0)
 }
 
+// ---------- T10-B: dashboard campaign review ----------
+
+/// One blocked entity.
+pub struct BlockRow {
+    pub entity_id: String,
+    pub reason: Option<String>,
+    pub blocked_by: Option<String>,
+    pub created_at: String,
+}
+
+/// Lists the blocked entities of one app.
+pub async fn list_blocks(pool: &SqlitePool, app: &str) -> Result<Vec<BlockRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT entity_id, reason, blocked_by, created_at FROM campaign_blocks \
+         WHERE app = ? ORDER BY entity_id",
+    )
+    .bind(app)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| BlockRow {
+            entity_id: row.get("entity_id"),
+            reason: row.get("reason"),
+            blocked_by: row.get("blocked_by"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+/// Blocks an entity and cancels its pending campaigns in one transaction.
+///
+/// The block and the cancellation commit together: a blocked entity never
+/// keeps a campaign waiting for review.
+pub async fn block_entity(
+    pool: &SqlitePool,
+    app: &str,
+    entity_id: &str,
+    reason: Option<&str>,
+    blocked_by: &str,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO campaign_blocks (app, entity_id, reason, blocked_by) VALUES (?, ?, ?, ?) \
+         ON CONFLICT(app, entity_id) DO UPDATE SET reason = excluded.reason, \
+         blocked_by = excluded.blocked_by",
+    )
+    .bind(app)
+    .bind(entity_id)
+    .bind(reason)
+    .bind(blocked_by)
+    .execute(&mut *tx)
+    .await?;
+
+    let cancelled = sqlx::query(
+        "UPDATE campaigns SET status = 'cancelled', review_note = 'entity blocked', \
+         decided_at = CURRENT_TIMESTAMP WHERE app = ? AND entity_id = ? \
+         AND status = 'pending_review'",
+    )
+    .bind(app)
+    .bind(entity_id)
+    .execute(&mut *tx)
+    .await?;
+
+    let count = cancelled.rows_affected();
+    tx.commit().await?;
+    Ok(count)
+}
+
+/// Removes the block of one entity. A missing block is `false`.
+pub async fn unblock_entity(
+    pool: &SqlitePool,
+    app: &str,
+    entity_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM campaign_blocks WHERE app = ? AND entity_id = ?")
+        .bind(app)
+        .bind(entity_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

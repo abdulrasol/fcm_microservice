@@ -445,6 +445,24 @@ pub(crate) fn admin_routes() -> Vec<AdminRoute> {
             true,
             post(campaigns::reject),
         ),
+        (
+            "GET",
+            "/apps/:app/blocks",
+            true,
+            get(campaigns::list_blocks),
+        ),
+        (
+            "POST",
+            "/apps/:app/blocks",
+            true,
+            post(campaigns::block_entity),
+        ),
+        (
+            "DELETE",
+            "/apps/:app/blocks/:entity_id",
+            true,
+            delete(campaigns::unblock_entity),
+        ),
     ]
 }
 
@@ -1779,6 +1797,13 @@ pub(crate) mod tests {
                 "/apps/:app/campaigns/:id/reject",
                 Some(json!({ "note": "matrix" })),
             ),
+            MatrixCase::new(Method::GET, "/apps/:app/blocks", None),
+            MatrixCase::new(
+                Method::POST,
+                "/apps/:app/blocks",
+                Some(json!({ "entity_id": "matrix" })),
+            ),
+            MatrixCase::new(Method::DELETE, "/apps/:app/blocks/:entity_id", None),
         ];
         for section in [
             "identity",

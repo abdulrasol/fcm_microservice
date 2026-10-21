@@ -254,6 +254,119 @@ pub async fn reject(
     Ok(Json(json!({ "status": "rejected" })))
 }
 
+/// The longest block reason a reviewer may write.
+const MAX_REASON_CHARS: usize = 200;
+
+/// `GET /apps/{app}/blocks`: the blocked entities of the app.
+pub async fn list_blocks(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(app): Path<String>,
+) -> Result<Json<Value>, CampaignAdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+
+    let rows = db::list_blocks(&state.db, &app)
+        .await
+        .map_err(|error| AdminError::from_db("read the blocks", error))?;
+
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "entity_id": row.entity_id,
+                "reason": row.reason,
+                "blocked_by": row.blocked_by,
+                "created_at": row.created_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(Value::Array(items)))
+}
+
+/// The body of a block: the entity and an optional reason.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockRequest {
+    pub entity_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `POST /apps/{app}/blocks`: block an entity and cancel its pending campaigns.
+///
+/// The block and the cancellation are one transaction, so a blocked entity
+/// never keeps a campaign waiting for review.
+pub async fn block_entity(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(app): Path<String>,
+    AdminJson(body): AdminJson<BlockRequest>,
+) -> Result<Json<Value>, CampaignAdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+
+    if !campaigns::is_entity_id(&body.entity_id) {
+        return Err(AdminError::invalid_request("the entity id is not valid").into());
+    }
+    if let Some(reason) = &body.reason {
+        if reason.chars().count() > MAX_REASON_CHARS {
+            return Err(
+                AdminError::invalid_request("the reason must be at most 200 characters").into(),
+            );
+        }
+    }
+
+    let cancelled = db::block_entity(
+        &state.db,
+        &app,
+        &body.entity_id,
+        body.reason.as_deref(),
+        &user.email,
+    )
+    .await
+    .map_err(|error| AdminError::from_db("block the entity", error))?;
+
+    let detail = json!({ "entity_id": body.entity_id }).to_string();
+    let _ = db::write_audit(
+        &state.db,
+        &user.email,
+        Some(&app),
+        "campaign.block",
+        &detail,
+    )
+    .await;
+
+    Ok(Json(json!({ "blocked": true, "cancelled": cancelled })))
+}
+
+/// `DELETE /apps/{app}/blocks/{entity_id}`: unblock an entity.
+pub async fn unblock_entity(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path((app, entity_id)): Path<(String, String)>,
+) -> Result<Json<Value>, CampaignAdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+
+    let removed = db::unblock_entity(&state.db, &app, &entity_id)
+        .await
+        .map_err(|error| AdminError::from_db("unblock the entity", error))?;
+    if !removed {
+        return Err(AdminError::not_found("the entity is not blocked").into());
+    }
+
+    let detail = json!({ "entity_id": entity_id }).to_string();
+    let _ = db::write_audit(
+        &state.db,
+        &user.email,
+        Some(&app),
+        "campaign.unblock",
+        &detail,
+    )
+    .await;
+
+    Ok(Json(json!({ "blocked": false })))
+}
+
 /// A review note: 1..=200 characters and no control character but a newline.
 fn validate_note(note: &str) -> Result<(), AdminError> {
     let length = note.chars().count();
@@ -696,17 +809,210 @@ mod tests {
         assert_eq!(harness.fcm.calls(), 0, "a rejected campaign is never sent");
     }
 
+    #[tokio::test]
+    async fn block_cancels_pending_campaigns_in_one_transaction() {
+        let harness = setup("owner", &[]).await;
+        let first = insert_campaign(&harness.pool, APP, "e1", "pending_review").await;
+        let second = insert_campaign(&harness.pool, APP, "e1", "pending_review").await;
+        let sent = insert_campaign(&harness.pool, APP, "e1", "sent").await;
+        let other = insert_campaign(&harness.pool, APP, "e2", "pending_review").await;
 
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/blocks", APP),
+                Some(json!({ "entity_id": "e1" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["blocked"], true);
+        assert_eq!(body["cancelled"], 2);
 
+        for id in [first, second] {
+            let row: (String, Option<String>) =
+                sqlx::query_as("SELECT status, review_note FROM campaigns WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&harness.pool)
+                    .await
+                    .expect("the row must exist");
+            assert_eq!(row.0, "cancelled");
+            assert_eq!(row.1.as_deref(), Some("entity blocked"));
+        }
 
+        let status: String = sqlx::query_scalar("SELECT status FROM campaigns WHERE id = ?")
+            .bind(sent)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the row must exist");
+        assert_eq!(status, "sent", "a sent campaign is not cancelled");
 
+        let status: String = sqlx::query_scalar("SELECT status FROM campaigns WHERE id = ?")
+            .bind(other)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the row must exist");
+        assert_eq!(status, "pending_review", "another entity is untouched");
+    }
 
+    #[tokio::test]
+    async fn block_idempotent_and_updates_reason() {
+        let harness = setup("owner", &[]).await;
+        for reason in ["first reason", "second reason"] {
+            let (status, _) = harness
+                .call(
+                    Method::POST,
+                    &format!("/apps/{}/blocks", APP),
+                    Some(json!({ "entity_id": "e1", "reason": reason })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK);
+        }
 
+        let (status, body) = harness
+            .call(Method::GET, &format!("/apps/{}/blocks", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("an array");
+        assert_eq!(rows.len(), 1, "the block is written once");
+        assert_eq!(rows[0]["entity_id"], "e1");
+        assert_eq!(rows[0]["reason"], "second reason");
+        assert_eq!(rows[0]["blocked_by"], "user@example.com");
+    }
 
+    #[tokio::test]
+    async fn unblock_missing_is_404() {
+        let harness = setup("owner", &[]).await;
+        let (status, body) = harness
+            .call(Method::DELETE, &format!("/apps/{}/blocks/e1", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+    }
 
+    #[tokio::test]
+    async fn block_entity_id_charset() {
+        let harness = setup("owner", &[]).await;
+        for entity_id in ["bad id", "bad!id", &"e".repeat(65)] {
+            let (status, body) = harness
+                .call(
+                    Method::POST,
+                    &format!("/apps/{}/blocks", APP),
+                    Some(json!({ "entity_id": entity_id })),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "entity {:?} must be refused",
+                entity_id
+            );
+            assert_eq!(body["error"], "invalid_request");
+        }
+    }
 
+    #[tokio::test]
+    async fn blocked_entity_cannot_create_new_campaign() {
+        let harness = setup("owner", &[]).await;
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/blocks", APP),
+                Some(json!({ "entity_id": "e1" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
 
+        // The T9 create route refuses a blocked entity with this exact
+        // predicate before it inserts anything.
+        let blocked = db::is_entity_blocked(&harness.pool, APP, "e1")
+            .await
+            .expect("the check must run");
+        assert!(blocked, "the dashboard block must block the T9 route");
+    }
 
+    #[tokio::test]
+    async fn quota_ignores_rejected_cancelled_failed_after_admin_actions() {
+        let harness = setup("owner", &[]).await;
+        let limits = Quota {
+            per_entity_per_day: 1,
+            per_entity_per_week: 1,
+        };
+        let new = db::NewCampaign {
+            app: APP.to_string(),
+            entity_id: "e1".to_string(),
+            sender_uid: "sender-uid".to_string(),
+            title: "Title".to_string(),
+            body: "Body".to_string(),
+            image: None,
+            data: "{}".to_string(),
+            audience: r#"{"groups":[["promos"]]}"#.to_string(),
+            condition: "'promos' in topics".to_string(),
+            review: Review {
+                mode: ReviewMode::Always,
+                n: None,
+            },
+            sender_is_service: false,
+        };
+
+        // The first campaign fills the quota and waits for review.
+        let inserted =
+            db::insert_campaign_checked(&harness.pool, &new, &limits, crate::unix_seconds())
+                .await
+                .expect("the first campaign must be inserted");
+        assert_eq!(inserted.status, "pending_review");
+
+        // A rejected campaign never consumes the quota.
+        let (status, _) = reject(&harness, inserted.id, "not allowed").await;
+        assert_eq!(status, StatusCode::OK);
+        db::insert_campaign_checked(&harness.pool, &new, &limits, crate::unix_seconds())
+            .await
+            .expect("a rejected campaign must not consume the quota");
+
+        // A cancelled campaign never consumes the quota either.
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/blocks", APP),
+                Some(json!({ "entity_id": "e1" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        db::insert_campaign_checked(&harness.pool, &new, &limits, crate::unix_seconds())
+            .await
+            .expect("a cancelled campaign must not consume the quota");
+
+        // A failed campaign never consumes the quota.
+        insert_campaign(&harness.pool, APP, "e2", "failed").await;
+        let other = db::NewCampaign {
+            entity_id: "e2".to_string(),
+            ..db::NewCampaign {
+                app: APP.to_string(),
+                entity_id: "e1".to_string(),
+                sender_uid: "sender-uid".to_string(),
+                title: "Title".to_string(),
+                body: "Body".to_string(),
+                image: None,
+                data: "{}".to_string(),
+                audience: r#"{"groups":[["promos"]]}"#.to_string(),
+                condition: "'promos' in topics".to_string(),
+                review: Review {
+                    mode: ReviewMode::Always,
+                    n: None,
+                },
+                sender_is_service: false,
+            }
+        };
+        db::insert_campaign_checked(&harness.pool, &other, &limits, crate::unix_seconds())
+            .await
+            .expect("a failed campaign must not consume the quota");
+
+        // A campaign that waits for review does consume the quota.
+        let error =
+            db::insert_campaign_checked(&harness.pool, &new, &limits, crate::unix_seconds())
+                .await
+                .expect_err("the quota must be exhausted");
+        assert!(matches!(error, db::InsertError::QuotaExceeded { .. }));
+    }
 
     #[tokio::test]
     async fn campaign_routes_denied_to_unassigned_manager_with_403() {
@@ -725,6 +1031,13 @@ mod tests {
                 format!("/apps/{}/campaigns/{}/reject", APP, id),
                 Some(json!({ "note": "no" })),
             ),
+            (Method::GET, format!("/apps/{}/blocks", APP), None),
+            (
+                Method::POST,
+                format!("/apps/{}/blocks", APP),
+                Some(json!({ "entity_id": "e1" })),
+            ),
+            (Method::DELETE, format!("/apps/{}/blocks/e1", APP), None),
         ];
 
         for (method, uri, body) in calls {
@@ -748,6 +1061,9 @@ mod tests {
             (Method::GET, format!("/apps/{}/campaigns", APP)),
             (Method::POST, format!("/apps/{}/campaigns/1/approve", APP)),
             (Method::POST, format!("/apps/{}/campaigns/1/reject", APP)),
+            (Method::GET, format!("/apps/{}/blocks", APP)),
+            (Method::POST, format!("/apps/{}/blocks", APP)),
+            (Method::DELETE, format!("/apps/{}/blocks/e1", APP)),
         ];
 
         for (method, uri) in calls {
