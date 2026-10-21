@@ -308,6 +308,280 @@ pub struct PreviewRequest {
     pub use_real_doc: bool,
 }
 
+enum Prepared {
+    Rendered(Rendered),
+    Forbidden,
+}
+
+/// Shared resolution of preview and test-send.
+async fn prepare(
+    state: &Arc<AppState>,
+    app: &str,
+    key: &str,
+    request: &PreviewRequest,
+) -> Result<Prepared, AdminError> {
+    let snapshot = snapshot_of(state, app)?;
+
+    let template = match &request.definition {
+        Some(definition) => {
+            let template: Template =
+                serde_json::from_value(definition.clone()).map_err(|error| {
+                    AdminError::invalid(vec![Issue::new(
+                        format!("templates.{}", key),
+                        format!("[S1] the template could not be read: {}", error),
+                    )])
+                })?;
+            let issues = validate_template(key, &template, &snapshot.config);
+            if !issues.is_empty() {
+                return Err(AdminError::invalid(issues));
+            }
+            template
+        }
+        None => snapshot
+            .templates
+            .get(key)
+            .cloned()
+            .ok_or_else(|| AdminError::not_found("the template does not exist"))?,
+    };
+
+    let sender = Sender {
+        uid: request.sender.uid.clone(),
+        name: request.sender.name.clone(),
+        role: request.sender.role.clone(),
+    };
+    let params = template::validate_params(&template, &request.params).map_err(render_error)?;
+
+    let doc = match (&request.doc, request.use_real_doc) {
+        (Some(doc), _) => Some(doc.clone()),
+        (None, true) => {
+            let path = template::context_path(&template, &params, &sender).map_err(render_error)?;
+            match path {
+                Some(path) => {
+                    let source =
+                        state.datasource.source_for(app).await.map_err(|_| {
+                            AdminError::unavailable("the data source is unavailable")
+                        })?;
+                    match source.get_doc(&path).await {
+                        Ok(doc) => doc,
+                        Err(DataError::Unavailable(_)) => {
+                            return Err(AdminError::unavailable("the data source is unavailable"))
+                        }
+                        Err(DataError::InvalidPath(message)) => {
+                            return Err(AdminError::invalid_request(&message))
+                        }
+                    }
+                }
+                None => None,
+            }
+        }
+        (None, false) => None,
+    };
+
+    match template::render(&template, &params, &sender, doc.as_ref(), None) {
+        Ok(rendered) => Ok(Prepared::Rendered(rendered)),
+        Err(RenderError::Forbidden) => Ok(Prepared::Forbidden),
+        Err(RenderError::BadRequest(message)) => Err(AdminError::invalid_request(&message)),
+    }
+}
+
+fn render_error(error: RenderError) -> AdminError {
+    match error {
+        RenderError::BadRequest(message) => AdminError::invalid_request(&message),
+        RenderError::Forbidden => AdminError::forbidden("Forbidden"),
+    }
+}
+
+fn device_error(error: DeviceError) -> AdminError {
+    match error {
+        DeviceError::Database(error) => AdminError::from_db("read the devices", error),
+        DeviceError::InvalidToken => AdminError::internal("a stored device token is invalid"),
+        DeviceError::InvalidRoleValue => AdminError::invalid_request("the role value is invalid"),
+        DeviceError::NotConfigured => {
+            AdminError::invalid_request("role targets require identity.role_members")
+        }
+        DeviceError::Unavailable(_) => AdminError::unavailable("the data source is unavailable"),
+    }
+}
+
+async fn recipient_count(
+    state: &Arc<AppState>,
+    app: &str,
+    snapshot: &AppSnapshot,
+    target: &ResolvedTarget,
+) -> Result<Option<usize>, AdminError> {
+    match target {
+        ResolvedTarget::Uid(uid) => {
+            let tokens = state
+                .devices
+                .tokens_for_uid(app, uid)
+                .await
+                .map_err(device_error)?;
+            Ok(Some(tokens.len()))
+        }
+        ResolvedTarget::Role(role) => {
+            let Some(role_members) = snapshot.config.identity.role_members.as_ref() else {
+                // The app cannot enumerate the role; the count is unknown.
+                return Ok(None);
+            };
+            let source = state
+                .datasource
+                .source_for(app)
+                .await
+                .map_err(|_| AdminError::unavailable("the data source is unavailable"))?;
+            let uids = state
+                .role_directory
+                .uids_for_role(app, snapshot.version, role_members, role, source.as_ref())
+                .await
+                .map_err(device_error)?;
+            Ok(Some(uids.len()))
+        }
+        ResolvedTarget::Topic(_) | ResolvedTarget::Condition(_) => Ok(None),
+    }
+}
+
+/// `POST /apps/{app}/templates/{key}/preview`.
+pub async fn preview(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path((app, key)): Path<(String, String)>,
+    AdminJson(request): AdminJson<PreviewRequest>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let snapshot = snapshot_of(&state, &app)?;
+
+    let rendered = match prepare(&state, &app, &key, &request).await? {
+        Prepared::Forbidden => {
+            return Ok(Json(json!({ "rendered": false, "reason": "forbidden" })));
+        }
+        Prepared::Rendered(rendered) => rendered,
+    };
+
+    let kind = match &rendered.target {
+        ResolvedTarget::Uid(_) => "uid",
+        ResolvedTarget::Role(_) => "role",
+        ResolvedTarget::Topic(_) => "topic",
+        ResolvedTarget::Condition(_) => "condition",
+    };
+    let value = match &rendered.target {
+        ResolvedTarget::Uid(value)
+        | ResolvedTarget::Role(value)
+        | ResolvedTarget::Topic(value)
+        | ResolvedTarget::Condition(value) => value.as_str(),
+    };
+    let count = recipient_count(&state, &app, &snapshot, &rendered.target).await?;
+
+    Ok(Json(json!({
+        "title": rendered.title,
+        "body": rendered.body,
+        "image": rendered.image,
+        "data": rendered.data,
+        "target": { "kind": kind, "value": value },
+        "dedupe_key": rendered.dedupe_key,
+        "recipients": { "kind": kind, "count": count },
+    })))
+}
+
+/// `POST /apps/{app}/templates/{key}/test-send`.
+pub async fn test_send(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path((app, key)): Path<(String, String)>,
+    AdminJson(request): AdminJson<PreviewRequest>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    snapshot_of(&state, &app)?;
+
+    let test_uid = super::auth::load_test_uid(&state.tool_auth.pool, user.user_id)
+        .await
+        .map_err(|error| AdminError::from_db("read the test uid", error))?
+        .ok_or_else(|| AdminError::invalid_request("Set a test_uid on your account first"))?;
+
+    if !state
+        .auth_fail_limiter
+        .check(&format!("{}{}", TEST_SEND_KEY_PREFIX, user.user_id))
+    {
+        return Err(AdminError::too_many_requests());
+    }
+
+    let rendered = match prepare(&state, &app, &key, &request).await? {
+        Prepared::Forbidden => return Err(AdminError::forbidden("Forbidden")),
+        Prepared::Rendered(rendered) => rendered,
+    };
+
+    let tokens = state
+        .devices
+        .tokens_for_uid(&app, &test_uid)
+        .await
+        .map_err(device_error)?;
+    if tokens.is_empty() {
+        return Ok(Json(json!({ "delivered": 0, "reason": "no_devices" })));
+    }
+
+    let project_id = {
+        let projects = state.project_map.read().await;
+        projects.get(&app).cloned()
+    }
+    .ok_or_else(|| AdminError::internal("Service account for this app is not loaded"))?;
+
+    let delivery = send::send_to_tokens(
+        &state.fcm,
+        &app,
+        &project_id,
+        &tokens,
+        |token| {
+            send::build_message(
+                &rendered.title,
+                Some(&rendered.body),
+                rendered.image.as_deref(),
+                &rendered.data,
+                None,
+                &send::Destination::Token(token.to_string()),
+            )
+        },
+        send::DEFAULT_CONCURRENCY,
+    )
+    .await;
+
+    for token in &delivery.dead_tokens {
+        let _ = state.devices.remove_dead_token(&app, token).await;
+    }
+
+    let payload = json!({
+        "title": rendered.title,
+        "body": rendered.body,
+        "data": rendered.data,
+    })
+    .to_string();
+    let response = json!({
+        "delivered": delivery.delivered,
+        "failed": delivery.failed,
+    })
+    .to_string();
+    let _ = db::log_notification_ext(
+        &state.db,
+        &app,
+        &format!("uid:{}", test_uid),
+        &rendered.title,
+        if delivery.delivered > 0 {
+            "success"
+        } else {
+            "failed"
+        },
+        &response,
+        &payload,
+        &test_uid,
+        Some(&user.email),
+        "test",
+        Some(&key),
+    )
+    .await;
+
+    Ok(Json(json!({
+        "delivered": delivery.delivered,
+        "failed": delivery.failed,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
@@ -617,13 +891,89 @@ mod tests {
             .contains("[S1]"));
     }
 
+    #[tokio::test]
+    async fn preview_renders_with_inline_doc() {
+        let harness = setup("owner", &[]).await;
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/draft/preview", APP),
+                Some(json!({
+                    "params": {},
+                    "sender": { "uid": "u1" },
+                    "definition": doc_template(),
+                    "doc": { "name": "Sara", "uid": "u1" }
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "body: {}", body);
+        assert_eq!(body["body"], "Hello Sara");
+        assert_eq!(body["title"], "Hello");
+        assert_eq!(body["target"]["kind"], "role");
+    }
 
+    #[tokio::test]
+    async fn preview_never_calls_fcm() {
+        let harness = setup("owner", &[]).await;
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/draft/preview", APP),
+                Some(json!({
+                    "params": {},
+                    "sender": { "uid": "u1" },
+                    "definition": doc_template(),
+                    "doc": { "name": "Sara", "uid": "u1" }
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(harness.fcm.calls(), 0, "preview must never reach FCM");
+    }
 
+    #[tokio::test]
+    async fn preview_unsaved_definition_must_validate() {
+        let harness = setup("owner", &[]).await;
+        let mut definition = doc_template();
+        definition["bogus"] = json!(true);
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/draft/preview", APP),
+                Some(json!({
+                    "params": {},
+                    "sender": { "uid": "u1" },
+                    "definition": definition,
+                    "doc": { "name": "Sara" }
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid");
+        assert!(!body["issues"].as_array().expect("issues").is_empty());
+    }
 
-
-
-
-
+    #[tokio::test]
+    async fn preview_require_failure_reports_reason_without_doc_data() {
+        let harness = setup("owner", &[]).await;
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/draft/preview", APP),
+                Some(json!({
+                    "params": {},
+                    "sender": { "uid": "u1" },
+                    "definition": doc_template(),
+                    "doc": { "name": "Sara", "uid": "someone-else", "secret": "TOP-SECRET" }
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rendered"], false);
+        assert_eq!(body["reason"], "forbidden");
+        assert_eq!(body.as_object().expect("an object").len(), 2);
+        assert!(!body.to_string().contains("TOP-SECRET"));
+    }
 
     async fn configure_http_source(harness: &Harness, base_url: &str) {
         let value = json!({
@@ -641,21 +991,243 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn preview_real_doc_reads_data_source() {
+        let server = crate::datasource::test_support::TestServer::start(vec![
+            crate::datasource::test_support::json(200, "OK", r#"{"name":"Sara","uid":"u1"}"#),
+        ])
+        .await;
+        let harness = setup_with_env("owner", &[], Some(Arc::new(FakeEnv))).await;
+        configure_http_source(&harness, &server.base_url).await;
 
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/draft/preview", APP),
+                Some(json!({
+                    "params": {},
+                    "sender": { "uid": "u1" },
+                    "definition": doc_template(),
+                    "use_real_doc": true
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["body"], "Hello Sara");
+    }
 
+    #[tokio::test]
+    async fn preview_real_doc_source_down_is_503() {
+        let harness = setup_with_env("owner", &[], Some(Arc::new(FakeEnv))).await;
+        configure_http_source(&harness, "http://127.0.0.1:1").await;
 
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/draft/preview", APP),
+                Some(json!({
+                    "params": {},
+                    "sender": { "uid": "u1" },
+                    "definition": doc_template(),
+                    "use_real_doc": true
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "unavailable");
+    }
 
+    #[tokio::test]
+    async fn preview_recipient_counts_only_no_uids_or_tokens() {
+        let harness = setup("owner", &[]).await;
+        harness
+            .register_device("u1", "token-u1-1-0000000000000000000000000000")
+            .await;
+        harness
+            .register_device("u1", "token-u1-2-0000000000000000000000000000")
+            .await;
+        harness
+            .register_device("u2", "token-u2-1-0000000000000000000000000000")
+            .await;
+        let _ = create(&harness, "sample", uid_template()).await;
 
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/sample/preview", APP),
+                Some(preview_body()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["recipients"]["kind"], "uid");
+        assert_eq!(body["recipients"]["count"], 2);
+        assert!(body.get("uids").is_none());
+        let text = body.to_string();
+        assert!(!text.contains("token-u1"));
+        assert!(!text.contains("token-u2"));
+        assert!(!text.contains("u2"));
+    }
 
+    #[tokio::test]
+    async fn test_send_without_test_uid_is_400() {
+        let harness = setup("owner", &[]).await;
+        let _ = create(&harness, "sample", sample_template()).await;
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/sample/test-send", APP),
+                Some(preview_body()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["message"], "Set a test_uid on your account first");
+    }
 
+    #[tokio::test]
+    async fn test_send_goes_only_to_test_uid_devices() {
+        let harness = setup("owner", &[]).await;
+        harness.set_test_uid("tester").await;
+        harness
+            .register_device("tester", "token-tester-1-0000000000000000000000000000")
+            .await;
+        harness
+            .register_device("tester", "token-tester-2-0000000000000000000000000000")
+            .await;
+        harness
+            .register_device("other", "token-other-1-0000000000000000000000000000")
+            .await;
+        let _ = create(&harness, "sample", uid_template()).await;
 
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/sample/test-send", APP),
+                Some(preview_body()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["delivered"], 2);
+        let tokens = harness.fcm.tokens();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.iter().all(|token| token.starts_with("token-tester")));
+    }
 
+    #[tokio::test]
+    async fn test_send_ignores_template_target() {
+        let harness = setup("owner", &[]).await;
+        harness.set_test_uid("tester").await;
+        harness
+            .register_device("tester", "token-tester-1-0000000000000000000000000000")
+            .await;
+        harness
+            .register_device("other", "token-other-1-0000000000000000000000000000")
+            .await;
+        let topic = json!({
+            "description": "Broadcast",
+            "enabled": true,
+            "senders": ["admin"],
+            "to": { "topic": "all" },
+            "title": "Hello",
+            "body": "Body"
+        });
+        let _ = create(&harness, "sample", topic).await;
 
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/sample/test-send", APP),
+                Some(preview_body()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["delivered"], 1);
+        assert_eq!(
+            harness.fcm.tokens(),
+            vec!["token-tester-1-0000000000000000000000000000".to_string()]
+        );
+    }
 
+    #[tokio::test]
+    async fn test_send_body_cannot_override_test_uid() {
+        let harness = setup("owner", &[]).await;
+        harness.set_test_uid("tester").await;
+        harness
+            .register_device("tester", "token-tester-1-0000000000000000000000000000")
+            .await;
+        harness
+            .register_device("other", "token-other-1-0000000000000000000000000000")
+            .await;
+        let _ = create(&harness, "sample", uid_template()).await;
 
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/sample/test-send", APP),
+                Some(json!({
+                    "params": {},
+                    "sender": { "uid": "tester" },
+                    "test_uid": "other"
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(harness.fcm.calls(), 0);
+    }
 
+    #[tokio::test]
+    async fn test_send_rate_limited_per_user() {
+        let harness = setup("owner", &[]).await;
+        harness.set_test_uid("tester").await;
+        let _ = create(&harness, "sample", sample_template()).await;
 
+        for attempt in 0..10 {
+            let (status, _) = harness
+                .call(
+                    Method::POST,
+                    &format!("/apps/{}/templates/sample/test-send", APP),
+                    Some(preview_body()),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "attempt {}", attempt);
+        }
+        let (status, body) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/sample/test-send", APP),
+                Some(preview_body()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "rate_limited");
+    }
 
+    #[tokio::test]
+    async fn test_send_history_kind_test() {
+        let harness = setup("owner", &[]).await;
+        harness.set_test_uid("tester").await;
+        harness
+            .register_device("tester", "token-tester-1-0000000000000000000000000000")
+            .await;
+        let _ = create(&harness, "sample", uid_template()).await;
 
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/sample/test-send", APP),
+                Some(preview_body()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
 
+        let row: (String, Option<String>, String, Option<String>) = sqlx::query_as(
+            "SELECT kind, \"ref\", target, sender_uid FROM notifications_history ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&harness.pool)
+        .await
+        .expect("the history row must exist");
+        assert_eq!(row.0, "test");
+        assert_eq!(row.1.as_deref(), Some("sample"));
+        assert_eq!(row.2, "uid:tester");
+        assert_eq!(row.3.as_deref(), Some("tester"));
+    }
 }

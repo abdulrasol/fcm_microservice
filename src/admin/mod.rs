@@ -352,6 +352,14 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/apps/:app/templates/:key/enabled",
             put(templates::set_enabled),
         )
+        .route(
+            "/apps/:app/templates/:key/preview",
+            post(templates::preview),
+        )
+        .route(
+            "/apps/:app/templates/:key/test-send",
+            post(templates::test_send),
+        )
         .layer(axum::middleware::from_fn_with_state(state, csrf_guard))
 }
 
