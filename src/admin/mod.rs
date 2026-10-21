@@ -625,7 +625,8 @@ pub(crate) mod tests {
             client.clone(),
             env,
         ));
-        let auth = AuthService::new(
+        let app_keys = Arc::new(crate::appkeys::AppKeyStore::new(pool.clone()));
+        let auth = AuthService::with_app_keys(
             project_map.clone(),
             identity.clone(),
             datasource.clone(),
@@ -635,6 +636,7 @@ pub(crate) mod tests {
                 legacy_api_key: None,
                 legacy_enabled: false,
             },
+            app_keys,
         );
         let tool_auth = Arc::new(ToolAuth {
             pool: pool.clone(),

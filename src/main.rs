@@ -1,4 +1,5 @@
 mod admin;
+mod appkeys;
 mod auth;
 mod campaigns;
 mod cli;
@@ -179,6 +180,7 @@ async fn main() {
     if service_api_key.is_none() {
         tracing::warn!("SERVICE_API_KEY is not set; service-key authentication is disabled");
     }
+    warn_about_service_key(service_api_key.as_deref());
     if legacy_enabled && legacy_api_key.is_none() {
         tracing::warn!(
             "LEGACY_API_KEY_ENABLED=true but API_KEY is unset; legacy authentication stays disabled"
@@ -261,7 +263,10 @@ async fn main() {
         Arc::new(SystemEnv),
     ));
 
-    let auth = AuthService::new(
+    // The application keys live in their own store, shared with the auth
+    // service that checks them.
+    let app_keys = Arc::new(appkeys::AppKeyStore::new(db_pool.clone()));
+    let auth = AuthService::with_app_keys(
         project_map.clone(),
         identity_registry.clone(),
         datasource_registry.clone(),
@@ -271,6 +276,7 @@ async fn main() {
             legacy_api_key,
             legacy_enabled,
         },
+        app_keys.clone(),
     );
 
     let tool_auth = match admin::ToolAuth::new(db_pool.clone()).await {
@@ -354,6 +360,19 @@ async fn main() {
     {
         tracing::error!("Server error: {}", error);
         std::process::exit(1);
+    }
+}
+
+/// Warns once when the global service key is set: the per-app keys are the
+/// safer way to give a backend access to one app.
+///
+/// Returns whether the warning was written.
+fn warn_about_service_key(service_api_key: Option<&str>) -> bool {
+    if service_api_key.is_some() {
+        tracing::warn!("SERVICE_API_KEY is set; prefer per-app keys");
+        true
+    } else {
+        false
     }
 }
 
@@ -960,8 +979,13 @@ async fn send_template(
     topics::check_ip_limit(&state, &headers, peer)?;
 
     // 2. The service key, or a verified identity and its resolved role.
-    let (sender, sender_email, is_service) = if state.auth.verify_service_key(&headers) {
-        (
+    let (sender, sender_email, is_service) = match state
+        .auth
+        .trusted_sender(&headers, &payload.app)
+        .await
+        .map_err(|error| error.into_response())?
+    {
+        Some(appkeys::TrustedSender::Service) => (
             template::Sender {
                 uid: "service".to_string(),
                 name: None,
@@ -969,27 +993,39 @@ async fn send_template(
             },
             None,
             true,
-        )
-    } else {
-        let identity = state
-            .auth
-            .authenticate_identity(&headers, &payload.app)
-            .await
-            .map_err(|error| auth_error_with_limit(&state, &headers, peer, error))?;
-        let role = state
-            .auth
-            .resolve_sender_role(&payload.app, &identity)
-            .await
-            .map_err(|error| auth_error_with_limit(&state, &headers, peer, error))?;
-        (
+        ),
+        // An application key sends like the service key: it skips the
+        // `senders` list and the per-uid limit.
+        Some(appkeys::TrustedSender::AppKey { id }) => (
             template::Sender {
-                uid: identity.uid,
-                name: identity.name,
-                role,
+                uid: appkeys::TrustedSender::app_key_uid(id),
+                name: None,
+                role: None,
             },
-            identity.email,
-            false,
-        )
+            None,
+            true,
+        ),
+        None => {
+            let identity = state
+                .auth
+                .authenticate_identity(&headers, &payload.app)
+                .await
+                .map_err(|error| auth_error_with_limit(&state, &headers, peer, error))?;
+            let role = state
+                .auth
+                .resolve_sender_role(&payload.app, &identity)
+                .await
+                .map_err(|error| auth_error_with_limit(&state, &headers, peer, error))?;
+            (
+                template::Sender {
+                    uid: identity.uid,
+                    name: identity.name,
+                    role,
+                },
+                identity.email,
+                false,
+            )
+        }
     };
 
     // 3. A missing or disabled template is a uniform 404.
@@ -1409,16 +1445,37 @@ async fn authorize_campaign_sender(
     ensure_known_app(state, app).await?;
     topics::check_ip_limit(state, headers, peer)?;
 
-    if state.auth.verify_service_key(headers) {
-        return Ok((
-            template::Sender {
-                uid: "service".to_string(),
-                name: None,
-                role: None,
-            },
-            None,
-            true,
-        ));
+    match state
+        .auth
+        .trusted_sender(headers, app)
+        .await
+        .map_err(|error| auth_error_with_limit(&state, &headers, peer, error))?
+    {
+        Some(appkeys::TrustedSender::Service) => {
+            return Ok((
+                template::Sender {
+                    uid: "service".to_string(),
+                    name: None,
+                    role: None,
+                },
+                None,
+                true,
+            ))
+        }
+        // An application key creates campaigns like the service key: without
+        // a review.
+        Some(appkeys::TrustedSender::AppKey { id }) => {
+            return Ok((
+                template::Sender {
+                    uid: appkeys::TrustedSender::app_key_uid(id),
+                    name: None,
+                    role: None,
+                },
+                None,
+                true,
+            ))
+        }
+        None => {}
     }
 
     let identity = state
@@ -2012,7 +2069,8 @@ mod tests {
             client.clone(),
             env,
         ));
-        let auth = AuthService::new(
+        let app_keys = Arc::new(appkeys::AppKeyStore::new(pool.clone()));
+        let auth = AuthService::with_app_keys(
             project_map.clone(),
             identity.clone(),
             datasource.clone(),
@@ -2022,6 +2080,7 @@ mod tests {
                 legacy_api_key: Some(LEGACY_KEY.to_string()),
                 legacy_enabled: true,
             },
+            app_keys.clone(),
         );
         let tool_auth = Arc::new(ToolAuth {
             pool: pool.clone(),
@@ -4424,5 +4483,440 @@ mod tests {
             assert_eq!(text, "topic not allowed");
         }
         assert_eq!(harness.fcm.message_count(), 0);
+    }
+    // ---------- T11: application keys ----------
+
+    /// The store of the application keys of a state.
+    fn key_store(state: &AppState) -> Arc<appkeys::AppKeyStore> {
+        state
+            .auth
+            .app_keys()
+            .cloned()
+            .expect("the key store must be known")
+    }
+
+    /// Creates an application key.
+    async fn create_key(state: &AppState, app: &str) -> appkeys::NewKey {
+        key_store(state)
+            .create(app, "backend", "tester")
+            .await
+            .expect("the key must be created")
+    }
+
+    /// A request with a bearer token.
+    fn bearer_request(
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+        token: &str,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        let body = body.map(|value| value.to_string()).unwrap_or_default();
+        let mut request = builder
+            .body(Body::from(body))
+            .expect("the request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+        request
+    }
+
+    /// A state with a fake FCM and a loaded service account.
+    async fn send_state() -> (Arc<AppState>, Arc<FakeTransport>) {
+        let fcm = FakeTransport::accepting();
+        let state = test_state_with_fcm(test_client(), {
+            let fcm = fcm.clone();
+            move |_, _| fcm.clone() as Arc<dyn FcmTransport>
+        })
+        .await;
+        state
+            .project_map
+            .write()
+            .await
+            .insert(APP.to_string(), PROJECT.to_string());
+        let token_uri = spawn_token_server().await;
+        let auth = fake_authenticator(&token_uri).await;
+        state.auth_map.write().await.insert(APP.to_string(), auth);
+        (state, fcm)
+    }
+
+    /// The topics routes, for the key tests.
+    fn topics_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/topics/subscribe", post(topics::subscribe))
+            .route("/topics/unsubscribe", post(topics::unsubscribe))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn send_accepts_own_app_key() {
+        let (state, fcm) = send_state().await;
+        let key = create_key(&state, APP).await;
+
+        let (status, body) = call(
+            &send_router(state),
+            bearer_request(
+                Method::POST,
+                "/send",
+                Some(json!({ "app": APP, "topic": "all", "title": "Hi" })),
+                &key.key,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {}", body);
+        assert_eq!(fcm.message_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_rejects_other_apps_key_403() {
+        let (state, fcm) = send_state().await;
+        let key = create_key(&state, "otherapp").await;
+
+        let (status, _) = call(
+            &send_router(state),
+            bearer_request(
+                Method::POST,
+                "/send",
+                Some(json!({ "app": APP, "topic": "all", "title": "Hi" })),
+                &key.key,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(fcm.message_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn send_revoked_key_401_and_counts_failure() {
+        let (state, fcm) = send_state().await;
+        let key = create_key(&state, APP).await;
+        key_store(&state)
+            .revoke(APP, key.id)
+            .await
+            .expect("the revoke must run");
+
+        let request = || {
+            bearer_request(
+                Method::POST,
+                "/send",
+                Some(json!({ "app": APP, "topic": "all", "title": "Hi" })),
+                &key.key,
+            )
+        };
+        let (status, _) = call(&send_router(state.clone()), request()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(fcm.message_count(), 0);
+
+        // The failure is counted like every other authentication failure.
+        for _ in 0..9 {
+            let _ = call(&send_router(state.clone()), request()).await;
+        }
+        let (status, _) = call(&send_router(state), request()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn send_template_accepts_app_key_and_skips_senders() {
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        save_template(
+            &harness,
+            "news",
+            json!({
+                "enabled": true,
+                "senders": ["admin"],
+                "to": { "topic": "news" },
+                "title": "News",
+                "body": "Body"
+            }),
+        )
+        .await;
+        let key = create_key(&harness.state, APP).await;
+
+        let (status, body) = call_json(
+            &template_router(harness.state.clone()),
+            template_request(
+                json!({ "app": APP, "template": "news" }),
+                Some(&key.key),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {}", body);
+        assert_eq!(body["status"], "success");
+        assert_eq!(harness.fcm.message_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_template_app_key_uid_is_key_prefixed() {
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        save_template(
+            &harness,
+            "news",
+            json!({
+                "enabled": true,
+                "senders": ["admin"],
+                "to": { "topic": "news" },
+                "title": "News",
+                "body": "Body"
+            }),
+        )
+        .await;
+        let key = create_key(&harness.state, APP).await;
+
+        let (status, _) = call_json(
+            &template_router(harness.state.clone()),
+            template_request(
+                json!({ "app": APP, "template": "news" }),
+                Some(&key.key),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let sender_uid: Option<String> =
+            sqlx::query_scalar("SELECT sender_uid FROM notifications_history ORDER BY id DESC LIMIT 1")
+                .fetch_one(&harness.pool)
+                .await
+                .expect("the history row must exist");
+        assert_eq!(
+            sender_uid.as_deref(),
+            Some(format!("key:{}", key.id).as_str()),
+            "the key sender is prefixed"
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_create_accepts_app_key_without_review() {
+        let mut config = campaigns_config();
+        config["quota"] = json!({ "per_entity_per_day": 10, "per_entity_per_week": 50 });
+        let harness =
+            campaign_setup(FakeTransport::accepting(), one_company("company-1"), config).await;
+        let key = create_key(&harness.state, APP).await;
+
+        let (status, body) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(&key.key),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            body["status"], "sent",
+            "an application key sends without a review: {}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_cancel_and_list_accept_app_key() {
+        let mut config = campaigns_config();
+        config["review"] = json!({ "mode": "always" });
+        config["quota"] = json!({ "per_entity_per_day": 10, "per_entity_per_week": 50 });
+        let harness =
+            campaign_setup(FakeTransport::accepting(), one_company("company-1"), config).await;
+        let key = create_key(&harness.state, APP).await;
+
+        // The campaign of the company waits for the review; the application
+        // key then lists and cancels it.
+        let (status, body) = create_campaign_call(
+            &harness,
+            campaign_body("company-1", json!([["users"]])),
+            Some(&jwt("company-1", "company")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["status"], "pending_review");
+        let id = body["id"].as_i64().expect("an id");
+
+        let (status, body) = get_campaigns_call(&harness, &format!("app={}", APP), Some(&key.key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.as_array().expect("an array").len() >= 1);
+
+        let (status, body) = call_json(
+            &campaign_router(harness.state.clone()),
+            campaign_call(
+                Method::POST,
+                &format!("/campaigns/{}/cancel", id),
+                Some(json!({ "app": APP })),
+                Some(&key.key),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {}", body);
+        assert_eq!(body["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn topics_subscribe_accepts_app_key_for_own_app_only() {
+        let state = test_state(test_client()).await;
+        state
+            .project_map
+            .write()
+            .await
+            .insert(APP.to_string(), PROJECT.to_string());
+        let own = create_key(&state, APP).await;
+        let other = create_key(&state, "otherapp").await;
+
+        let body = json!({
+            "app": APP,
+            "topic": "news",
+            "tokens": ["token-0123456789abcdef0123456789abcdef"]
+        });
+
+        // The key of another app is refused.
+        let (status, _) = call(
+            &topics_router(state.clone()),
+            bearer_request(Method::POST, "/topics/subscribe", Some(body.clone()), &other.key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // The key of its own app passes the authorization: the request then
+        // stops at the service account, which is not loaded in this test.
+        let (status, text) = call(
+            &topics_router(state),
+            bearer_request(Method::POST, "/topics/subscribe", Some(body), &own.key),
+        )
+        .await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+        assert_ne!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {}", text);
+    }
+
+    #[tokio::test]
+    async fn app_key_rejected_on_admin_routes() {
+        let state = test_state(test_client()).await;
+        let key = create_key(&state, APP).await;
+
+        let router = admin::router(state.clone()).with_state(state);
+        let (status, _) = call(
+            &router,
+            bearer_request(Method::GET, "/apps", None, &key.key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn app_key_rejected_on_devices_routes() {
+        let state = test_state(test_client()).await;
+        state
+            .project_map
+            .write()
+            .await
+            .insert(APP.to_string(), PROJECT.to_string());
+        let key = create_key(&state, APP).await;
+
+        let router = Router::new()
+            .route("/devices/register", post(crate::register_device))
+            .with_state(state);
+        let (status, _) = call(
+            &router,
+            bearer_request(
+                Method::POST,
+                "/devices/register",
+                Some(json!({
+                    "app": APP,
+                    "token": "token-0123456789abcdef0123456789abcdef",
+                    "platform": "android"
+                })),
+                &key.key,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn legacy_key_still_send_only() {
+        let (state, _fcm) = send_state().await;
+
+        // The legacy key still sends.
+        let (status, _) = call(
+            &send_router(state.clone()),
+            bearer_request(
+                Method::POST,
+                "/send",
+                Some(json!({ "app": APP, "topic": "all", "title": "Hi" })),
+                LEGACY_KEY,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // It is still refused everywhere else.
+        let (status, _) = call(
+            &template_router(state),
+            bearer_request(
+                Method::POST,
+                "/send/template",
+                Some(json!({ "app": APP, "template": "news" })),
+                LEGACY_KEY,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn service_key_behaviour_unchanged() {
+        let (state, fcm) = send_state().await;
+
+        let (status, _) = call(
+            &send_router(state.clone()),
+            bearer_request(
+                Method::POST,
+                "/send",
+                Some(json!({ "app": APP, "topic": "all", "title": "Hi" })),
+                SERVICE_KEY,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fcm.message_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_fcm_prefixed_token_falls_to_401_not_identity_path() {
+        let (state, fcm) = send_state().await;
+
+        let (status, _) = call(
+            &send_router(state),
+            bearer_request(
+                Method::POST,
+                "/send",
+                Some(json!({ "app": APP, "topic": "all", "title": "Hi" })),
+                "fcm_testapp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(fcm.message_count(), 0);
+    }
+
+    #[test]
+    fn startup_warns_when_service_key_set() {
+        assert!(
+            warn_about_service_key(Some("a-service-key")),
+            "the warning is written when the key is set"
+        );
+        assert!(
+            !warn_about_service_key(None),
+            "no warning without the key"
+        );
+
+        // The warning is in the startup path.
+        let source = include_str!("main.rs");
+        assert!(source.contains("SERVICE_API_KEY is set; prefer per-app keys"));
+        assert!(source.contains("warn_about_service_key(service_api_key.as_deref())"));
     }
 }

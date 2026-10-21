@@ -10,6 +10,7 @@
 //! - The service key and the legacy API key are compared in constant time and are
 //!   never logged.
 
+use crate::appkeys::{AppKeyStore, KeyCheck, TrustedSender, APP_KEY_PREFIX};
 use crate::config::store::ConfigStore;
 use crate::config::{IdentityProvider as ProviderConfig, RoleSource, WebSubscribe};
 use crate::credentials::ProjectIdMap;
@@ -59,6 +60,14 @@ impl AdminIdentity {
 
     pub fn is_service(&self) -> bool {
         self.uid == "service"
+    }
+
+    /// The identity of an application key.
+    pub fn app_key(id: i64) -> Self {
+        Self {
+            uid: TrustedSender::app_key_uid(id),
+            email: None,
+        }
     }
 }
 
@@ -119,6 +128,8 @@ pub struct AuthService {
     config: Arc<ConfigStore>,
     auth_config: AuthConfig,
     roles: RoleResolver,
+    /// The application keys, when the service knows them.
+    app_keys: Option<Arc<AppKeyStore>>,
 }
 
 impl AuthService {
@@ -136,6 +147,62 @@ impl AuthService {
             config,
             auth_config,
             roles: RoleResolver::new(),
+            app_keys: None,
+        }
+    }
+
+    /// The same service with the application keys of the tool.
+    pub fn with_app_keys(
+        project_map: ProjectIdMap,
+        identity: Arc<IdentityRegistry>,
+        datasource: Arc<DataSourceRegistry>,
+        config: Arc<ConfigStore>,
+        auth_config: AuthConfig,
+        app_keys: Arc<AppKeyStore>,
+    ) -> Self {
+        Self {
+            project_map,
+            identity,
+            datasource,
+            config,
+            auth_config,
+            roles: RoleResolver::new(),
+            app_keys: Some(app_keys),
+        }
+    }
+
+    /// The application keys of the tool, when the service knows them.
+    pub fn app_keys(&self) -> Option<&Arc<AppKeyStore>> {
+        self.app_keys.as_ref()
+    }
+
+    /// The sender a bearer token stands for, if it is a trusted one.
+    ///
+    /// The service key is trusted for every app, an application key only for
+    /// its own app. A key of another app is refused with `403` and an unknown
+    /// or revoked key with `401`.
+    pub async fn trusted_sender(
+        &self,
+        headers: &HeaderMap,
+        app: &str,
+    ) -> Result<Option<TrustedSender>, AuthError> {
+        if self.verify_service_key(headers) {
+            return Ok(Some(TrustedSender::Service));
+        }
+        let Some(store) = self.app_keys.as_ref() else {
+            return Ok(None);
+        };
+        let Some(token) = bearer_token(headers) else {
+            return Ok(None);
+        };
+        if !token.starts_with(APP_KEY_PREFIX) {
+            return Ok(None);
+        }
+        match store.check(token, app).await {
+            KeyCheck::Valid { id } => Ok(Some(TrustedSender::AppKey { id })),
+            KeyCheck::WrongApp => Err(AuthError::Forbidden("Forbidden".to_string())),
+            KeyCheck::Invalid => Err(AuthError::Unauthorized("invalid application key")),
+            KeyCheck::NotAKey => Ok(None),
         }
     }
 
@@ -174,8 +241,10 @@ impl AuthService {
         headers: &HeaderMap,
         app: &str,
     ) -> Result<AdminIdentity, AuthError> {
-        if self.verify_service_key(headers) {
-            return Ok(AdminIdentity::service());
+        match self.trusted_sender(headers, app).await? {
+            Some(TrustedSender::Service) => return Ok(AdminIdentity::service()),
+            Some(TrustedSender::AppKey { id }) => return Ok(AdminIdentity::app_key(id)),
+            None => {}
         }
 
         let (policy, version) = self.policy_for(app);
@@ -200,8 +269,10 @@ impl AuthService {
         headers: &HeaderMap,
         app: &str,
     ) -> Result<AdminIdentity, AuthError> {
-        if self.verify_service_key(headers) {
-            return Ok(AdminIdentity::service());
+        match self.trusted_sender(headers, app).await? {
+            Some(TrustedSender::Service) => return Ok(AdminIdentity::service()),
+            Some(TrustedSender::AppKey { id }) => return Ok(AdminIdentity::app_key(id)),
+            None => {}
         }
 
         if self.verify_legacy_key(headers) {
@@ -529,8 +600,11 @@ impl AuthService {
         app: &str,
         topic: &str,
     ) -> Result<(TopicAccess, Option<UserIdentity>), AuthError> {
-        if self.verify_service_key(headers) {
-            return Ok((TopicAccess::Admin, None));
+        match self.trusted_sender(headers, app).await? {
+            Some(TrustedSender::Service) => return Ok((TopicAccess::Admin, None)),
+            // An application key is an admin of its own app.
+            Some(TrustedSender::AppKey { .. }) => return Ok((TopicAccess::Admin, None)),
+            None => {}
         }
 
         let snapshot = self.config.get(app);
