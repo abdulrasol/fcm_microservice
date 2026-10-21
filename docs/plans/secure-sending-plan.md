@@ -684,7 +684,7 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
   التكرار ⇐ `duplicate`. `UNREGISTERED` يحذف الجهاز. نفس القالب يعمل بمزود JWT + مصدر http.
 
 ### T9 — الحملات: الإنشاء والإرسال
-- **الحالة:** ⬜
+- **الحالة:** ✅
 - **الملفات:** `src/campaigns.rs`، `src/db.rs`، `src/main.rs`.
 - **الخطوات:** التحقق من `entity` والحظر، بناء الشرط، قواعد المحتوى، الحصة، `review.mode`، `GET`/`cancel`.
 - **طريقة الفحص:** شركة pending ⇐ 403. شركة غيره ⇐ 403. `admins` في الجمهور ⇐ 400. 5 topics + promos ⇐ 400.
@@ -692,7 +692,7 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
   أول 3 ⇐ `pending_review` والرابعة ⇐ `sent`. الشرط المبني يطابق نصاً متوقعاً حرفياً.
 
 ### T10 — واجهات الداشبورد (backend)
-- **الحالة:** ⬜
+- **الحالة:** 🔄 (الشريحة A منفذة؛ B وC متبقيتان)
 - **الملفات:** `src/admin/apps.rs`، `src/admin/templates.rs`، `src/admin/campaigns.rs`، `src/admin/keys.rs`، `src/admin/users.rs`، `src/admin/mod.rs`.
 - **الخطوات:** كل مسارات جدول "واجهات الداشبورد" في 3.11، بما فيها `validate` و`preview` (بلا إرسال) و`test-send` (لأجهزة `test_uid` فقط)
   و`identity/test` و`data_source/test` والموافقة/الرفض والحظر.
@@ -882,3 +882,5 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
 | 2026-10-21 | T7 — محرك القوالب | 🔄 بانتظار المراجعة | `segments()` في `config/placeholder.rs` (إضافة صرفة: 116 سطراً، 0 محذوف) + `src/template.rs`: `validate_params` (text/pattern/enum/int، حدود 4096 بايت و200 للـpattern و`size_limit` للمترجم) ثم `context_path` (مقطع مسار واحد) ثم `render` (مرور واحد، `|int` بتقريب بعيداً عن الصفر، `require` موحّد 403، `vars` كسولة، حدود `validation.rs`). بلا شبكة/قاعدة بيانات/`AppState`. 285 اختباراً ناجحاً (43 جديداً). التقرير: `docs/plans/reports/T7-report.md` |
 | 2026-10-21 | T8 — إرسال القوالب | ✅ | `src/send.rs`: `FcmTransport`/`HttpFcm`/`FcmOutcome`/`build_message`/`send_to_tokens` (JoinSet + Semaphore، بلا إعادة محاولة) ونقل نداء FCM من `main.rs` بلا تغيير ردود `/send` (4 اختبارات توصيف). `POST /api/v1/send/template` بالترتيب: app ⇒ IP ⇒ (مفتاح خدمة أو هوية + دور) ⇒ قالب مفعّل ⇒ senders ⇒ حد/uid ⇒ params ⇒ doc ⇒ render ⇒ `validation.rs` ⇒ dedupe ⇒ أجهزة ⇒ إرسال ⇒ سجل. `db.rs`: `kind`/`ref`، `template_dedupe` (SHA-256، ذرّية، انتهاء)، `touch_template_used` (يغيّر `last_used_at` فقط)، `TemplateRateLimiter` (نافذة ساعة، سقف 10k). إصلاح T8-F: تحرير مفتاح dedupe عند كل خروج لا يسلّم (أجهزة/دور/بيانات/credentials) مع 5 اختبارات. 335 اختباراً ناجحاً (50 جديداً). التقريران: `docs/plans/reports/T8-report.md` و`T8-fix-report.md` |
 | 2026-10-21 | T9 — حملات الشركات | 🔄 بانتظار المراجعة | `src/campaigns.rs`: `build_condition` (مجموعات ⇒ شرط حرفي، `allowed_topics` حرفي/`*`/`{p.param}`، ≤5 مع promos، تفريد داخل المجموعة) + محتوى (`title_max`/`body_max`، منع روابط best-effort، صورة بمضيف تام من `image_hosts`، إجراء من `actions` مع `check` ⇒ 403 موحد) + `resolve_entity`/`check_action`/`dispatch_campaign`/`insert_campaign`. `db.rs`: `campaigns`/`campaign_blocks` + فهرسان بصيغة 3.14، `insert_campaign_checked` (حصة 24h/7d داخل معاملة تحت قفل كتابة، `retry_after` ≥1)، `review.mode` (`first_n` يعدّ `sent|sending` فقط، service يتخطى)، `get/list/claim/cancel/finish/is_entity_blocked`. `template.rs`: `Snippet`/`render_snippet`/`validate_param_map`/`check_require_map` بإعادة هيكلة داخلية بلا تعديل اختبارات T7. المسارات: `POST|GET /api/v1/campaigns` و`POST /api/v1/campaigns/{id}/cancel` بالترتيب 12 خطوة وتوحيد 403/404. 394 اختباراً ناجحاً (59 جديداً)، clippy 0، والتجارب الخمس موثقة. التقرير: `docs/plans/reports/T9-report.md` |
+| 2026-10-21 | T9 — قرار المراجع | ✅ | حقن العنوان 201 مقبول (العنوان لا يدخل الشرط)؛ `#[allow(dead_code)]` على `claim_for_sending` يبقى حتى T10-B؛ تعافي الحملات العالقة في `sending` مؤجل إلى T10-B |
+| 2026-10-21 | T10-A — تطبيقات وقوالب وإصدارات وتدقيق | 🔄 بانتظار المراجعة | `src/admin/apps.rs` (تطبيقات/أقسام/إصدارات/استيراد/تصدير/تدقيق) و`src/admin/templates.rs` (CRUD/validate/enable/delete/preview/test-send) + `authorize` و`AdminError` في `mod.rs` + قراءات `db.rs` + قاعدة `context.require` في `validate.rs`. 450 اختباراً ناجحاً (56 جديداً)، clippy 0، 5 تجارب سلبية مستعادة بـ`sha256`. التقرير: `docs/plans/reports/T10A-report.md` |
