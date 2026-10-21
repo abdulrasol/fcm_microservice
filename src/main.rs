@@ -3,6 +3,7 @@ mod auth;
 mod cli;
 mod config;
 mod credentials;
+mod datasource;
 mod db;
 mod identity;
 mod ratelimit;
