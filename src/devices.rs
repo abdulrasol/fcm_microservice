@@ -7,14 +7,24 @@
 //! Role-targeted sending (T8/T9) reads the member uids of a role from the app's
 //! data source through [`RoleDirectory`] and then looks their tokens up here.
 
+use crate::config::RoleMembers;
+use crate::datasource::DataSource;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 
 /// Eviction limit bounds, from the plan (3.8): values outside are clamped.
 const MIN_PER_UID: u32 = 1;
 const MAX_PER_UID: u32 = 20;
+
+/// A role lookup never returns more tokens than this (T8/T9).
+const MAX_ROLE_TOKENS: usize = 5000;
+
+/// Largest number of cached role lookups.
+const ROLE_CACHE_ENTRIES: usize = 256;
 
 /// The platform that registered the token. Unknown values are rejected by
 /// serde, which the routes turn into a `400`.
@@ -38,7 +48,6 @@ impl Platform {
 
 /// Why a device operation failed.
 #[derive(Debug)]
-#[allow(dead_code)] // The role directory uses the remaining variants from T6-2.
 pub enum DeviceError {
     /// The database failed. The message is generic: no token is ever echoed.
     Database(sqlx::Error),
@@ -97,7 +106,6 @@ pub fn validate_token(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(dead_code)] // Used by the role directory in T6-2.
 fn validate_role_value(value: &str) -> Result<(), DeviceError> {
     if value.is_empty()
         || value.len() > 64
@@ -260,14 +268,143 @@ impl DeviceStore {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    /// The tokens of every uid that holds `role_value`, capped at
+    /// [`MAX_ROLE_TOKENS`]. `None` means the app has no `role_members`
+    /// configuration.
+    #[allow(dead_code)] // Wired to role-targeted sending in T8/T9.
+    pub async fn tokens_for_role(
+        &self,
+        app: &str,
+        version: i64,
+        role_members: Option<&RoleMembers>,
+        role_value: &str,
+        directory: &RoleDirectory,
+        source: &dyn DataSource,
+    ) -> Result<Vec<String>, DeviceError> {
+        let Some(config) = role_members else {
+            return Err(DeviceError::NotConfigured);
+        };
+        let uids = directory
+            .uids_for_role(app, version, config, role_value, source)
+            .await?;
+        self.tokens_for_uids(app, &uids, MAX_ROLE_TOKENS).await
+    }
+}
+
+type RoleCacheKey = (String, i64, String);
+
+struct RoleCacheEntry {
+    uids: Vec<String>,
+    expires_at: Instant,
+}
+
+/// Cache of role member lookups, keyed by `(app, config version, role value)`
+/// so saving a new configuration invalidates it. Errors are never cached.
+#[allow(dead_code)] // Wired to role-targeted sending in T8/T9.
+pub struct RoleDirectory {
+    entries: Mutex<HashMap<RoleCacheKey, RoleCacheEntry>>,
+}
+
+#[allow(dead_code)] // Wired to role-targeted sending in T8/T9.
+impl Default for RoleDirectory {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[allow(dead_code)] // Wired to role-targeted sending in T8/T9.
+impl RoleDirectory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Member uids of `role_value`, from the cache when it is still fresh.
+    ///
+    /// `cache_seconds == 0` disables caching. A data-source failure is
+    /// [`DeviceError::Unavailable`] (fail closed) and is not cached.
+    pub async fn uids_for_role(
+        &self,
+        app: &str,
+        version: i64,
+        config: &RoleMembers,
+        role_value: &str,
+        source: &dyn DataSource,
+    ) -> Result<Vec<String>, DeviceError> {
+        validate_role_value(role_value)?;
+
+        let key = (app.to_string(), version, role_value.to_string());
+        if config.cache_seconds > 0 {
+            let now = Instant::now();
+            let cached = lock(&self.entries)
+                .get(&key)
+                .filter(|entry| entry.expires_at > now)
+                .map(|entry| entry.uids.clone());
+            if let Some(uids) = cached {
+                return Ok(uids);
+            }
+        }
+
+        // The lock is never held across this await.
+        let uids = source
+            .members(
+                &config.collection,
+                &config.field,
+                role_value,
+                config.max as usize,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    app = %app,
+                    error = ?error,
+                    "the role member lookup failed"
+                );
+                DeviceError::Unavailable("the role lookup failed".to_string())
+            })?;
+
+        if config.cache_seconds > 0 {
+            let now = Instant::now();
+            let expires_at = now
+                .checked_add(Duration::from_secs(config.cache_seconds))
+                .unwrap_or(now);
+            let mut entries = lock(&self.entries);
+            if !entries.contains_key(&key) && entries.len() >= ROLE_CACHE_ENTRIES {
+                entries.retain(|_, entry| entry.expires_at > now);
+                if entries.len() >= ROLE_CACHE_ENTRIES {
+                    entries.clear();
+                }
+            }
+            entries.insert(
+                key,
+                RoleCacheEntry {
+                    uids: uids.clone(),
+                    expires_at,
+                },
+            );
+        }
+
+        Ok(uids)
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datasource::{DataError, Doc};
     use serde_json::json;
+    use async_trait::async_trait;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     const APP: &str = "test-app";
@@ -294,6 +431,15 @@ mod tests {
 
     fn token(number: usize) -> String {
         format!("device-token-{number:0>24}")
+    }
+
+    fn role_members(cache_seconds: u64) -> RoleMembers {
+        RoleMembers {
+            collection: "users".to_string(),
+            field: "role".to_string(),
+            cache_seconds,
+            max: 50,
+        }
     }
 
     // ---------- store ----------
@@ -716,4 +862,205 @@ mod tests {
             .expect_err("a closed pool must fail");
         assert!(!error.to_string().contains(&token));
     }
+
+    // ---------- role directory ----------
+
+    struct FakeSource {
+        calls: AtomicUsize,
+        result: Mutex<Result<Vec<String>, DataError>>,
+    }
+
+    impl FakeSource {
+        fn ok(uids: &[&str]) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                result: Mutex::new(Ok(uids.iter().map(|uid| uid.to_string()).collect())),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                result: Mutex::new(Err(DataError::Unavailable("down".to_string()))),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn set(&self, uids: &[&str]) {
+            *lock(&self.result) = Ok(uids.iter().map(|uid| uid.to_string()).collect());
+        }
+    }
+
+    #[async_trait]
+    impl DataSource for FakeSource {
+        async fn get_doc(&self, _path: &str) -> Result<Option<Doc>, DataError> {
+            Ok(None)
+        }
+
+        async fn members(
+            &self,
+            _collection: &str,
+            _field: &str,
+            _value: &str,
+            _limit: usize,
+        ) -> Result<Vec<String>, DataError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            lock(&self.result).clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn role_uids_cached_within_ttl() {
+        let directory = RoleDirectory::new();
+        let source = FakeSource::ok(&["uid-1", "uid-2"]);
+        let config = role_members(300);
+
+        let first = directory
+            .uids_for_role(APP, 1, &config, "admin", &source)
+            .await
+            .expect("the first lookup");
+        let second = directory
+            .uids_for_role(APP, 1, &config, "admin", &source)
+            .await
+            .expect("the cached lookup");
+
+        assert_eq!(first, second);
+        assert_eq!(source.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn role_uids_zero_ttl_not_cached() {
+        let directory = RoleDirectory::new();
+        let source = FakeSource::ok(&["uid-1"]);
+        let config = role_members(0);
+
+        for _ in 0..2 {
+            directory
+                .uids_for_role(APP, 1, &config, "admin", &source)
+                .await
+                .expect("the lookup");
+        }
+        assert_eq!(source.calls(), 2);
+        assert!(lock(&directory.entries).is_empty());
+    }
+
+    #[tokio::test]
+    async fn role_uids_cache_invalidated_by_config_version() {
+        let directory = RoleDirectory::new();
+        let source = FakeSource::ok(&["uid-1"]);
+        let config = role_members(300);
+
+        directory
+            .uids_for_role(APP, 1, &config, "admin", &source)
+            .await
+            .expect("the first version");
+        directory
+            .uids_for_role(APP, 1, &config, "admin", &source)
+            .await
+            .expect("the cached version");
+        assert_eq!(source.calls(), 1);
+
+        directory
+            .uids_for_role(APP, 2, &config, "admin", &source)
+            .await
+            .expect("the second version");
+        assert_eq!(source.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn role_uids_source_error_is_unavailable_and_not_cached() {
+        let directory = RoleDirectory::new();
+        let source = FakeSource::failing();
+        let config = role_members(300);
+
+        let error = directory
+            .uids_for_role(APP, 1, &config, "admin", &source)
+            .await
+            .expect_err("a failing source must fail closed");
+        assert!(matches!(error, DeviceError::Unavailable(_)));
+        assert_eq!(source.calls(), 1);
+
+        source.set(&["uid-1"]);
+        let uids = directory
+            .uids_for_role(APP, 1, &config, "admin", &source)
+            .await
+            .expect("the error must not be cached");
+        assert_eq!(uids, vec!["uid-1".to_string()]);
+        assert_eq!(source.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn role_value_validation_rejects_injection_like_input() {
+        let directory = RoleDirectory::new();
+        let source = FakeSource::ok(&["uid-1"]);
+        let config = role_members(300);
+
+        for invalid in [
+            "",
+            "admin' OR '1'='1",
+            "admin role",
+            "admin;drop",
+            "x".repeat(65).as_str(),
+            "admín",
+        ] {
+            let error = directory
+                .uids_for_role(APP, 1, &config, invalid, &source)
+                .await
+                .expect_err("the value must be rejected");
+            assert!(
+                matches!(error, DeviceError::InvalidRoleValue),
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(source.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn role_cache_is_bounded() {
+        let directory = RoleDirectory::new();
+        let source = FakeSource::ok(&[]);
+        let config = role_members(300);
+
+        for number in 0..300 {
+            directory
+                .uids_for_role(APP, 1, &config, &format!("role-{number}"), &source)
+                .await
+                .expect("the lookup");
+        }
+
+        let entries = lock(&directory.entries).len();
+        assert!(entries <= ROLE_CACHE_ENTRIES, "cache grew to {entries}");
+        assert!(entries >= 1);
+    }
+
+    #[tokio::test]
+    async fn tokens_for_role_requires_role_members_config() {
+        let store = store().await;
+        let directory = RoleDirectory::new();
+        let source = FakeSource::ok(&["uid-1"]);
+
+        let error = store
+            .tokens_for_role(APP, 1, None, "admin", &directory, &source)
+            .await
+            .expect_err("the missing configuration must be reported");
+        assert!(matches!(error, DeviceError::NotConfigured));
+        assert_eq!(source.calls(), 0);
+
+        let tokens = store
+            .tokens_for_role(
+                APP,
+                1,
+                Some(&role_members(300)),
+                "admin",
+                &directory,
+                &source,
+            )
+            .await
+            .expect("the configured lookup");
+        assert!(tokens.is_empty());
+    }
+
 }
