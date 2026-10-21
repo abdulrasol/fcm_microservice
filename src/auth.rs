@@ -507,8 +507,13 @@ impl AuthService {
             return Ok((TopicAccess::Admin, None));
         }
 
+        let snapshot = self.config.get(app);
+        let web_subscribe = snapshot
+            .as_ref()
+            .map(|snapshot| &snapshot.config.web_subscribe);
+
         if let Some(identity) = self.authenticated_identity(headers, app).await {
-            if topic_allowed(topic, TopicAccess::User, None) {
+            if topic_allowed(topic, TopicAccess::User, web_subscribe) {
                 return Ok((TopicAccess::User, Some(UserIdentity { uid: identity.uid })));
             }
             if self.is_admin_identity(app, &identity).await? {
@@ -519,7 +524,7 @@ impl AuthService {
             )));
         }
 
-        if topic_allowed(topic, TopicAccess::Anonymous, None) {
+        if topic_allowed(topic, TopicAccess::Anonymous, web_subscribe) {
             Ok((TopicAccess::Anonymous, None))
         } else {
             Err(AuthError::Forbidden(format!(
@@ -1433,6 +1438,91 @@ mod tests {
                 .await,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn web_subscribe_custom_patterns_allow_and_deny() {
+        let store = memory_store().await;
+        save_app(
+            &store,
+            APP,
+            &[
+                ("identity", jwt_identity(claim_role("role"), &["admin"])),
+                (
+                    "web_subscribe",
+                    json!({
+                        "anonymous": ["all", "country_*"],
+                        "signed_in": ["users", "cat_*"]
+                    }),
+                ),
+            ],
+        )
+        .await;
+        let service = auth_service(store, &[(APP, PROJECT)], Arc::new(FakeEnv::jwt()));
+        let user = bearer(&token("uid-1", "user"));
+
+        for topic in ["all", "country_us", "users", "cat_books"] {
+            let (access, _) = service
+                .authorize_topic(&user, APP, topic)
+                .await
+                .expect("the configured pattern must allow the topic");
+            assert_eq!(access, TopicAccess::User, "{topic}");
+        }
+        for topic in ["admins", "lang_ar"] {
+            match service.authorize_topic(&user, APP, topic).await {
+                Err(AuthError::Forbidden(_)) => {}
+                other => panic!("{topic} must be forbidden, got {other:?}"),
+            }
+        }
+
+        let anonymous = HeaderMap::new();
+        for topic in ["all", "country_us"] {
+            let (access, _) = service
+                .authorize_topic(&anonymous, APP, topic)
+                .await
+                .expect("the anonymous pattern must allow the topic");
+            assert_eq!(access, TopicAccess::Anonymous, "{topic}");
+        }
+        match service.authorize_topic(&anonymous, APP, "users").await {
+            Err(AuthError::Forbidden(_)) => {}
+            other => panic!("users must be forbidden for anonymous, got {other:?}"),
+        }
+
+        let admin = bearer(&token("uid-admin", "admin"));
+        let (access, _) = service
+            .authorize_topic(&admin, APP, "admins")
+            .await
+            .expect("an admin role allows every valid topic");
+        assert_eq!(access, TopicAccess::Admin);
+    }
+
+    #[tokio::test]
+    async fn legacy_hardcoded_topics_not_applied_to_configured_app() {
+        let store = memory_store().await;
+        save_app(
+            &store,
+            APP,
+            &[
+                ("identity", jwt_identity(claim_role("role"), &["admin"])),
+                (
+                    "web_subscribe",
+                    json!({ "anonymous": [], "signed_in": ["promos"] }),
+                ),
+            ],
+        )
+        .await;
+        let service = auth_service(store, &[(APP, PROJECT)], Arc::new(FakeEnv::jwt()));
+        let user = bearer(&token("uid-1", "user"));
+
+        match service.authorize_topic(&user, APP, "users").await {
+            Err(AuthError::Forbidden(_)) => {}
+            other => panic!("users must not be inherited, got {other:?}"),
+        }
+        let (access, _) = service
+            .authorize_topic(&user, APP, "promos")
+            .await
+            .expect("the configured topic must be allowed");
+        assert_eq!(access, TopicAccess::User);
     }
 
     #[tokio::test]
