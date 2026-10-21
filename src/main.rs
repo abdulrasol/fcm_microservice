@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod credentials;
 mod db;
+mod identity;
 mod ratelimit;
 mod topics;
 mod validation;

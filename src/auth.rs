@@ -1,20 +1,19 @@
-//! Firebase ID-token verification and authorization helpers.
+//! Authorization helpers built on top of the identity providers.
 //!
 //! Design notes:
-//! - ID tokens are verified locally (RS256) against Google's public JWKs, so the
-//!   service account private key never signs user tokens.
-//! - JWKs are cached in memory and refreshed according to `Cache-Control: max-age`.
-//!   An unknown `kid` triggers at most one refresh per [`MIN_JWK_REFRESH`].
+//! - ID tokens are verified by [`FirebaseVerifier`] (RS256 against Google's
+//!   public JWKs), so the service account private key never signs user tokens.
 //! - Admin status is read from Firestore `users/{uid}` using the per-app service
 //!   account with the `datastore` scope. Results are cached for 60 seconds.
 //! - The service key and the legacy API key are compared in constant time and are
 //!   never logged.
 
 use crate::credentials::AuthMap;
+use crate::identity::is_valid_uid;
+use crate::identity::jwks::JwksCache;
+use crate::identity::{Identity, IdentityError, MAX_TOKEN_LENGTH};
 use async_trait::async_trait;
 use axum::http::{header, HeaderMap, StatusCode};
-use jsonwebtoken::jwk::{JwkSet, KeyAlgorithm};
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -24,22 +23,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
+pub use crate::identity::firebase::FirebaseVerifier;
+#[cfg(test)]
+pub use crate::identity::jwks::FetchedJwks;
+pub use crate::identity::jwks::{GoogleJwkProvider, JwkProvider};
+
 use crate::credentials::ProjectIdMap;
 
-/// Google's public keys for Firebase Auth ID tokens.
-const JWK_URL: &str =
-    "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com";
-const SECURETOKEN_ISSUER_PREFIX: &str = "https://securetoken.google.com/";
-const CLOCK_LEEWAY_SECONDS: u64 = 60;
-const MAX_TOKEN_LENGTH: usize = 8192;
-const MAX_KID_LENGTH: usize = 128;
-const MAX_UID_LENGTH: usize = 128;
 const ADMIN_CACHE_TTL: Duration = Duration::from_secs(60);
 const ADMIN_CACHE_MAX_ENTRIES: usize = 4096;
-const MIN_JWK_REFRESH: Duration = Duration::from_secs(60);
-const DEFAULT_JWK_MAX_AGE: Duration = Duration::from_secs(60 * 60);
-const MAX_JWK_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
-const MIN_JWK_MAX_AGE: Duration = Duration::from_secs(60);
 const FIRESTORE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,16 +110,6 @@ pub struct AuthConfig {
     pub legacy_enabled: bool,
 }
 
-pub struct FetchedJwks {
-    pub keys: HashMap<String, DecodingKey>,
-    pub max_age: Duration,
-}
-
-#[async_trait]
-pub trait JwkProvider: Send + Sync {
-    async fn fetch_keys(&self) -> Result<FetchedJwks, String>;
-}
-
 #[async_trait]
 pub trait FirestoreReader: Send + Sync {
     /// Returns `Ok(None)` when the user document does not exist. Any transport,
@@ -139,69 +121,6 @@ pub trait FirestoreReader: Send + Sync {
         project_id: &str,
         uid: &str,
     ) -> Result<Option<Value>, String>;
-}
-
-pub struct GoogleJwkProvider {
-    client: reqwest::Client,
-}
-
-impl GoogleJwkProvider {
-    pub fn new(client: reqwest::Client) -> Self {
-        Self { client }
-    }
-}
-
-#[async_trait]
-impl JwkProvider for GoogleJwkProvider {
-    async fn fetch_keys(&self) -> Result<FetchedJwks, String> {
-        let response = self
-            .client
-            .get(JWK_URL)
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|_| "could not reach the Google JWK endpoint".to_string())?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(format!("Google JWK endpoint returned HTTP {status}"));
-        }
-
-        let max_age = response
-            .headers()
-            .get(reqwest::header::CACHE_CONTROL)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_cache_max_age)
-            .unwrap_or(DEFAULT_JWK_MAX_AGE)
-            .clamp(MIN_JWK_MAX_AGE, MAX_JWK_MAX_AGE);
-
-        let set: JwkSet = response
-            .json()
-            .await
-            .map_err(|_| "Google JWK response was not valid JSON".to_string())?;
-
-        let mut keys = HashMap::new();
-        for jwk in set.keys {
-            if jwk.common.key_algorithm != Some(KeyAlgorithm::RS256) {
-                continue;
-            }
-            let Some(kid) = jwk.common.key_id.clone() else {
-                continue;
-            };
-            if kid.len() > MAX_KID_LENGTH {
-                continue;
-            }
-            if let Ok(key) = DecodingKey::from_jwk(&jwk) {
-                keys.insert(kid, key);
-            }
-        }
-
-        if keys.is_empty() {
-            return Err("Google JWK response contained no usable RS256 keys".to_string());
-        }
-
-        Ok(FetchedJwks { keys, max_age })
-    }
 }
 
 pub struct FirestoreHttp {
@@ -278,39 +197,19 @@ impl FirestoreReader for FirestoreHttp {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct RawClaims {
-    sub: Option<String>,
-    aud: Option<Value>,
-    iss: Option<String>,
-    exp: Option<u64>,
-    iat: Option<u64>,
-    auth_time: Option<u64>,
-    email: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct VerifiedClaims {
-    uid: String,
-    email: Option<String>,
-}
-
-struct JwkCache {
-    keys: HashMap<String, DecodingKey>,
-    expires_at: Instant,
-    last_refresh: Instant,
-}
-
 struct AdminCache {
     entries: HashMap<(String, String), (bool, Instant)>,
 }
 
 pub struct AuthService {
     project_map: ProjectIdMap,
-    jwks: Arc<dyn JwkProvider>,
+    verifier: FirebaseVerifier,
     firestore: Arc<dyn FirestoreReader>,
     config: AuthConfig,
-    jwk_cache: Mutex<JwkCache>,
+    /// The Firebase JWKS cache, shared with the verifier. It is kept as a field
+    /// so tests can simulate a stale cache.
+    #[allow(dead_code)]
+    jwk_cache: Arc<Mutex<JwksCache>>,
     admin_cache: Mutex<AdminCache>,
 }
 
@@ -321,16 +220,13 @@ impl AuthService {
         firestore: Arc<dyn FirestoreReader>,
         config: AuthConfig,
     ) -> Self {
+        let jwk_cache = Arc::new(Mutex::new(JwksCache::new()));
         Self {
             project_map,
-            jwks,
+            verifier: FirebaseVerifier::with_cache(jwks, jwk_cache.clone()),
             firestore,
             config,
-            jwk_cache: Mutex::new(JwkCache {
-                keys: HashMap::new(),
-                expires_at: Instant::now(),
-                last_refresh: Instant::now() - MIN_JWK_REFRESH,
-            }),
+            jwk_cache,
             admin_cache: Mutex::new(AdminCache {
                 entries: HashMap::new(),
             }),
@@ -502,132 +398,19 @@ impl AuthService {
         &self,
         headers: &HeaderMap,
         project_id: &str,
-    ) -> Result<VerifiedClaims, AuthError> {
+    ) -> Result<Identity, AuthError> {
         let token = bearer_token(headers).ok_or(AuthError::Unauthorized("missing bearer token"))?;
         self.verify_token(token, project_id).await
     }
 
-    async fn verify_token(
-        &self,
-        token: &str,
-        project_id: &str,
-    ) -> Result<VerifiedClaims, AuthError> {
-        if token.len() > MAX_TOKEN_LENGTH {
-            return Err(AuthError::Unauthorized("token is too long"));
-        }
-
-        let header =
-            decode_header(token).map_err(|_| AuthError::Unauthorized("malformed ID token"))?;
-        if header.alg != Algorithm::RS256 {
-            return Err(AuthError::Unauthorized(
-                "unsupported token algorithm; RS256 is required",
-            ));
-        }
-        let kid = header
-            .kid
-            .filter(|kid| !kid.is_empty() && kid.len() <= MAX_KID_LENGTH)
-            .ok_or(AuthError::Unauthorized("token has no valid kid"))?;
-
-        let key = self
-            .decoding_key(&kid)
-            .await?
-            .ok_or(AuthError::Unauthorized("unknown token signing key"))?;
-
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.leeway = CLOCK_LEEWAY_SECONDS;
-        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
-        validation.set_issuer(&[format!("{SECURETOKEN_ISSUER_PREFIX}{project_id}")]);
-        validation.set_audience(&[project_id]);
-
-        let data = decode::<RawClaims>(token, &key, &validation)
-            .map_err(|_| AuthError::Unauthorized("invalid ID token"))?;
-        let claims = data.claims;
-
-        let now = jsonwebtoken::get_current_timestamp();
-        let exp = claims
-            .exp
-            .ok_or(AuthError::Unauthorized("token is missing exp"))?;
-        if now > exp.saturating_add(CLOCK_LEEWAY_SECONDS) {
-            return Err(AuthError::Unauthorized("token has expired"));
-        }
-        let iat = claims
-            .iat
-            .ok_or(AuthError::Unauthorized("token is missing iat"))?;
-        if iat > now.saturating_add(CLOCK_LEEWAY_SECONDS) {
-            return Err(AuthError::Unauthorized("token was issued in the future"));
-        }
-        let auth_time = claims
-            .auth_time
-            .ok_or(AuthError::Unauthorized("token is missing auth_time"))?;
-        if auth_time > now {
-            return Err(AuthError::Unauthorized("token auth_time is in the future"));
-        }
-
-        let uid = claims
-            .sub
-            .filter(|sub| is_valid_uid(sub) && !sub.trim().is_empty())
-            .ok_or(AuthError::Unauthorized("token has no valid sub"))?;
-
-        // These checks are redundant with `Validation` but make the contract
-        // explicit if the validation setup is ever changed.
-        let expected_iss = format!("{SECURETOKEN_ISSUER_PREFIX}{project_id}");
-        if claims.iss.as_deref() != Some(expected_iss.as_str()) {
-            return Err(AuthError::Unauthorized("invalid token issuer"));
-        }
-        if !audience_matches(claims.aud.as_ref(), project_id) {
-            return Err(AuthError::Unauthorized("invalid token audience"));
-        }
-
-        Ok(VerifiedClaims {
-            uid,
-            email: claims.email,
-        })
-    }
-
-    async fn decoding_key(&self, kid: &str) -> Result<Option<DecodingKey>, AuthError> {
-        let now = Instant::now();
-        let (cached, expired) = {
-            let cache = lock(&self.jwk_cache);
-            (cache.keys.get(kid).cloned(), now >= cache.expires_at)
-        };
-        if !expired && cached.is_some() {
-            return Ok(cached);
-        }
-
-        let may_refresh = {
-            let cache = lock(&self.jwk_cache);
-            now.duration_since(cache.last_refresh) >= MIN_JWK_REFRESH
-        };
-        if !may_refresh {
-            return if expired {
-                Err(AuthError::Unavailable(
-                    "Firebase signing keys expired and refresh is throttled".to_string(),
-                ))
-            } else {
-                Ok(None)
-            };
-        }
-
-        {
-            let mut cache = lock(&self.jwk_cache);
-            cache.last_refresh = now;
-        }
-        self.refresh_keys().await?;
-
-        let cache = lock(&self.jwk_cache);
-        Ok(cache.keys.get(kid).cloned())
-    }
-
-    async fn refresh_keys(&self) -> Result<(), AuthError> {
-        let fetched = self.jwks.fetch_keys().await.map_err(|reason| {
-            AuthError::Unavailable(format!("Firebase signing keys unavailable: {reason}"))
-        })?;
-
-        let max_age = fetched.max_age.clamp(MIN_JWK_MAX_AGE, MAX_JWK_MAX_AGE);
-        let mut cache = lock(&self.jwk_cache);
-        cache.keys = fetched.keys;
-        cache.expires_at = Instant::now() + max_age;
-        Ok(())
+    async fn verify_token(&self, token: &str, project_id: &str) -> Result<Identity, AuthError> {
+        self.verifier
+            .verify(token, project_id)
+            .await
+            .map_err(|error| match error {
+                IdentityError::Invalid(reason) => AuthError::Unauthorized(reason),
+                IdentityError::Unavailable(reason) => AuthError::Unavailable(reason),
+            })
     }
 
     async fn uid_is_admin(
@@ -786,16 +569,6 @@ fn unverified_audience(token: &str) -> Option<String> {
     }
 }
 
-fn audience_matches(aud: Option<&Value>, project_id: &str) -> bool {
-    match aud {
-        Some(Value::String(value)) => value == project_id,
-        Some(Value::Array(values)) => values
-            .iter()
-            .any(|value| value.as_str() == Some(project_id)),
-        _ => false,
-    }
-}
-
 fn role_is_admin(document: &Value) -> bool {
     document
         .get("fields")
@@ -803,10 +576,6 @@ fn role_is_admin(document: &Value) -> bool {
         .and_then(|role| role.get("stringValue"))
         .and_then(Value::as_str)
         == Some("admin")
-}
-
-pub(crate) fn is_valid_uid(uid: &str) -> bool {
-    !uid.is_empty() && uid.len() <= MAX_UID_LENGTH
 }
 
 /// Percent-encode a Firestore document id safely (slashes must not create new
@@ -821,16 +590,6 @@ fn encode_path_segment(value: &str) -> String {
         }
     }
     encoded
-}
-
-pub(crate) fn parse_cache_max_age(value: &str) -> Option<Duration> {
-    value.split(',').find_map(|directive| {
-        let (name, value) = directive.trim().split_once('=')?;
-        if !name.trim().eq_ignore_ascii_case("max-age") {
-            return None;
-        }
-        value.trim().parse::<u64>().ok().map(Duration::from_secs)
-    })
 }
 
 /// Client IP for rate limiting. `X-Forwarded-For` is only trusted behind a proxy.
@@ -855,7 +614,10 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, trust_proxy: boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use crate::identity::firebase::SECURETOKEN_ISSUER_PREFIX;
+    use crate::identity::jwks::{parse_cache_max_age, MIN_JWK_REFRESH};
+    use crate::identity::MAX_UID_LENGTH;
+    use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
     use rand::rngs::OsRng;
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
     use rsa::RsaPrivateKey;
