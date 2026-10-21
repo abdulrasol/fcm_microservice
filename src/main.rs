@@ -9,6 +9,7 @@ mod devices;
 mod identity;
 mod ratelimit;
 mod roles;
+mod template;
 mod topics;
 mod validation;
 
