@@ -58,6 +58,29 @@ impl RateLimiter {
         hits.push_back(now);
         true
     }
+
+    /// Returns `true` when `key` has used its whole budget in the current
+    /// window, without recording a hit. Callers use it to refuse a request
+    /// before doing the expensive work (e.g. password hashing).
+    pub fn is_blocked(&self, key: &str) -> bool {
+        self.is_blocked_at(key, Instant::now())
+    }
+
+    fn is_blocked_at(&self, key: &str, now: Instant) -> bool {
+        let mut entries = lock(&self.entries);
+        let hits = match entries.get_mut(key) {
+            Some(hits) => hits,
+            None => return false,
+        };
+        while let Some(first) = hits.front() {
+            if now.duration_since(*first) >= self.window {
+                hits.pop_front();
+            } else {
+                break;
+            }
+        }
+        hits.len() >= self.limit
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -96,5 +119,30 @@ mod tests {
         assert!(limiter.check_at("uid:a", start));
         assert!(!limiter.check_at("uid:a", start));
         assert!(limiter.check_at("uid:b", start));
+    }
+
+    #[test]
+    fn is_blocked_reports_without_recording_a_hit() {
+        let limiter = RateLimiter::new(2, Duration::from_secs(60));
+        let start = Instant::now();
+
+        assert!(!limiter.is_blocked_at("key", start));
+        assert!(limiter.check_at("key", start));
+        assert!(
+            !limiter.is_blocked_at("key", start),
+            "one of two hits is not a block"
+        );
+        assert!(limiter.check_at("key", start));
+        assert!(limiter.is_blocked_at("key", start));
+
+        // Repeated queries neither add hits nor extend the window.
+        assert!(limiter.is_blocked_at("key", start));
+        assert!(limiter.is_blocked_at("key", start));
+        assert!(!limiter.is_blocked_at("key", start + Duration::from_secs(61)));
+
+        assert!(
+            limiter.check_at("key", start + Duration::from_secs(61)),
+            "the budget is available again after the window"
+        );
     }
 }

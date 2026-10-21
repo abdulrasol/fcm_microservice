@@ -1,6 +1,8 @@
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
 use std::env;
 use std::path::Path;
+use std::str::FromStr;
 
 pub async fn init_db() -> Result<SqlitePool, sqlx::Error> {
     let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data.db".to_string());
@@ -11,9 +13,11 @@ pub async fn init_db() -> Result<SqlitePool, sqlx::Error> {
         std::fs::File::create(&db_path).map_err(sqlx::Error::Io)?;
     }
 
+    // SQLite enforces foreign keys per connection and has them off by default.
+    let options = SqliteConnectOptions::from_str(&db_url)?.foreign_keys(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&db_url)
+        .connect_with(options)
         .await?;
 
     migrate(&pool).await?;
@@ -108,6 +112,48 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Dashboard accounts, their app bindings and their sessions (T2). Times in
+    // `tool_sessions` are epoch seconds so comparisons never depend on text.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS tool_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('owner','manager')),
+            must_change_password INTEGER NOT NULL DEFAULT 1, test_uid TEXT,
+            disabled INTEGER NOT NULL DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS tool_user_apps (
+            user_id INTEGER NOT NULL REFERENCES tool_users(id) ON DELETE CASCADE, app TEXT NOT NULL,
+            PRIMARY KEY (user_id, app)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS tool_sessions (
+            id_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES tool_users(id) ON DELETE CASCADE,
+            expires_at INTEGER NOT NULL, reauth_at INTEGER, created_at INTEGER NOT NULL,
+            ip TEXT, user_agent TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_tool_sessions_user ON tool_sessions(user_id)")
+        .execute(pool)
+        .await?;
+
     // Safe migrations for existing databases. Errors (e.g. duplicate column) are
     // expected and ignored; no data is dropped.
     let _ = sqlx::query("ALTER TABLE notifications_history ADD COLUMN payload TEXT")
@@ -127,6 +173,24 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await;
 
+    Ok(())
+}
+
+/// Appends one row to the audit log. Dashboard actions pass `None` for the app.
+pub async fn write_audit(
+    pool: &SqlitePool,
+    actor: &str,
+    app: Option<&str>,
+    action: &str,
+    detail: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO audit_log (actor, app, action, detail) VALUES (?, ?, ?, ?)")
+        .bind(actor)
+        .bind(app)
+        .bind(action)
+        .bind(detail)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

@@ -1,3 +1,4 @@
+mod admin;
 mod auth;
 mod cli;
 mod config;
@@ -50,6 +51,8 @@ struct AppState {
     /// T1: the configuration store. Used from T7/T8.
     #[allow(dead_code)]
     config: Arc<ConfigStore>,
+    /// T2: dashboard accounts and sessions.
+    tool_auth: Arc<admin::ToolAuth>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -159,6 +162,15 @@ async fn main() {
         config_store.app_count()
     );
 
+    let tool_auth = match admin::ToolAuth::new(db_pool.clone()).await {
+        Ok(tool_auth) => tool_auth,
+        Err(message) => {
+            tracing::error!("Failed to prepare the dashboard accounts: {}", message);
+            std::process::exit(1);
+        }
+    };
+    admin::spawn_session_cleanup(tool_auth.clone());
+
     let state = Arc::new(AppState {
         db: db_pool,
         auth_map,
@@ -169,6 +181,7 @@ async fn main() {
         topics_limiter: RateLimiter::new(TOPICS_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
         auth_fail_limiter: RateLimiter::new(AUTH_FAILURE_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
         config: config_store,
+        tool_auth,
     });
 
     // Serve static files from "dist", fallback to index.html for SPA routing
@@ -181,6 +194,7 @@ async fn main() {
         .route("/send", post(send_notification))
         .route("/topics/subscribe", post(topics::subscribe))
         .route("/topics/unsubscribe", post(topics::unsubscribe))
+        .nest("/admin", admin::router(state.clone()))
         .fallback(api_fallback)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .with_state(state.clone());
