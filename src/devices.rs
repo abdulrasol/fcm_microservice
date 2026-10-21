@@ -205,7 +205,6 @@ impl DeviceStore {
     }
 
     /// Every token of one user, most recently seen first.
-    #[allow(dead_code)] // Wired to user-targeted sending in T8/T9.
     pub async fn tokens_for_uid(&self, app: &str, uid: &str) -> Result<Vec<String>, DeviceError> {
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT token FROM devices WHERE app = ? AND uid = ? \
@@ -220,7 +219,6 @@ impl DeviceStore {
 
     /// Bulk lookup for a list of uids: at most 50 bound parameters per query,
     /// de-duplicated, at most `cap` tokens.
-    #[allow(dead_code)] // Wired to user/role-targeted sending in T8/T9.
     pub async fn tokens_for_uids(
         &self,
         app: &str,
@@ -259,7 +257,6 @@ impl DeviceStore {
     }
 
     /// Removes a token FCM reported as dead, whatever its owner.
-    #[allow(dead_code)] // Wired to FCM error handling in T8.
     pub async fn remove_dead_token(&self, app: &str, token: &str) -> Result<bool, DeviceError> {
         let result = sqlx::query("DELETE FROM devices WHERE app = ? AND token = ?")
             .bind(app)
@@ -272,7 +269,6 @@ impl DeviceStore {
     /// The tokens of every uid that holds `role_value`, capped at
     /// [`MAX_ROLE_TOKENS`]. `None` means the app has no `role_members`
     /// configuration.
-    #[allow(dead_code)] // Wired to role-targeted sending in T8/T9.
     pub async fn tokens_for_role(
         &self,
         app: &str,
@@ -301,12 +297,10 @@ struct RoleCacheEntry {
 
 /// Cache of role member lookups, keyed by `(app, config version, role value)`
 /// so saving a new configuration invalidates it. Errors are never cached.
-#[allow(dead_code)] // Wired to role-targeted sending in T8/T9.
 pub struct RoleDirectory {
     entries: Mutex<HashMap<RoleCacheKey, RoleCacheEntry>>,
 }
 
-#[allow(dead_code)] // Wired to role-targeted sending in T8/T9.
 impl Default for RoleDirectory {
     fn default() -> Self {
         Self {
@@ -315,7 +309,6 @@ impl Default for RoleDirectory {
     }
 }
 
-#[allow(dead_code)] // Wired to role-targeted sending in T8/T9.
 impl RoleDirectory {
     pub fn new() -> Self {
         Self::default()

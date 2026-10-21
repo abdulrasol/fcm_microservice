@@ -9,7 +9,6 @@
 //!
 //! The engine is wired into sending in T8 and into preview in T10; until then
 //! its public items are intentionally unused.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
