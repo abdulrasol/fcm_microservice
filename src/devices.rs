@@ -1201,6 +1201,8 @@ mod tests {
             identity,
             datasource,
             fcm,
+            role_directory: Arc::new(crate::devices::RoleDirectory::new()),
+            template_rate: Arc::new(crate::db::TemplateRateLimiter::new()),
         })
     }
 

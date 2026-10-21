@@ -16,7 +16,6 @@ use tokio::task::JoinSet;
 const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 
 /// Parallel FCM calls used by [`send_to_tokens`] when the caller passes `0`.
-#[allow(dead_code)] // Wired to the template route in T8-4.
 pub const DEFAULT_CONCURRENCY: usize = 10;
 
 /// Why an FCM call could not produce an HTTP response.
@@ -207,7 +206,6 @@ fn is_dead_token(body: &str) -> bool {
 }
 
 /// What a fan-out produced. Tokens are never logged.
-#[allow(dead_code)] // Wired to the template route in T8-4.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Delivery {
     pub delivered: usize,
@@ -219,7 +217,6 @@ pub struct Delivery {
 ///
 /// `make` runs in the caller's task, so the closure does not cross tasks. A
 /// panicked task counts as one failure. Nothing is retried.
-#[allow(dead_code)] // Wired to the template route in T8-4.
 pub async fn send_to_tokens(
     transport: &Arc<dyn FcmTransport>,
     app: &str,
@@ -304,7 +301,6 @@ pub(crate) mod test_support {
             })
         }
 
-        #[allow(dead_code)] // Used by the template route tests in T8-4.
         pub(crate) fn accepting() -> Arc<Self> {
             Self::new(|_, _| {
                 Ok(FcmOutcome::Accepted {

@@ -341,6 +341,19 @@ impl AuthService {
         Ok(is_admin_role(role.as_deref(), &policy.admin_roles))
     }
 
+    /// The role of a verified identity, for template senders (T8).
+    ///
+    /// A missing data source or role configuration is not an error here: the
+    /// caller decides whether the template requires a role.
+    pub async fn resolve_sender_role(
+        &self,
+        app: &str,
+        identity: &Identity,
+    ) -> Result<Option<String>, AuthError> {
+        let (policy, version) = self.policy_for(app);
+        self.resolve_role(app, version, &policy, identity).await
+    }
+
     /// The role policy and configuration version of an app, or the legacy policy
     /// for an app that has no stored configuration.
     fn policy_for(&self, app: &str) -> (IdentityPolicy, i64) {
