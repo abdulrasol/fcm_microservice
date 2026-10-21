@@ -792,9 +792,20 @@ impl ConfigStore {
                     format!("the template could not be serialized: {}", error),
                 )
             })?;
+            // A new template starts at 1; an existing one moves to its previous
+            // version + 1, so an import never rewinds a template version. The
+            // history of a template removed by the import stays in
+            // `config_versions`.
+            let current: Option<i64> =
+                sqlx::query_scalar("SELECT version FROM templates WHERE app = ? AND key = ?")
+                    .bind(app)
+                    .bind(key)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            let new_version = current.unwrap_or(0) + 1;
             sqlx::query(
                 "INSERT INTO templates (app, key, definition, enabled, version, updated_by, updated_at) \
-                 VALUES (?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP) \
+                 VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
                  ON CONFLICT(app, key) DO UPDATE SET \
                  definition = excluded.definition, enabled = excluded.enabled, \
                  version = excluded.version, updated_by = excluded.updated_by, \
@@ -804,6 +815,7 @@ impl ConfigStore {
             .bind(key)
             .bind(&definition)
             .bind(if template.enabled { 1_i64 } else { 0_i64 })
+            .bind(new_version)
             .bind(actor)
             .execute(&mut *transaction)
             .await?;
@@ -1733,5 +1745,50 @@ mod tests {
             Some("2026-01-02 03:04:05"),
             "a template kept by the import must keep last_used_at"
         );
+    }
+
+    #[tokio::test]
+    async fn import_keeps_template_versions_monotonic() {
+        let (store, pool) = memory_store().await;
+        store
+            .import("watt", example_document(), "tester")
+            .await
+            .expect("the first import must work");
+
+        let version: i64 = sqlx::query_scalar(
+            "SELECT version FROM templates WHERE app = 'watt' AND key = 'order_new'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the template must exist");
+        assert_eq!(version, 1, "a new template starts at version 1");
+
+        store
+            .import("watt", example_document(), "tester")
+            .await
+            .expect("the second import must work");
+
+        let version: i64 = sqlx::query_scalar(
+            "SELECT version FROM templates WHERE app = 'watt' AND key = 'order_new'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the template must exist");
+        assert_eq!(
+            version, 2,
+            "an import must bump an existing template version"
+        );
+
+        let snapshot = store.get("watt").expect("the app must be cached");
+        let definition = serde_json::to_value(&snapshot.templates["order_new"])
+            .expect("the template must serialize");
+        let error = store
+            .save_template("watt", "order_new", definition, "tester", Some(1))
+            .await
+            .expect_err("a stale expected_version must conflict");
+        match error {
+            ConfigError::Conflict { current_version } => assert_eq!(current_version, 2),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
     }
 }
