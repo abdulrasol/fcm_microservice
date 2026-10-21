@@ -406,7 +406,7 @@ create ──► pending_review ──approve──► sending ──► sent
 
 - `POST /devices/register` عند الحصول على token، وعند تجدده، وعند الدخول. `POST /devices/unregister` عند الخروج.
 - token واحد يخص uid واحد (ينتقل عند تبديل الحساب). حد `max_per_uid` (الأقدم يُحذف).
-- رد FCM بـ `UNREGISTERED`/`INVALID_ARGUMENT` ⇐ حذف تلقائي.
+- الجهاز الميت يُحدَّد بدقة: `error.details[].errorCode == "UNREGISTERED"`، أو `error.status == "INVALID_ARGUMENT"` مع `error.details[].fieldViolations[].field` منتهٍ بـ`message.token` ⇐ حذف تلقائي. لا يُعتبر كل `INVALID_ARGUMENT` جهازاً ميتاً (قد يكون الحمل نفسه غير صالح).
 - **لـ uid:** أجهزته (≤5). **لـ role:** أعضاء الدور من مصدر البيانات (مخزن 5 دقائق، حد 50) ثم أجهزتهم.
 - يعمل مع أي مزود هوية، لأنه يعتمد على `uid` فقط.
 
@@ -589,6 +589,7 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
 | 409 | حملة ليست بالحالة المطلوبة، أو تعارض إصدار عند الحفظ (حفظ فوق نسخة أحدث) |
 | 429 | حد السرعة أو حصة الحملات (مع `retry_after`) |
 | 500 | خطأ داخلي غير متوقع في الأداة (رسالة عامة بلا تفاصيل، والتفاصيل في السجل فقط) |
+| 502 | فشل FCM كلياً (لا تسليم، ورفض غير 4xx)، أو تعذّر الحصول على توكن خدمة Firebase |
 | 503 | مصدر البيانات أو مفاتيح الهوية غير متاحة |
 
 - حفظ الإعدادات يرسل `version` الحالي، وإذا تغير بالأثناء ⇐ 409 (يمنع مديرين يكتبون فوق بعض).
@@ -878,3 +879,4 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
 | 2026-10-21 | T5 — تعميم الأدوار والاشتراك | ✅ | `src/roles.rs` (محلّل + مخبأ + `is_admin_role` + `topic_matches`) + `AuthService` فوق السجلين + أنماط `web_subscribe` + `LEGACY_SIGNED_IN_TOPICS` للتطبيقات بلا إعداد + حقلا `identity`/`datasource` في `AppState`. 212 اختباراً ناجحاً. قرار المراجع: `#[allow(dead_code)]` المؤقتة مقبولة وتزول عند استعمالها، وتعديلات اختبارات Firebase مقبولة. التقرير: `docs/plans/reports/T5-report.md` |
 | 2026-10-21 | T6 — سجل الأجهزة | 🔄 بانتظار المراجعة | جدول `devices` (`PRIMARY KEY(app, token)` + فهرس `(app, uid)`) + `DeviceStore` (upsert/نقل ملكية/إخلاء الأقدم ضمن معاملة تحت قفل كتابة/إلغاء) + `RoleDirectory` بمخبأ `(app, version, role)` TTL وحد 256 + `tokens_for_role` بسقف 5000 + مسارا `POST /api/v1/devices/register` و`/devices/unregister` بهوية مستخدم فقط (بلا مفتاح خدمة/قديم) وحد 20/دقيقة لكل uid. 242 اختباراً ناجحاً (30 جديداً). التقرير: `docs/plans/reports/T6-report.md` |
 | 2026-10-21 | T7 — محرك القوالب | 🔄 بانتظار المراجعة | `segments()` في `config/placeholder.rs` (إضافة صرفة: 116 سطراً، 0 محذوف) + `src/template.rs`: `validate_params` (text/pattern/enum/int، حدود 4096 بايت و200 للـpattern و`size_limit` للمترجم) ثم `context_path` (مقطع مسار واحد) ثم `render` (مرور واحد، `|int` بتقريب بعيداً عن الصفر، `require` موحّد 403، `vars` كسولة، حدود `validation.rs`). بلا شبكة/قاعدة بيانات/`AppState`. 285 اختباراً ناجحاً (43 جديداً). التقرير: `docs/plans/reports/T7-report.md` |
+| 2026-10-21 | T8 — إرسال القوالب | 🔄 بانتظار المراجعة | `src/send.rs`: `FcmTransport`/`HttpFcm`/`FcmOutcome`/`build_message`/`send_to_tokens` (JoinSet + Semaphore، بلا إعادة محاولة) ونقل نداء FCM من `main.rs` بلا تغيير ردود `/send` (4 اختبارات توصيف). `POST /api/v1/send/template` بالترتيب: app ⇒ IP ⇒ (مفتاح خدمة أو هوية + دور) ⇒ قالب مفعّل ⇒ senders ⇒ حد/uid ⇒ params ⇒ doc ⇒ render ⇒ `validation.rs` ⇒ dedupe ⇒ أجهزة ⇒ إرسال ⇒ سجل. `db.rs`: `kind`/`ref`، `template_dedupe` (SHA-256، ذرّية، انتهاء)، `touch_template_used` (يغيّر `last_used_at` فقط)، `TemplateRateLimiter` (نافذة ساعة، سقف 10k). 330 اختباراً ناجحاً (45 جديداً). التقرير: `docs/plans/reports/T8-report.md` |
