@@ -138,6 +138,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct HttpJwkProvider {
     client: reqwest::Client,
     url: String,
+    /// Per-request timeout; `None` uses the client's own setting.
+    timeout: Option<Duration>,
 }
 
 impl HttpJwkProvider {
@@ -145,6 +147,21 @@ impl HttpJwkProvider {
         Self {
             client,
             url: url.into(),
+            timeout: None,
+        }
+    }
+
+    /// A provider with its own timeout, so a long-lived shared client cannot
+    /// stretch the JWKS download past the value the identity code chose.
+    pub fn with_timeout(
+        client: reqwest::Client,
+        url: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            client,
+            url: url.into(),
+            timeout: Some(timeout),
         }
     }
 }
@@ -156,9 +173,11 @@ impl JwkProvider for HttpJwkProvider {
             return Err("the JWK endpoint must use https".to_string());
         }
 
-        let mut response = self
-            .client
-            .get(&self.url)
+        let mut request = self.client.get(&self.url);
+        if let Some(timeout) = self.timeout {
+            request = request.timeout(timeout);
+        }
+        let mut response = request
             .send()
             .await
             .map_err(|_| "could not reach the JWK endpoint".to_string())?;
@@ -233,7 +252,7 @@ pub struct GoogleJwkProvider {
 impl GoogleJwkProvider {
     pub fn new(client: reqwest::Client) -> Self {
         Self {
-            inner: HttpJwkProvider::new(client, GOOGLE_JWK_URL),
+            inner: HttpJwkProvider::with_timeout(client, GOOGLE_JWK_URL, Duration::from_secs(10)),
         }
     }
 }
@@ -242,6 +261,16 @@ impl GoogleJwkProvider {
 impl JwkProvider for GoogleJwkProvider {
     async fn fetch_keys(&self) -> Result<FetchedJwks, String> {
         self.inner.fetch_keys().await
+    }
+}
+
+/// A provider with no endpoint, used when a configuration relies on HS256 only.
+pub struct UnconfiguredJwkProvider;
+
+#[async_trait]
+impl JwkProvider for UnconfiguredJwkProvider {
+    async fn fetch_keys(&self) -> Result<FetchedJwks, String> {
+        Err("no JWKS endpoint is configured".to_string())
     }
 }
 

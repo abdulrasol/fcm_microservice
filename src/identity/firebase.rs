@@ -35,6 +35,11 @@ pub struct FirebaseVerifier {
 }
 
 impl FirebaseVerifier {
+    /// Builds a verifier with its own empty cache.
+    pub fn new(jwks: Arc<dyn JwkProvider>) -> Self {
+        Self::with_cache(jwks, Arc::new(Mutex::new(JwksCache::new())))
+    }
+
     /// Builds a verifier around an existing cache, so Firebase apps can share
     /// one downloaded Google key set.
     pub fn with_cache(jwks: Arc<dyn JwkProvider>, cache: Arc<Mutex<JwksCache>>) -> Self {
@@ -135,5 +140,132 @@ fn audience_matches(aud: Option<&Value>, project_id: &str) -> bool {
             .iter()
             .any(|value| value.as_str() == Some(project_id)),
         _ => false,
+    }
+}
+
+/// One Firebase app: a project id plus the verifier shared by all Firebase apps.
+pub struct FirebaseProvider {
+    project_id: String,
+    verifier: Arc<FirebaseVerifier>,
+}
+
+impl FirebaseProvider {
+    pub fn new(project_id: impl Into<String>, verifier: Arc<FirebaseVerifier>) -> Self {
+        Self {
+            project_id: project_id.into(),
+            verifier,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl super::IdentityProvider for FirebaseProvider {
+    async fn verify(&self, token: &str) -> Result<Identity, IdentityError> {
+        self.verifier.verify(token, &self.project_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::jwks::FetchedJwks;
+    use crate::identity::IdentityProvider;
+    use jsonwebtoken::{encode, DecodingKey, EncodingKey, Header};
+    use rand::rngs::OsRng;
+    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+    use rsa::RsaPrivateKey;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    const PROJECT: &str = "test-project";
+
+    struct TestKeys {
+        private_pem: String,
+        decoding: DecodingKey,
+    }
+
+    fn generate_keys() -> TestKeys {
+        let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("generate RSA key");
+        let private_pem = private
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("private key PEM")
+            .to_string();
+        let public_pem = private
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .expect("public key PEM");
+        TestKeys {
+            private_pem,
+            decoding: DecodingKey::from_rsa_pem(public_pem.as_bytes()).expect("decoding key"),
+        }
+    }
+
+    struct StaticJwks {
+        keys: HashMap<String, DecodingKey>,
+    }
+
+    #[async_trait::async_trait]
+    impl JwkProvider for StaticJwks {
+        async fn fetch_keys(&self) -> Result<FetchedJwks, String> {
+            Ok(FetchedJwks {
+                keys: self.keys.clone(),
+                max_age: Duration::from_secs(3600),
+            })
+        }
+    }
+
+    fn provider(keys: &TestKeys) -> FirebaseProvider {
+        let jwks = Arc::new(StaticJwks {
+            keys: HashMap::from([("k1".to_string(), keys.decoding.clone())]),
+        });
+        FirebaseProvider::new(PROJECT, Arc::new(FirebaseVerifier::new(jwks)))
+    }
+
+    fn token(keys: &TestKeys, audience: &str) -> String {
+        let now = jsonwebtoken::get_current_timestamp();
+        let payload = json!({
+            "sub": "uid-1",
+            "aud": audience,
+            "iss": format!("{SECURETOKEN_ISSUER_PREFIX}{PROJECT}"),
+            "exp": now + 3600,
+            "iat": now - 10,
+            "auth_time": now - 10,
+            "email": "user@example.com",
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("k1".to_string());
+        encode(
+            &header,
+            &payload,
+            &EncodingKey::from_rsa_pem(keys.private_pem.as_bytes()).expect("encoding key"),
+        )
+        .expect("encode token")
+    }
+
+    #[tokio::test]
+    async fn firebase_provider_returns_identity_with_email() {
+        let keys = generate_keys();
+        let identity = provider(&keys)
+            .verify(&token(&keys, PROJECT))
+            .await
+            .expect("a valid token must be accepted");
+        assert_eq!(identity.uid, "uid-1");
+        assert_eq!(identity.email.as_deref(), Some("user@example.com"));
+        assert_eq!(identity.name, None);
+        assert_eq!(
+            identity.claims["iss"],
+            json!(format!("{SECURETOKEN_ISSUER_PREFIX}{PROJECT}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn firebase_provider_rejects_wrong_audience() {
+        let keys = generate_keys();
+        let error = provider(&keys)
+            .verify(&token(&keys, "other-project"))
+            .await
+            .expect_err("a token for another project must be rejected");
+        assert!(matches!(error, IdentityError::Invalid(_)));
     }
 }
