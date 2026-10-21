@@ -1097,5 +1097,82 @@ mod tests {
         assert_eq!(reviewer.as_deref(), Some("user@example.com"));
     }
 
+    #[tokio::test]
+    async fn audit_has_approve_reject_block_unblock_and_free_send_without_text() {
+        let harness = setup("owner", &[]).await;
+        let id = insert_campaign(&harness.pool, APP, "e1", "pending_review").await;
 
+        let (status, _) = approve(&harness, id).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let other = insert_campaign(&harness.pool, APP, "e2", "pending_review").await;
+        let (status, _) = reject(&harness, other, "a long free reason").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/blocks", APP),
+                Some(json!({ "entity_id": "e3", "reason": "a long free reason" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = harness
+            .call(Method::DELETE, &format!("/apps/{}/blocks/e3", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/send", APP),
+                Some(json!({
+                    "title": "Secret notification text",
+                    "body": "Secret body text",
+                    "topic": "news"
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT action, detail FROM audit_log WHERE app = ? ORDER BY id")
+                .bind(APP)
+                .fetch_all(&harness.pool)
+                .await
+                .expect("the audit rows must exist");
+
+        let actions: Vec<&str> = rows.iter().map(|(action, _)| action.as_str()).collect();
+        for action in [
+            "campaign.approve",
+            "campaign.reject",
+            "campaign.block",
+            "campaign.unblock",
+            "send.free",
+        ] {
+            assert!(
+                actions.contains(&action),
+                "missing {} in {:?}",
+                action,
+                actions
+            );
+        }
+
+        for (_, detail) in &rows {
+            let detail = detail.clone().unwrap_or_default();
+            assert!(
+                !detail.contains("Secret notification text"),
+                "the audit must not keep the notification text"
+            );
+            assert!(
+                !detail.contains("Secret body text"),
+                "the audit must not keep the notification body"
+            );
+            assert!(
+                !detail.contains("a long free reason"),
+                "the audit must not keep a long free reason"
+            );
+        }
+    }
 }

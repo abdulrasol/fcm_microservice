@@ -7,6 +7,7 @@
 pub mod apps;
 pub mod auth;
 pub mod campaigns;
+pub mod history;
 pub mod password;
 pub mod session;
 pub mod templates;
@@ -462,6 +463,25 @@ pub(crate) fn admin_routes() -> Vec<AdminRoute> {
             "/apps/:app/blocks/:entity_id",
             true,
             delete(campaigns::unblock_entity),
+        ),
+        (
+            "GET",
+            "/apps/:app/history",
+            true,
+            get(history::list_history),
+        ),
+        (
+            "GET",
+            "/apps/:app/history/:id",
+            true,
+            get(history::history_detail),
+        ),
+        ("POST", "/apps/:app/send", true, post(history::free_send)),
+        (
+            "GET",
+            "/apps/:app/devices/stats",
+            true,
+            get(history::device_stats),
         ),
     ]
 }
@@ -1804,6 +1824,14 @@ pub(crate) mod tests {
                 Some(json!({ "entity_id": "matrix" })),
             ),
             MatrixCase::new(Method::DELETE, "/apps/:app/blocks/:entity_id", None),
+            MatrixCase::new(Method::GET, "/apps/:app/history", None),
+            MatrixCase::new(Method::GET, "/apps/:app/history/:id", None),
+            MatrixCase::new(
+                Method::POST,
+                "/apps/:app/send",
+                Some(json!({ "title": "Matrix", "topic": "news" })),
+            ),
+            MatrixCase::new(Method::GET, "/apps/:app/devices/stats", None),
         ];
         for section in [
             "identity",
@@ -1897,6 +1925,35 @@ pub(crate) mod tests {
                 case.method,
                 case.path,
                 response
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_covers_new_routes() {
+        let harness = setup("owner", &[]).await;
+        let cases = owner_matrix_cases(&harness).await;
+        let (registered, covered) = matrix_coverage(&cases);
+        assert_eq!(
+            covered, registered,
+            "the owner matrix must cover every registered route"
+        );
+
+        for pattern in [
+            "/apps/:app/campaigns",
+            "/apps/:app/campaigns/:id/approve",
+            "/apps/:app/campaigns/:id/reject",
+            "/apps/:app/blocks",
+            "/apps/:app/blocks/:entity_id",
+            "/apps/:app/history",
+            "/apps/:app/history/:id",
+            "/apps/:app/send",
+            "/apps/:app/devices/stats",
+        ] {
+            assert!(
+                covered.iter().any(|(_, known)| known == pattern),
+                "the matrix must cover {}",
+                pattern
             );
         }
     }

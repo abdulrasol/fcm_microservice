@@ -1119,6 +1119,129 @@ pub async fn unblock_entity(
     Ok(result.rows_affected() == 1)
 }
 
+// ---------- T10-B: dashboard history and device statistics ----------
+
+/// One history row. The payload is the rendered content, never a token.
+pub struct HistoryRow {
+    pub id: i64,
+    pub target: String,
+    pub title: String,
+    pub status: String,
+    pub kind: Option<String>,
+    pub reference: Option<String>,
+    pub sender_uid: Option<String>,
+    pub sender_email: Option<String>,
+    pub created_at: String,
+    pub response: Option<String>,
+    pub payload: Option<String>,
+}
+
+fn history_from_row(row: SqliteRow) -> HistoryRow {
+    HistoryRow {
+        id: row.get("id"),
+        target: row.get("target"),
+        title: row.get("title"),
+        status: row.get("status"),
+        kind: row.get("kind"),
+        reference: row.get("ref"),
+        sender_uid: row.get("sender_uid"),
+        sender_email: row.get("sender_email"),
+        created_at: row.get("created_at"),
+        response: row.get("response"),
+        payload: row.get("payload"),
+    }
+}
+
+/// Reads the history of one app, newest first.
+///
+/// `before` pages backwards over the id, `kind` and `status` filter the rows
+/// and `limit` caps the page.
+pub async fn read_history(
+    pool: &SqlitePool,
+    app: &str,
+    kind: Option<&str>,
+    status: Option<&str>,
+    before: Option<i64>,
+    limit: u32,
+) -> Result<Vec<HistoryRow>, sqlx::Error> {
+    let mut query =
+        sqlx::QueryBuilder::<Sqlite>::new("SELECT * FROM notifications_history WHERE app = ");
+    query.push_bind(app.to_string());
+    if let Some(kind) = kind {
+        query.push(" AND kind = ");
+        query.push_bind(kind.to_string());
+    }
+    if let Some(status) = status {
+        query.push(" AND status = ");
+        query.push_bind(status.to_string());
+    }
+    if let Some(before) = before {
+        query.push(" AND id < ");
+        query.push_bind(before);
+    }
+    query.push(" ORDER BY id DESC LIMIT ");
+    query.push_bind(i64::from(limit));
+
+    let rows = query.build().fetch_all(pool).await?;
+    Ok(rows.into_iter().map(history_from_row).collect())
+}
+
+/// Reads one history row of one app. A row of another app is not found.
+pub async fn read_history_detail(
+    pool: &SqlitePool,
+    app: &str,
+    id: i64,
+) -> Result<Option<HistoryRow>, sqlx::Error> {
+    let row = sqlx::query("SELECT * FROM notifications_history WHERE id = ? AND app = ?")
+        .bind(id)
+        .bind(app)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(history_from_row))
+}
+
+/// The device counts of one app. No token and no uid is ever returned.
+pub struct DeviceStats {
+    pub total: i64,
+    pub distinct_uids: i64,
+    pub android: i64,
+    pub ios: i64,
+    pub web: i64,
+    pub active_last_7d: i64,
+    pub newest_last_seen: Option<String>,
+}
+
+/// Counts the devices of one app by platform and activity.
+pub async fn device_stats(pool: &SqlitePool, app: &str) -> Result<DeviceStats, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS total, COUNT(DISTINCT uid) AS uids, \
+         SUM(CASE WHEN platform = 'android' THEN 1 ELSE 0 END) AS android, \
+         SUM(CASE WHEN platform = 'ios' THEN 1 ELSE 0 END) AS ios, \
+         SUM(CASE WHEN platform = 'web' THEN 1 ELSE 0 END) AS web, \
+         SUM(CASE WHEN last_seen >= datetime('now', '-7 days') THEN 1 ELSE 0 END) AS active, \
+         MAX(last_seen) AS newest FROM devices WHERE app = ?",
+    )
+    .bind(app)
+    .fetch_one(pool)
+    .await?;
+
+    let count = |name: &str| -> i64 {
+        row.try_get::<Option<i64>, _>(name)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    };
+    Ok(DeviceStats {
+        total: count("total"),
+        distinct_uids: count("uids"),
+        android: count("android"),
+        ios: count("ios"),
+        web: count("web"),
+        active_last_7d: count("active"),
+        newest_last_seen: row.try_get("newest").unwrap_or_default(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
