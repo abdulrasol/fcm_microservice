@@ -7,6 +7,7 @@
 pub mod apps;
 pub mod auth;
 pub mod campaigns;
+pub mod credentials;
 pub mod diagnostics;
 pub mod history;
 pub mod keys;
@@ -517,6 +518,37 @@ pub(crate) fn admin_routes() -> Vec<AdminRoute> {
             true,
             delete(keys::revoke_key),
         ),
+        ("POST", "/apps", true, post(credentials::create_app)),
+        (
+            "PUT",
+            "/apps/:app/credentials",
+            true,
+            put(credentials::replace_credentials),
+        ),
+        (
+            "GET",
+            "/apps/:app/credentials",
+            true,
+            get(credentials::get_credentials),
+        ),
+        (
+            "POST",
+            "/apps/:app/disable",
+            true,
+            post(credentials::disable_app),
+        ),
+        (
+            "POST",
+            "/apps/:app/enable",
+            true,
+            post(credentials::enable_app),
+        ),
+        (
+            "DELETE",
+            "/apps/:app",
+            true,
+            delete(credentials::delete_app),
+        ),
     ]
 }
 
@@ -610,6 +642,16 @@ pub(crate) mod tests {
         env: Option<Arc<dyn crate::identity::jwt::EnvSource>>,
         fcm: Option<Arc<dyn crate::send::FcmTransport>>,
     ) -> Arc<AppState> {
+        test_state_with_env_and_upload(pool, env, fcm, true).await
+    }
+
+    /// The same state, with the upload of credentials on or off.
+    pub(crate) async fn test_state_with_env_and_upload(
+        pool: SqlitePool,
+        env: Option<Arc<dyn crate::identity::jwt::EnvSource>>,
+        fcm: Option<Arc<dyn crate::send::FcmTransport>>,
+        upload_enabled: bool,
+    ) -> Arc<AppState> {
         let client = Client::builder()
             .build()
             .expect("the test client must build");
@@ -661,6 +703,16 @@ pub(crate) mod tests {
             Arc::new(crate::send::HttpFcm::new(client.clone(), auth_map.clone()))
         });
 
+        // T16: the credential files of the tests live in a fresh directory.
+        let credentials = Arc::new(crate::credentials::CredentialManager::new(
+            credentials_dir(),
+            auth_map.clone(),
+            project_map.clone(),
+            Arc::new(RwLock::new(std::collections::HashSet::new())),
+            Arc::new(AcceptingVerifier),
+            upload_enabled,
+        ));
+
         Arc::new(AppState {
             db: pool.clone(),
             auth_map,
@@ -679,6 +731,7 @@ pub(crate) mod tests {
             fcm,
             role_directory: Arc::new(crate::devices::RoleDirectory::new()),
             template_rate: Arc::new(crate::db::TemplateRateLimiter::new()),
+            credentials,
         })
     }
 
@@ -1587,6 +1640,43 @@ pub(crate) mod tests {
         setup_with_env(role, bound, None).await
     }
 
+    /// The same harness, with the upload of credentials on or off.
+    pub(crate) async fn setup_with_upload(
+        role: &str,
+        bound: &[&str],
+        upload_enabled: bool,
+    ) -> Harness {
+        let pool = memory_pool().await;
+        let fcm = Arc::new(CountingFcm::default());
+        let state =
+            test_state_with_env_and_upload(pool.clone(), None, Some(fcm.clone()), upload_enabled)
+                .await;
+        bind_app(&state, APP, "project-watt").await;
+        bind_app(&state, OTHER_APP, "project-other").await;
+
+        let user_id = insert_user(&pool, "user@example.com", role, false).await;
+        for app in bound {
+            sqlx::query("INSERT INTO tool_user_apps (user_id, app) VALUES (?, ?)")
+                .bind(user_id)
+                .bind(app)
+                .execute(&pool)
+                .await
+                .expect("the app binding must be inserted");
+        }
+
+        let router = app(state.clone());
+        let login = login_request(&router, "user@example.com", PASSWORD).await;
+        let token = session_token(&login);
+        Harness {
+            state,
+            pool,
+            router,
+            token,
+            user_id,
+            fcm,
+        }
+    }
+
     pub(crate) async fn setup_with_env(
         role: &str,
         bound: &[&str],
@@ -1670,6 +1760,25 @@ pub(crate) mod tests {
             .oneshot(request)
             .await
             .expect("the request must run")
+    }
+
+    /// A verifier that accepts every key, for the tests.
+    pub(crate) struct AcceptingVerifier;
+
+    #[async_trait::async_trait]
+    impl crate::credentials::CredentialVerifier for AcceptingVerifier {
+        async fn verify(&self, _key: &yup_oauth2::ServiceAccountKey) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A fresh directory for the credential files of one test.
+    pub(crate) fn credentials_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("fcm-credentials-{}-{}", std::process::id(), unique))
     }
 
     /// A minimal admin-only template that passes the validators.
@@ -1970,6 +2079,28 @@ pub(crate) mod tests {
                 Some(json!({ "name": "matrix" })),
             ),
             MatrixCase::new(Method::DELETE, "/apps/:app/keys/:id", None),
+            MatrixCase::new(
+                Method::POST,
+                "/apps",
+                Some(json!({
+                    "app": "matrixapp",
+                    "service_account": crate::credentials::tests::test_service_account(
+                        "matrix-project",
+                        "matrix-key",
+                    )
+                })),
+            ),
+            MatrixCase::new(Method::GET, "/apps/:app/credentials", None),
+            MatrixCase::new(
+                Method::PUT,
+                "/apps/:app/credentials",
+                Some(json!({
+                    "service_account": crate::credentials::tests::test_service_account(
+                        "matrix-project",
+                        "matrix-key-2",
+                    )
+                })),
+            ),
         ];
         for section in [
             "identity",
@@ -1992,6 +2123,14 @@ pub(crate) mod tests {
                 Some(json!({ "value": section_value(harness, section), "expected_version": version })),
             ));
         }
+        // The disable and the enable change the app, so they come last.
+        cases.push(MatrixCase::new(Method::POST, "/apps/:app/disable", None));
+        cases.push(MatrixCase::new(Method::POST, "/apps/:app/enable", None));
+        cases.push(MatrixCase::new(
+            Method::DELETE,
+            "/apps/:app",
+            Some(json!({ "confirm": "not-the-app" })),
+        ));
         // The last case ends the session, so it must stay at the end.
         cases.push(MatrixCase::new(Method::POST, "/auth/logout", None));
         cases

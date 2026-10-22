@@ -86,6 +86,8 @@ struct AppState {
     role_directory: Arc<RoleDirectory>,
     /// T8: per-uid template rate limit.
     template_rate: Arc<TemplateRateLimiter>,
+    /// T16: the manager of the credential files.
+    credentials: Arc<credentials::CredentialManager>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -222,12 +224,30 @@ async fn main() {
     let creds_dir = PathBuf::from(
         std::env::var("CREDENTIALS_DIR").unwrap_or_else(|_| "credentials".to_string()),
     );
+    let upload_enabled = match env_optional("CREDENTIALS_UPLOAD_ENABLED") {
+        Some(value) => {
+            value.eq_ignore_ascii_case("true") || value == "1" || value.eq_ignore_ascii_case("yes")
+        }
+        None => true,
+    };
     let disabled_apps: credentials::DisabledApps =
         Arc::new(RwLock::new(std::collections::HashSet::new()));
     // The disabled apps are known before the first scan, so they stay off.
     for app in db::list_disabled_apps(&db_pool).await.unwrap_or_default() {
         disabled_apps.write().await.insert(app);
     }
+    let credential_manager = Arc::new(credentials::CredentialManager::new(
+        creds_dir.clone(),
+        auth_map.clone(),
+        project_map.clone(),
+        disabled_apps.clone(),
+        Arc::new(credentials::GoogleVerifier),
+        upload_enabled,
+    ));
+    tracing::info!(
+        "Credentials directory: {}",
+        credential_manager.directory().display()
+    );
     credentials::scan_credentials_dir(
         &creds_dir,
         auth_map.clone(),
@@ -328,6 +348,7 @@ async fn main() {
         fcm,
         role_directory: Arc::new(RoleDirectory::new()),
         template_rate: Arc::new(TemplateRateLimiter::new()),
+        credentials: credential_manager,
     });
 
     // Serve static files from "dist", fallback to index.html for SPA routing
@@ -1980,6 +2001,14 @@ mod tests {
     const RESOLVER_SECRET_ENV: &str = "T8_RESOLVER_SECRET";
     const RESOLVER_SECRET: &str = "test-resolver-secret-0123456789abcdef";
 
+    /// A unique suffix for the temporary directory of a test.
+    fn unique_suffix() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    }
+
     fn test_client() -> Client {
         Client::builder()
             .build()
@@ -2108,6 +2137,20 @@ mod tests {
             dummy_hash: "unused in send tests".to_string(),
             allowed_origins: Vec::new(),
         });
+        // T16: the credential files of the tests live in a fresh directory.
+        let credentials = Arc::new(credentials::CredentialManager::new(
+            std::env::temp_dir().join(format!(
+                "fcm-credentials-{}-{}",
+                std::process::id(),
+                unique_suffix()
+            )),
+            auth_map.clone(),
+            project_map.clone(),
+            Arc::new(RwLock::new(std::collections::HashSet::new())),
+            Arc::new(credentials::GoogleVerifier),
+            true,
+        ));
+
         let state = Arc::new(AppState {
             db: pool.clone(),
             auth_map: auth_map.clone(),
@@ -2126,6 +2169,7 @@ mod tests {
             fcm,
             role_directory: Arc::new(RoleDirectory::new()),
             template_rate: Arc::new(TemplateRateLimiter::new()),
+            credentials,
         });
 
         (state, config, pool, project_map, auth_map)

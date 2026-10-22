@@ -989,14 +989,30 @@ pub(crate) mod tests {
     async fn install_temp_file_never_ends_with_json() {
         // The temporary file of an upload is a dot file with a random suffix,
         // so neither the scan nor the watcher can take it.
+        // The name of the temporary file is a format string in the source.
         let source = include_str!("credentials.rs");
+        let suffix = source
+            .find(".upload-")
+            .expect("the temporary file name must be in the source");
+        let head = &source[..suffix];
+        let marker = "format!(\"";
+        let start = head
+            .rfind(marker)
+            .expect("the temporary file name must be a format string");
+        let rest = &source[start + marker.len()..];
+        let end = rest.find('"').expect("the format must end");
+        let format = &rest[..end];
         assert!(
-            source.contains(".upload-"),
-            "the temporary file has a suffix"
+            format.contains(".upload-"),
+            "the temporary file has a suffix: {}",
+            format
         );
-        let name = format!(".watt.upload-{}", "abcd1234");
-        assert!(!name.ends_with(".json"), "the temporary file is not a json");
-        assert!(name.starts_with('.'), "the temporary file is a dot file");
+        assert!(
+            !format.ends_with(".json"),
+            "the temporary file must not be a json file: {}",
+            format
+        );
+        assert!(format.starts_with('.'), "the temporary file is a dot file");
     }
 
     #[tokio::test]

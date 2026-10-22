@@ -37,33 +37,33 @@ pub async fn list_apps(
     names.sort();
     names.dedup();
 
-    let items: Vec<Value> = names
-        .iter()
-        .map(|app| {
-            let snapshot = state.config.get(app);
-            json!({
-                "app": app,
-                "configured": snapshot.is_some(),
-                "has_credentials": project_map.contains_key(app),
-                "project_id": project_map.get(app),
-                "version": snapshot.as_ref().map(|snapshot| snapshot.version).unwrap_or(0),
-                "template_count": snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.templates.len())
-                    .unwrap_or(0),
-                "enabled_templates": snapshot
-                    .as_ref()
-                    .map(|snapshot| {
-                        snapshot
-                            .templates
-                            .values()
-                            .filter(|template| template.enabled)
-                            .count()
-                    })
-                    .unwrap_or(0),
-            })
-        })
-        .collect();
+    let mut items: Vec<Value> = Vec::with_capacity(names.len());
+    for app in &names {
+        let snapshot = state.config.get(app);
+        let disabled = state.credentials.is_disabled(app).await;
+        items.push(json!({
+            "app": app,
+            "configured": snapshot.is_some(),
+            "has_credentials": project_map.contains_key(app),
+            "project_id": project_map.get(app),
+            "disabled": disabled,
+            "version": snapshot.as_ref().map(|snapshot| snapshot.version).unwrap_or(0),
+            "template_count": snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.templates.len())
+                .unwrap_or(0),
+            "enabled_templates": snapshot
+                .as_ref()
+                .map(|snapshot| {
+                    snapshot
+                        .templates
+                        .values()
+                        .filter(|template| template.enabled)
+                        .count()
+                })
+                .unwrap_or(0),
+        }));
+    }
 
     Ok(Json(Value::Array(items)))
 }
@@ -100,9 +100,12 @@ pub async fn get_app(
 
     let config = serde_json::to_value(&snapshot.config)
         .map_err(|_| AdminError::internal("the configuration could not be rendered"))?;
+    let disabled = state.credentials.is_disabled(&app).await;
+
     Ok(Json(json!({
         "app": app,
         "version": snapshot.version,
+        "disabled": disabled,
         "config": config,
         "templates": templates,
     })))

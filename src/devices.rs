@@ -1177,6 +1177,14 @@ mod tests {
         });
 
         let fcm = Arc::new(crate::send::HttpFcm::new(client.clone(), auth_map.clone()));
+        let credentials = Arc::new(crate::credentials::CredentialManager::new(
+            std::env::temp_dir().join("fcm-device-test-credentials"),
+            auth_map.clone(),
+            project_map.clone(),
+            Arc::new(RwLock::new(std::collections::HashSet::new())),
+            Arc::new(crate::credentials::GoogleVerifier),
+            true,
+        ));
 
         Arc::new(AppState {
             devices: Arc::new(DeviceStore::new(pool.clone())),
@@ -1196,6 +1204,8 @@ mod tests {
             fcm,
             role_directory: Arc::new(crate::devices::RoleDirectory::new()),
             template_rate: Arc::new(crate::db::TemplateRateLimiter::new()),
+            // T16: the device tests never touch the credential files.
+            credentials,
         })
     }
 
