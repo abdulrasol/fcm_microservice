@@ -1209,6 +1209,7 @@ mod tests {
             legacy: Arc::new(crate::legacy::LegacyGuard::new(
                 crate::legacy::DEFAULT_LEGACY_RATE_LIMIT_PER_MINUTE,
             )),
+            admin_limiters: crate::AdminLimiters::new(),
         })
     }
 

@@ -43,13 +43,14 @@ impl IntoResponse for UserAdminError {
     }
 }
 
-/// The write limit of the account routes: 20 per minute and dashboard user.
+/// The write limit of the account routes: 30 per minute and dashboard user.
 ///
-/// The existing 20-per-minute limiter is reused; its key is the account, so
-/// the device registration limit is untouched.
+/// T13-A: the budget of the administrative writes is its own; the limit of
+/// the device registrations is never spent here.
 pub fn check_write_limit(state: &AppState, user: &AuthedUser) -> Result<(), AdminError> {
     if !state
-        .devices_limiter
+        .admin_limiters
+        .admin_writes
         .check(&format!("admin:users:{}", user.user_id))
     {
         return Err(AdminError::too_many_requests());
@@ -569,6 +570,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_writes_limited_per_user_not_global() {
+        let harness = setup("owner", &[]).await;
+        harness.reauth().await;
+        let (id, _) = create_manager(&harness, "manager@example.com", &[APP]).await;
+
+        // A second owner, with its own session.
+        let second_id = insert_owner(&harness, "second@example.com").await;
+        create_session(&harness, second_id).await;
+        let second_token = session_token(
+            &login_request(
+                &harness.router,
+                "second@example.com",
+                super::super::tests::PASSWORD,
+            )
+            .await,
+        );
+
+        // The first owner spends its whole budget of administrative writes.
+        // The creation of the manager above already spent one of them.
+        for attempt in 0..29 {
+            let (status, _) = harness
+                .call(
+                    Method::PUT,
+                    &format!("/users/{}", id),
+                    Some(json!({ "apps": [APP] })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "attempt {}", attempt);
+        }
+        let (status, body) = harness
+            .call(
+                Method::PUT,
+                &format!("/users/{}", id),
+                Some(json!({ "apps": [APP] })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "rate_limited");
+
+        // The second account has its own budget.
+        let (status, _) = call(
+            &harness.router,
+            Method::PUT,
+            &format!("/users/{}", id),
+            Some(json!({ "apps": [APP] })),
+            Some(&second_token),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn update_user_apps_replaces_set_and_kills_sessions() {
         let harness = setup("owner", &[]).await;
         harness.reauth().await;
@@ -826,7 +880,9 @@ mod tests {
     async fn users_write_rate_limited() {
         let harness = setup("owner", &[]).await;
         harness.reauth().await;
-        for index in 0..20 {
+        // T13-A: the administrative writes have their own budget of 30 per
+        // minute and account.
+        for index in 0..30 {
             let (status, body) = harness
                 .call(
                     Method::POST,

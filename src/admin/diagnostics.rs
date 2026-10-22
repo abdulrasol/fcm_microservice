@@ -28,13 +28,14 @@ const MAX_MEMBERS_LIMIT: usize = 200;
 /// The default number of members the check returns.
 const DEFAULT_MEMBERS_LIMIT: usize = 50;
 
-/// The check limit: 20 per minute and dashboard user.
+/// The check limit: 30 per minute and dashboard user.
 ///
-/// The existing 20-per-minute limiter is reused with its own key, so the
-/// account routes and the device limit are untouched.
+/// T13-A: the budget of the administrative writes is its own; the limit of
+/// the device registrations is never spent here.
 fn check_limit(state: &AppState, user: &AuthedUser) -> Result<(), AdminError> {
     if !state
-        .devices_limiter
+        .admin_limiters
+        .admin_writes
         .check(&format!("admin:diagnostics:{}", user.user_id))
     {
         return Err(AdminError::too_many_requests());

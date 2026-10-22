@@ -75,9 +75,13 @@ pub struct DeleteAppRequest {
 }
 
 /// The write limit of the credential routes: 10 per minute and dashboard user.
+///
+/// T13-A: the budget of the credential files is its own; the budget of the
+/// failed authentications is never spent here.
 fn check_rate_limit(state: &AppState, user: &AuthedUser) -> Result<(), AdminError> {
     if !state
-        .auth_fail_limiter
+        .admin_limiters
+        .credentials
         .check(&format!("admin:credentials:{}", user.user_id))
     {
         return Err(AdminError::too_many_requests());

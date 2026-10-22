@@ -59,6 +59,48 @@ const AUTH_FAILURE_RATE_LIMIT_PER_MINUTE: usize = 10;
 /// Device registrations allowed per uid per minute (T6).
 const DEVICES_RATE_LIMIT_PER_MINUTE: usize = 20;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+/// T13-A: the test send of a template, per dashboard user and minute.
+const TEST_SEND_RATE_LIMIT_PER_MINUTE: usize = 10;
+/// T13-A: the free send of the dashboard, per dashboard user and minute.
+const FREE_SEND_RATE_LIMIT_PER_MINUTE: usize = 10;
+/// T13-A: the administrative writes, per dashboard user and minute.
+const ADMIN_WRITES_RATE_LIMIT_PER_MINUTE: usize = 30;
+/// T13-A: the credential files, per dashboard user and minute.
+const CREDENTIALS_RATE_LIMIT_PER_MINUTE: usize = 10;
+
+/// The limiters of the admin routes (T13-A).
+///
+/// Every family of administrative actions has its own budget, so a busy
+/// dashboard never spends the budget of another family, and the budget of the
+/// public routes is never borrowed.
+pub struct AdminLimiters {
+    /// The test send of a template: 10 per minute and dashboard user.
+    pub test_send: RateLimiter,
+    /// The free send of the dashboard: 10 per minute and dashboard user.
+    pub free_send: RateLimiter,
+    /// The administrative writes: 30 per minute and dashboard user.
+    pub admin_writes: RateLimiter,
+    /// The credential files: 10 per minute and dashboard user.
+    pub credentials: RateLimiter,
+}
+
+impl AdminLimiters {
+    /// The default budgets of the admin routes.
+    pub fn new() -> Self {
+        Self {
+            test_send: RateLimiter::new(TEST_SEND_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
+            free_send: RateLimiter::new(FREE_SEND_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
+            admin_writes: RateLimiter::new(ADMIN_WRITES_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
+            credentials: RateLimiter::new(CREDENTIALS_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
+        }
+    }
+}
+
+impl Default for AdminLimiters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 struct AppState {
     db: sqlx::SqlitePool,
@@ -93,6 +135,8 @@ struct AppState {
     credentials: Arc<credentials::CredentialManager>,
     /// T13-A: the budget of the legacy API key.
     legacy: Arc<legacy::LegacyGuard>,
+    /// T13-A: the budgets of the admin routes.
+    admin_limiters: AdminLimiters,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -364,6 +408,7 @@ async fn main() {
         template_rate: Arc::new(TemplateRateLimiter::new()),
         credentials: credential_manager,
         legacy: Arc::new(legacy::LegacyGuard::new(legacy_limit.limit)),
+        admin_limiters: AdminLimiters::new(),
     });
 
     let app = build_router(state);
@@ -2412,6 +2457,7 @@ mod tests {
             template_rate: Arc::new(TemplateRateLimiter::new()),
             credentials,
             legacy: Arc::new(legacy::LegacyGuard::new(legacy_limit)),
+            admin_limiters: AdminLimiters::new(),
         });
 
         (state, config, pool, project_map, auth_map)

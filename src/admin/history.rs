@@ -193,11 +193,11 @@ pub async fn free_send(
     )
     .map_err(|message| AdminError::invalid_request(&message))?;
 
-    // One free send per minute bucket, per dashboard account. The topics
-    // limiter is the existing 30-per-minute limiter; its key is the account,
-    // so the IP limit of the topics routes is untouched.
+    // T13-A: the free send has its own budget, per dashboard account. The
+    // budget of the topics routes is never spent here.
     if !state
-        .topics_limiter
+        .admin_limiters
+        .free_send
         .check(&format!("admin:send:{}", user.user_id))
     {
         return Err(AdminError::too_many_requests());
@@ -734,7 +734,8 @@ mod tests {
     #[tokio::test]
     async fn free_send_rate_limited_per_user() {
         let harness = setup("owner", &[]).await;
-        for attempt in 0..30 {
+        // T13-A: the free send has its own budget of 10 per minute.
+        for attempt in 0..10 {
             let (status, _) =
                 free_send(&harness, json!({ "title": "A title", "topic": "news" })).await;
             assert_eq!(status, StatusCode::OK, "attempt {}", attempt);
@@ -744,6 +745,27 @@ mod tests {
             free_send(&harness, json!({ "title": "A title", "topic": "news" })).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(body["error"], "rate_limited");
+    }
+
+    #[tokio::test]
+    async fn free_send_has_own_limiter_and_does_not_consume_topics() {
+        let harness = setup("owner", &[]).await;
+
+        // The budget of the topics routes is untouched before the free send
+        // spends its own.
+        assert!(!harness.state.topics_limiter.is_blocked("ip:127.0.0.1"));
+
+        for _ in 0..10 {
+            let (status, _) =
+                free_send(&harness, json!({ "title": "A title", "topic": "news" })).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, _) = free_send(&harness, json!({ "title": "A title", "topic": "news" })).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // The free send spent its own budget, never the budget of the topics
+        // routes.
+        assert!(!harness.state.topics_limiter.is_blocked("ip:127.0.0.1"));
     }
 
     #[tokio::test]

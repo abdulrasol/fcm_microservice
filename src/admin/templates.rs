@@ -496,8 +496,11 @@ pub async fn test_send(
         .map_err(|error| AdminError::from_db("read the test uid", error))?
         .ok_or_else(|| AdminError::invalid_request("Set a test_uid on your account first"))?;
 
+    // T13-A: the test send has its own budget; the budget of the failed
+    // authentications is never spent here.
     if !state
-        .auth_fail_limiter
+        .admin_limiters
+        .test_send
         .check(&format!("{}{}", TEST_SEND_KEY_PREFIX, user.user_id))
     {
         return Err(AdminError::too_many_requests());
@@ -1199,6 +1202,40 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(body["error"], "rate_limited");
+    }
+
+    #[tokio::test]
+    async fn test_send_has_own_limiter_and_does_not_consume_auth_failures() {
+        let harness = setup("owner", &[]).await;
+        harness.set_test_uid("tester").await;
+        let _ = create(&harness, "sample", sample_template()).await;
+
+        // The budget of the failed authentications is untouched before the
+        // test send spends its own.
+        assert!(!harness.state.auth_fail_limiter.is_blocked("ip:127.0.0.1"));
+
+        for _ in 0..10 {
+            let (status, _) = harness
+                .call(
+                    Method::POST,
+                    &format!("/apps/{}/templates/sample/test-send", APP),
+                    Some(preview_body()),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, _) = harness
+            .call(
+                Method::POST,
+                &format!("/apps/{}/templates/sample/test-send", APP),
+                Some(preview_body()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // The test send spent its own budget, never the budget of the failed
+        // authentications.
+        assert!(!harness.state.auth_fail_limiter.is_blocked("ip:127.0.0.1"));
     }
 
     #[tokio::test]

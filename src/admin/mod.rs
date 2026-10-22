@@ -735,6 +735,7 @@ pub(crate) mod tests {
             legacy: Arc::new(crate::legacy::LegacyGuard::new(
                 crate::legacy::DEFAULT_LEGACY_RATE_LIMIT_PER_MINUTE,
             )),
+            admin_limiters: crate::AdminLimiters::new(),
         })
     }
 
@@ -2452,6 +2453,41 @@ pub(crate) mod tests {
         let (status, body) = call(&router, Method::GET, "/apps", None, Some(&token), true).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "password_change_required");
+    }
+
+    #[test]
+    fn borrowed_limiters_not_used_outside_original_routes() {
+        // The admin routes have their own budgets. The names are built here so
+        // this file never holds the name of a borrowed budget.
+        let borrowed = ["auth_fail", "topics", "devices"]
+            .iter()
+            .map(|family| format!(".{family}_limiter"))
+            .collect::<Vec<String>>();
+
+        let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/admin");
+        let entries = std::fs::read_dir(&folder).expect("the admin folder must be readable");
+        for entry in entries {
+            let path = entry.expect("the entry must be readable").path();
+            if path.extension().and_then(|value| value.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("the file must be readable");
+            // The tests may look at the budget of another route to prove it
+            // is untouched; the production code may not use it.
+            let production = match text.find("#[cfg(test)]") {
+                Some(index) => &text[..index],
+                None => text.as_str(),
+            };
+            for name in &borrowed {
+                // A field access means the budget is borrowed; the field of
+                // the state itself is written without a dot.
+                assert!(
+                    !production.contains(name.as_str()),
+                    "{} must not use the budget of another route ({name})",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[tokio::test]
