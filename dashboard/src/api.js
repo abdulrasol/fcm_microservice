@@ -1,92 +1,108 @@
+// The HTTP layer of the dashboard.
+//
+// One axios instance for the admin API: the session cookie travels with every
+// request, the CSRF header is on every request, and every failure becomes an
+// ApiError with a stable shape.
+
 import axios from 'axios'
-import { auth, waitForAuth } from './firebase'
+import { safeRedirect } from './lib/redirect'
+
+export const API_BASE = '/api/v1/admin'
+export const CSRF_HEADER = 'X-Requested-With'
+export const CSRF_VALUE = 'fcm-dashboard'
+export const LOGIN_PATH = '/login'
+
+/** A failure of the admin API, with a stable shape for the views. */
+export class ApiError extends Error {
+  constructor({ status = 0, code = 'unknown', message = '', issues = null, currentVersion = null } = {}) {
+    super(message || code)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+    this.message = message
+    this.issues = issues
+    this.currentVersion = currentVersion
+  }
+}
 
 const api = axios.create({
-  baseURL: '/api/v1',
+  baseURL: API_BASE,
+  withCredentials: true,
 })
 
-let selectedApp = ''
+// The session module registers the handler, so the two modules do not import
+// each other.
+let unauthorizedHandler = null
 
-export function setSelectedApp(appName) {
-  selectedApp = typeof appName === 'string' ? appName.trim() : ''
+/** Registers what happens when the server answers 401. */
+export function setUnauthorizedHandler(handler) {
+  unauthorizedHandler = handler
 }
 
-export function getSelectedApp() {
-  return selectedApp
+// The browser navigation is replaceable, so the tests can watch it.
+let navigate = (target) => {
+  window.location.assign(target)
 }
 
-function acceptsAppParam(url) {
-  const path = String(url || '').split('?')[0]
-  return path === '/send' || path === '/history' || path === '/topics'
+/** Replaces the navigation of the browser (the tests use it). */
+export function setNavigator(fn) {
+  navigate = fn
 }
 
-function isPlainObject(value) {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-}
-
-function withSelectedApp(config) {
-  if (!selectedApp || config.skipDefaultApp || !acceptsAppParam(config.url)) {
-    return config
+/**
+ * The login page with the path to come back to.
+ *
+ * Only a path inside the dashboard is kept.
+ */
+export function loginRedirect(current) {
+  const target = safeRedirect((current && (current.redirect || current.path)) || '/')
+  if (target === '/') {
+    return LOGIN_PATH
   }
+  return `${LOGIN_PATH}?redirect=${encodeURIComponent(target)}`
+}
 
-  const method = String(config.method || 'get').toLowerCase()
-  if (method === 'get') {
-    const hasAppInUrl = /[?&]app=/.test(String(config.url || ''))
-    if (!hasAppInUrl && config.params?.app === undefined) {
-      config.params = { ...(config.params || {}), app: selectedApp }
-    }
-  } else if (isPlainObject(config.data)) {
-    if (config.data.app === undefined) {
-      config.data = { ...config.data, app: selectedApp }
-    }
-  }
-
+/** Puts the CSRF header on every request. */
+export function requestInterceptor(config) {
+  config.headers = config.headers || {}
+  config.headers[CSRF_HEADER] = CSRF_VALUE
   return config
 }
 
-api.interceptors.request.use(async (config) => {
-  const user = await waitForAuth()
-  if (user) {
-    const forceRefresh = config.forceTokenRefresh === true
-    const token = await user.getIdToken(forceRefresh)
-    config.headers = config.headers || {}
-    config.headers.Authorization = `Bearer ${token}`
+/** Turns any failure into an ApiError. */
+export function normalizeError(error) {
+  if (error instanceof ApiError) {
+    return error
   }
-  return withSelectedApp(config)
-})
-
-let redirectingToLogin = false
-
-function redirectToLogin() {
-  if (redirectingToLogin || window.location.pathname === '/login') return
-  redirectingToLogin = true
-  window.location.assign('/login')
+  const response = error && error.response
+  if (!response) {
+    return new ApiError({ status: 0, code: 'network', message: '' })
+  }
+  const body = response.data && typeof response.data === 'object' ? response.data : {}
+  const code = typeof body.error === 'string' ? body.error : 'unknown'
+  const message = typeof body.message === 'string' ? body.message : ''
+  const issues = Array.isArray(body.issues) ? body.issues : null
+  const currentVersion = typeof body.current_version === 'number' ? body.current_version : null
+  return new ApiError({ status: response.status, code, message, issues, currentVersion })
 }
 
+/** Turns a failure into an ApiError and sends the account back to the login. */
+export function responseInterceptor(error) {
+  const apiError = normalizeError(error)
+  const url = (error && error.config && error.config.url) || ''
+  if (apiError.status === 401 && !url.includes('/auth/login')) {
+    if (unauthorizedHandler) {
+      unauthorizedHandler()
+    }
+    navigate(loginRedirect({ path: window.location.pathname }))
+  }
+  return Promise.reject(apiError)
+}
+
+api.interceptors.request.use(requestInterceptor)
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
-    const status = error.response?.status
-    const original = error.config
-
-    if (status === 401) {
-      if (original && !original.authRetried) {
-        original.authRetried = true
-        const user = auth?.currentUser
-        if (user) {
-          original.forceTokenRefresh = true
-          return api(original)
-        }
-      }
-      redirectToLogin()
-    } else if (status === 403) {
-      error.friendlyMessage = 'هذا الحساب ليس أدمن لهذا التطبيق'
-    } else if (status === 503) {
-      error.friendlyMessage = 'تعذر التحقق من الصلاحية، حاول لاحقاً'
-    }
-
-    return Promise.reject(error)
-  },
+  responseInterceptor,
 )
 
 export default api
