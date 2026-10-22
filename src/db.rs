@@ -1318,6 +1318,68 @@ pub async fn list_disabled_apps(pool: &SqlitePool) -> Result<Vec<String>, sqlx::
     Ok(apps)
 }
 
+/// Marks an app as disabled.
+pub async fn set_app_disabled(
+    pool: &SqlitePool,
+    app: &str,
+    disabled_by: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO app_disabled (app, disabled_by) VALUES (?, ?) \
+         ON CONFLICT(app) DO UPDATE SET disabled_by = excluded.disabled_by, \
+         disabled_at = CURRENT_TIMESTAMP",
+    )
+    .bind(app)
+    .bind(disabled_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Marks an app as enabled again.
+pub async fn clear_app_disabled(pool: &SqlitePool, app: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM app_disabled WHERE app = ?")
+        .bind(app)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Remembers who uploaded the credential file of an app.
+pub async fn record_app_credentials(
+    pool: &SqlitePool,
+    app: &str,
+    uploaded_by: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO app_credentials (app, uploaded_by) VALUES (?, ?) \
+         ON CONFLICT(app) DO UPDATE SET uploaded_by = excluded.uploaded_by, \
+         uploaded_at = CURRENT_TIMESTAMP",
+    )
+    .bind(app)
+    .bind(uploaded_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The uploader and the upload time of the credential file of an app.
+pub async fn app_credentials_info(
+    pool: &SqlitePool,
+    app: &str,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    let row = sqlx::query("SELECT uploaded_by, uploaded_at FROM app_credentials WHERE app = ?")
+        .bind(app)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|row| {
+        (
+            row.get::<String, _>("uploaded_by"),
+            row.get::<String, _>("uploaded_at"),
+        )
+    }))
+}
+
 /// Removes the upload information of an app.
 pub async fn forget_app_credentials(pool: &SqlitePool, app: &str) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM app_credentials WHERE app = ?")

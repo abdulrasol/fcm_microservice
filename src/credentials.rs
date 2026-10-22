@@ -598,6 +598,58 @@ impl CredentialManager {
         Ok(())
     }
 
+    /// Stops an app at once: the file stays, the app sends nothing.
+    pub async fn disable(&self, app: &str) -> Result<(), CredentialError> {
+        if !app_name_ok(app) {
+            return Err(CredentialError::Invalid("the app name is not valid"));
+        }
+        let _guard = self.lock.lock().await;
+        self.disabled.write().await.insert(app.to_string());
+        self.auth_map.write().await.remove(app);
+        self.project_map.write().await.remove(app);
+        Ok(())
+    }
+
+    /// Starts a disabled app again.
+    pub async fn enable(&self, app: &str) -> Result<(), CredentialError> {
+        if !app_name_ok(app) {
+            return Err(CredentialError::Invalid("the app name is not valid"));
+        }
+        let _guard = self.lock.lock().await;
+        let target = self.path_of(app);
+        if !target.exists() {
+            return Err(CredentialError::NotFound);
+        }
+        self.disabled.write().await.remove(app);
+        load_credential(
+            &target,
+            self.auth_map.clone(),
+            self.project_map.clone(),
+            &self.disabled,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Removes the credential file of an app.
+    pub async fn remove(&self, app: &str) -> Result<(), CredentialError> {
+        if !app_name_ok(app) {
+            return Err(CredentialError::Invalid("the app name is not valid"));
+        }
+        let _guard = self.lock.lock().await;
+        let target = self.path_of(app);
+        if target.exists() {
+            if let Err(error) = tokio::fs::remove_file(&target).await {
+                tracing::error!(app = %app, error = %error, "the credential file could not be removed");
+                return Err(CredentialError::Io);
+            }
+        }
+        self.disabled.write().await.remove(app);
+        self.auth_map.write().await.remove(app);
+        self.project_map.write().await.remove(app);
+        Ok(())
+    }
+
     /// The public information about the credential of an app.
     pub async fn metadata(&self, app: &str) -> Option<CredentialMeta> {
         if !app_name_ok(app) {
@@ -1011,7 +1063,34 @@ pub(crate) mod tests {
         assert!(old_email.ends_with(".gserviceaccount.com"));
     }
 
+    #[tokio::test]
+    async fn replace_swaps_atomically_and_keeps_old_on_load_failure() {
+        let dir = fresh_dir();
+        let manager = manager(&dir, true);
+        manager
+            .install("watt", &service_account("demo-project", "key-1"), false)
+            .await
+            .expect("the file must be installed");
 
+        // A disabled app is never loaded, so the new file cannot be used: the
+        // old one must come back.
+        manager
+            .disable("watt")
+            .await
+            .expect("the app must be disabled");
+        let error = manager
+            .install("watt", &service_account("demo-project", "key-2"), true)
+            .await
+            .expect_err("the file that cannot be loaded must be refused");
+        assert!(matches!(error, CredentialError::Io));
+
+        let content = std::fs::read_to_string(dir.join("watt.json")).expect("the file must exist");
+        assert!(
+            content.contains("key-1"),
+            "the old file must come back: {}",
+            content
+        );
+    }
 
     #[tokio::test]
     async fn no_temp_files_left_after_failure() {
@@ -1113,13 +1192,117 @@ pub(crate) mod tests {
 
     // ---------- the disable and the removal ----------
 
+    #[tokio::test]
+    async fn disable_stops_app_immediately() {
+        let dir = fresh_dir();
+        let manager = manager(&dir, true);
+        manager
+            .install("watt", &service_account("demo-project", "key-1"), false)
+            .await
+            .expect("the file must be installed");
 
+        manager
+            .disable("watt")
+            .await
+            .expect("the app must be disabled");
 
+        assert!(manager.is_disabled("watt").await);
+        assert!(
+            !manager.project_map.read().await.contains_key("watt"),
+            "the app must be unknown now"
+        );
+        assert!(dir.join("watt.json").exists(), "the file stays");
+    }
 
+    #[tokio::test]
+    async fn disabled_app_not_reloaded_by_scan_or_watcher() {
+        let dir = fresh_dir();
+        let manager = manager(&dir, true);
+        manager
+            .install("watt", &service_account("demo-project", "key-1"), false)
+            .await
+            .expect("the file must be installed");
+        manager
+            .disable("watt")
+            .await
+            .expect("the app must be disabled");
 
+        let auth_map: AuthMap = Arc::new(RwLock::new(HashMap::new()));
+        let project_map: ProjectIdMap = Arc::new(RwLock::new(HashMap::new()));
+        let disabled = manager.disabled.clone();
+        scan_credentials_dir(&dir, auth_map.clone(), project_map.clone(), &disabled).await;
+        load_credential(
+            &dir.join("watt.json"),
+            auth_map.clone(),
+            project_map.clone(),
+            &disabled,
+        )
+        .await;
 
+        assert!(
+            project_map.read().await.is_empty(),
+            "a disabled app stays disabled"
+        );
+    }
 
+    #[tokio::test]
+    async fn enable_reloads_file() {
+        let dir = fresh_dir();
+        let manager = manager(&dir, true);
+        manager
+            .install("watt", &service_account("demo-project", "key-1"), false)
+            .await
+            .expect("the file must be installed");
+        manager
+            .disable("watt")
+            .await
+            .expect("the app must be disabled");
 
+        manager
+            .enable("watt")
+            .await
+            .expect("the app must be enabled");
+        assert!(!manager.is_disabled("watt").await);
+        assert_eq!(
+            manager.project_map.read().await.get("watt").cloned(),
+            Some("demo-project".to_string())
+        );
+    }
 
+    #[tokio::test]
+    async fn disabled_state_survives_restart() {
+        // The disabled apps live in the database, so a new process knows them.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("the database must open");
+        crate::db::migrate(&pool)
+            .await
+            .expect("the migration must run");
+        crate::db::set_app_disabled(&pool, "watt", "owner@example.com")
+            .await
+            .expect("the app must be disabled");
+        let disabled = crate::db::list_disabled_apps(&pool)
+            .await
+            .expect("the list must run");
+        assert_eq!(disabled, vec!["watt".to_string()]);
+    }
 
+    #[tokio::test]
+    async fn remove_deletes_file_and_maps() {
+        let dir = fresh_dir();
+        let manager = manager(&dir, true);
+        manager
+            .install("watt", &service_account("demo-project", "key-1"), false)
+            .await
+            .expect("the file must be installed");
+
+        manager
+            .remove("watt")
+            .await
+            .expect("the app must be removed");
+        assert!(!dir.join("watt.json").exists(), "the file must be gone");
+        assert!(!manager.project_map.read().await.contains_key("watt"));
+    }
 }
