@@ -163,7 +163,7 @@ curl -s -X POST https://fcm.example.com/api/v1/send/template \
 ```python
 import requests
 
-APP_KEY = "fcm_watt_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v"  # مفتاح التطبيق من الداشبورد
+APP_KEY = os.environ.get("FCM_APP_KEY", "fcm_watt_<43-char-random>")  # مفتاح التطبيق من الداشبورد
 FCM_SERVER = "https://fcm.example.com"
 
 response = requests.post(

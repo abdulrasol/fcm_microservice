@@ -142,7 +142,7 @@ curl -s -X POST https://fcm.example.com/api/v1/send/template \
 ```python
 import requests
 
-APP_KEY = "fcm_fastapi_app_xyz1234567890abcdefghijklmnopqrstuv"
+APP_KEY = os.environ.get("FCM_APP_KEY", "fcm_fastapi_app_<43-char-random>")
 FCM_SERVER = "https://fcm.example.com"
 
 response = requests.post(

@@ -733,7 +733,7 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
   ومعاينة، وإرسال تجريبي لجهاز حقيقي، وتراجع لإصدار سابق، وموافقة/رفض حملة. لقطات شاشة في سجل التقدم.
 
 ### T13 — المفتاح القديم المقيد + التوثيق
-- **الحالة:** ⬜
+- **الحالة:** ✅
 - **الملفات:** `src/auth.rs`، `.env.example`، `docs.md`، `README.md`، `.agent.md`، `curl_api.md`، `docs/integration/` (جديد).
 - **الخطوات:** حد `LEGACY_RATE_LIMIT_PER_MINUTE` وتحذير يومي. الوثائق:
   - جدول الصلاحيات الكامل.
