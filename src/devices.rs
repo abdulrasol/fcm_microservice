@@ -1206,6 +1206,9 @@ mod tests {
             template_rate: Arc::new(crate::db::TemplateRateLimiter::new()),
             // T16: the device tests never touch the credential files.
             credentials,
+            legacy: Arc::new(crate::legacy::LegacyGuard::new(
+                crate::legacy::DEFAULT_LEGACY_RATE_LIMIT_PER_MINUTE,
+            )),
         })
     }
 

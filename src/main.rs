@@ -9,6 +9,7 @@ mod datasource;
 mod db;
 mod devices;
 mod identity;
+mod legacy;
 mod ratelimit;
 mod roles;
 mod send;
@@ -88,6 +89,8 @@ struct AppState {
     template_rate: Arc<TemplateRateLimiter>,
     /// T16: the manager of the credential files.
     credentials: Arc<credentials::CredentialManager>,
+    /// T13-A: the budget of the legacy API key.
+    legacy: Arc<legacy::LegacyGuard>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -178,6 +181,16 @@ async fn main() {
     let legacy_api_key = env_optional("API_KEY");
     let legacy_enabled = env_flag("LEGACY_API_KEY_ENABLED");
     let trust_proxy = env_flag("TRUST_PROXY");
+
+    // The budget of the legacy key. Only this file reads the variable.
+    let legacy_limit = {
+        let raw = env_optional("LEGACY_RATE_LIMIT_PER_MINUTE");
+        let limit = legacy::legacy_limit_from_env(raw.as_deref());
+        if let Some(warning) = limit.warning.as_deref() {
+            tracing::warn!("{}", warning);
+        }
+        limit
+    };
 
     if service_api_key.is_none() {
         tracing::warn!("SERVICE_API_KEY is not set; service-key authentication is disabled");
@@ -349,6 +362,7 @@ async fn main() {
         role_directory: Arc::new(RoleDirectory::new()),
         template_rate: Arc::new(TemplateRateLimiter::new()),
         credentials: credential_manager,
+        legacy: Arc::new(legacy::LegacyGuard::new(legacy_limit.limit)),
     });
 
     // Serve static files from "dist", fallback to index.html for SPA routing
@@ -414,6 +428,23 @@ fn warn_about_service_key(service_api_key: Option<&str>) -> bool {
     } else {
         false
     }
+}
+
+/// The refusal of a request that spent the budget of the legacy key.
+///
+/// The answer carries `Retry-After`, so the client waits instead of retrying
+/// in a loop.
+fn legacy_rate_limited() -> (StatusCode, HeaderMap, String) {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_static(legacy::LEGACY_RATE_LIMIT_WINDOW_STR),
+    );
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        headers,
+        legacy::LEGACY_LIMIT_MESSAGE.to_string(),
+    )
 }
 
 fn env_optional(name: &str) -> Option<String> {
@@ -791,12 +822,24 @@ async fn send_notification(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SendNotificationRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
     let identity = state
         .auth
         .authenticate_send(&headers, &payload.app)
         .await
         .map_err(|error| auth_error_with_limit(&state, &headers, peer, error))?;
+
+    // The legacy key has its own budget: it never spends the budget of the
+    // service key, of an application key or of the address limits.
+    if identity.is_legacy() {
+        if !state.legacy.allow() {
+            return Ok(legacy_rate_limited().into_response());
+        }
+        let day = legacy::utc_day(SystemTime::now());
+        if let Some(uses) = state.legacy.note_use(day) {
+            tracing::warn!("{}", legacy::legacy_warning_message(uses));
+        }
+    }
 
     validation::validate_send(
         &payload.app,
@@ -911,7 +954,7 @@ async fn send_notification(
                 identity.email.as_deref(),
             )
             .await;
-            Ok(raw_send_success_response(body))
+            Ok(raw_send_success_response(body).into_response())
         }
         Ok(FcmOutcome::Rejected {
             http_status, body, ..
@@ -928,7 +971,7 @@ async fn send_notification(
                 identity.email.as_deref(),
             )
             .await;
-            Ok(raw_send_fcm_error_response(http_status, &body))
+            Ok(raw_send_fcm_error_response(http_status, &body).into_response())
         }
         Err(SendError::Auth) => Err((
             StatusCode::BAD_GATEWAY,
@@ -2048,7 +2091,24 @@ mod tests {
         client: Client,
         make_fcm: impl FnOnce(&Client, &AuthMap) -> Arc<dyn FcmTransport>,
     ) -> Arc<AppState> {
-        build_state(client, make_fcm).await.0
+        build_state(
+            client,
+            make_fcm,
+            legacy::DEFAULT_LEGACY_RATE_LIMIT_PER_MINUTE,
+        )
+        .await
+        .0
+    }
+
+    /// A state whose legacy key has a small budget, for the limit tests.
+    async fn test_state_with_legacy_limit(client: Client, limit: usize) -> Arc<AppState> {
+        build_state(
+            client,
+            |client, auth_map| Arc::new(HttpFcm::new(client.clone(), auth_map.clone())),
+            limit,
+        )
+        .await
+        .0
     }
 
     struct Harness {
@@ -2082,6 +2142,7 @@ mod tests {
     async fn build_state(
         client: Client,
         make_fcm: impl FnOnce(&Client, &AuthMap) -> Arc<dyn FcmTransport>,
+        legacy_limit: usize,
     ) -> (
         Arc<AppState>,
         Arc<ConfigStore>,
@@ -2170,6 +2231,7 @@ mod tests {
             role_directory: Arc::new(RoleDirectory::new()),
             template_rate: Arc::new(TemplateRateLimiter::new()),
             credentials,
+            legacy: Arc::new(legacy::LegacyGuard::new(legacy_limit)),
         });
 
         (state, config, pool, project_map, auth_map)
@@ -2193,6 +2255,39 @@ mod tests {
             .extensions_mut()
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
         request
+    }
+
+    /// A `/send` request with the given bearer token.
+    fn send_request_with_key(body: Value, key: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .body(Body::from(body.to_string()))
+            .expect("the request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+        request
+    }
+
+    /// The answer of a request with its status, its body and its headers.
+    async fn call_full(router: &Router, request: Request<Body>) -> (StatusCode, String, HeaderMap) {
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router must answer");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("the body must be readable")
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string(), headers)
     }
 
     async fn call(router: &Router, request: Request<Body>) -> (StatusCode, String) {
@@ -2344,6 +2439,71 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body, "Network error while calling Firebase");
+    }
+
+    // ---------- the legacy key budget (T13-A) ----------
+
+    #[tokio::test]
+    async fn legacy_key_limited_per_minute_returns_429() {
+        let state = test_state_with_legacy_limit(test_client(), 2).await;
+        let router = send_router(state);
+        let body = json!({ "app": APP, "topic": "all", "title": "Hi" });
+
+        for _ in 0..2 {
+            let (status, _) = call(&router, send_request_with_key(body.clone(), LEGACY_KEY)).await;
+            assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        let (status, text) = call(&router, send_request_with_key(body.clone(), LEGACY_KEY)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            text.contains("legacy API key"),
+            "the refusal must name the legacy key: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_key_limit_has_retry_after() {
+        let state = test_state_with_legacy_limit(test_client(), 1).await;
+        let router = send_router(state);
+        let body = json!({ "app": APP, "topic": "all", "title": "Hi" });
+
+        let _ = call(&router, send_request_with_key(body.clone(), LEGACY_KEY)).await;
+        let (status, _, headers) =
+            call_full(&router, send_request_with_key(body, LEGACY_KEY)).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = headers
+            .get(header::RETRY_AFTER)
+            .expect("the refusal must carry Retry-After");
+        assert_eq!(retry_after.to_str().unwrap_or_default(), "60");
+    }
+
+    #[tokio::test]
+    async fn legacy_key_limit_does_not_affect_app_key_or_service_key() {
+        let state = test_state_with_legacy_limit(test_client(), 1).await;
+        let router = send_router(state.clone());
+        let body = json!({ "app": APP, "topic": "all", "title": "Hi" });
+
+        // The legacy key spends the whole budget.
+        let _ = call(&router, send_request_with_key(body.clone(), LEGACY_KEY)).await;
+        let (status, _) = call(&router, send_request_with_key(body.clone(), LEGACY_KEY)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // The service key is not refused by the budget of the legacy key.
+        let (status, _) = call(&router, send_request_with_key(body.clone(), SERVICE_KEY)).await;
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // An application key of the app is not refused either.
+        let key = state
+            .auth
+            .app_keys()
+            .expect("the store of the application keys must be there")
+            .create(APP, "tester", "tester@test.local")
+            .await
+            .expect("the application key must be created");
+        let (status, _) = call(&router, send_request_with_key(body.clone(), &key.key)).await;
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
     }
 
     // ---------- template route ----------

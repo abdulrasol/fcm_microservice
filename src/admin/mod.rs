@@ -732,6 +732,9 @@ pub(crate) mod tests {
             role_directory: Arc::new(crate::devices::RoleDirectory::new()),
             template_rate: Arc::new(crate::db::TemplateRateLimiter::new()),
             credentials,
+            legacy: Arc::new(crate::legacy::LegacyGuard::new(
+                crate::legacy::DEFAULT_LEGACY_RATE_LIMIT_PER_MINUTE,
+            )),
         })
     }
 

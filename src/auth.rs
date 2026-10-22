@@ -62,6 +62,11 @@ impl AdminIdentity {
         self.uid == "service"
     }
 
+    /// True when the request was accepted because of the legacy API key.
+    pub fn is_legacy(&self) -> bool {
+        self.uid == "legacy"
+    }
+
     /// The identity of an application key.
     pub fn app_key(id: i64) -> Self {
         Self {
