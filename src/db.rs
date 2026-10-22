@@ -163,6 +163,32 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // T16: the state of the credential files. No secret is stored here: the
+    // file itself lives in the credentials directory.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS app_disabled (
+            app TEXT PRIMARY KEY,
+            disabled_by TEXT NOT NULL,
+            disabled_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS app_credentials (
+            app TEXT PRIMARY KEY,
+            uploaded_by TEXT NOT NULL,
+            uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS tool_sessions (
@@ -1280,6 +1306,55 @@ pub async fn device_stats(pool: &SqlitePool, app: &str) -> Result<DeviceStats, s
         active_last_7d: count("active"),
         newest_last_seen: row.try_get("newest").unwrap_or_default(),
     })
+}
+
+// ---------- T16: the state of the credential files ----------
+
+/// The apps that are disabled. The rows are loaded at startup.
+pub async fn list_disabled_apps(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+    let apps: Vec<String> = sqlx::query_scalar("SELECT app FROM app_disabled ORDER BY app")
+        .fetch_all(pool)
+        .await?;
+    Ok(apps)
+}
+
+/// Removes the upload information of an app.
+pub async fn forget_app_credentials(pool: &SqlitePool, app: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM app_credentials WHERE app = ?")
+        .bind(app)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Deletes the devices of an app.
+pub async fn delete_app_devices(pool: &SqlitePool, app: &str) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM devices WHERE app = ?")
+        .bind(app)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Revokes every key of an app.
+pub async fn revoke_app_keys(pool: &SqlitePool, app: &str) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE app_keys SET revoked_at = CURRENT_TIMESTAMP \
+         WHERE app = ? AND revoked_at IS NULL",
+    )
+    .bind(app)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Deletes the dedupe keys of an app.
+pub async fn delete_app_dedupe(pool: &SqlitePool, app: &str) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM template_dedupe WHERE app = ?")
+        .bind(app)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 // ---------- T10-C: dashboard accounts ----------

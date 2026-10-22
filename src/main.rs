@@ -219,9 +219,28 @@ async fn main() {
     let auth_map: AuthMap = Arc::new(RwLock::new(HashMap::new()));
     let project_map: ProjectIdMap = Arc::new(RwLock::new(HashMap::new()));
 
-    let creds_dir = PathBuf::from("credentials");
-    credentials::scan_credentials_dir(&creds_dir, auth_map.clone(), project_map.clone()).await;
-    credentials::watch_credentials_dir(creds_dir.clone(), auth_map.clone(), project_map.clone());
+    let creds_dir = PathBuf::from(
+        std::env::var("CREDENTIALS_DIR").unwrap_or_else(|_| "credentials".to_string()),
+    );
+    let disabled_apps: credentials::DisabledApps =
+        Arc::new(RwLock::new(std::collections::HashSet::new()));
+    // The disabled apps are known before the first scan, so they stay off.
+    for app in db::list_disabled_apps(&db_pool).await.unwrap_or_default() {
+        disabled_apps.write().await.insert(app);
+    }
+    credentials::scan_credentials_dir(
+        &creds_dir,
+        auth_map.clone(),
+        project_map.clone(),
+        &disabled_apps,
+    )
+    .await;
+    credentials::watch_credentials_dir(
+        creds_dir.clone(),
+        auth_map.clone(),
+        project_map.clone(),
+        disabled_apps,
+    );
 
     let config_store = match ConfigStore::new(db_pool.clone()).await {
         Ok(store) => Arc::new(store),
@@ -2089,7 +2108,6 @@ mod tests {
             dummy_hash: "unused in send tests".to_string(),
             allowed_origins: Vec::new(),
         });
-
         let state = Arc::new(AppState {
             db: pool.clone(),
             auth_map: auth_map.clone(),
