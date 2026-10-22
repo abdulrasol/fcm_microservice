@@ -2,7 +2,7 @@
 import { onMounted, ref } from 'vue'
 import api from '../api'
 import strings from '../strings'
-import { isOwner, session } from '../session'
+import { session } from '../session'
 
 const rows = ref([])
 const apps = ref([])
@@ -12,6 +12,17 @@ const failed = ref(false)
 const expanded = ref(null)
 const more = ref(false)
 
+/** True when the signed-in account is an owner. */
+function isOwnerAccount() {
+  return Boolean(session.me) && session.me.role === 'owner'
+}
+
+/**
+ * Reads a page of the audit log.
+ *
+ * The `app` filter stays optional for everyone: the owner sees every app and
+ * a manager sees the apps bound to the account without naming one.
+ */
 async function load(reset = true) {
   if (reset) {
     rows.value = []
@@ -63,11 +74,13 @@ function toggleDetail(row) {
       <label class="field audit__filter">
         <span>{{ strings.audit.filterApp }}</span>
         <select v-model="app" @change="load()">
-          <option value="">{{ strings.audit.allApps }}</option>
+          <option value="">{{ isOwnerAccount() ? strings.audit.allApps : strings.audit.myApps }}</option>
           <option v-for="name in apps" :key="name" :value="name">{{ name }}</option>
         </select>
       </label>
     </div>
+
+    <p v-if="!isOwnerAccount()" class="muted audit__hint">{{ strings.audit.managerHint }}</p>
 
     <p v-if="loading && rows.length === 0" class="muted">{{ strings.common.loading }}</p>
     <p v-else-if="failed" class="error">{{ strings.errors.server }}</p>
@@ -126,6 +139,11 @@ function toggleDetail(row) {
 
 .audit__filter {
   min-width: 12rem;
+}
+
+.audit__hint {
+  margin: 0 0 0.75rem;
+  font-size: 0.85rem;
 }
 
 .audit__table {

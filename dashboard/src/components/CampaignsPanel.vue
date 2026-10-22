@@ -35,6 +35,25 @@ function isBlocked(entityId) {
   return blockedEntities.value.includes(entityId)
 }
 
+/**
+ * The quota of the company of a campaign.
+ *
+ * The backend sends the campaigns that are left today for the company, or
+ * `null` when the app has no campaign quota at all.
+ */
+function quotaText(campaign) {
+  const remaining = campaign.company_quota_remaining
+  if (remaining === null || remaining === undefined) {
+    return strings.campaigns.noQuota
+  }
+  return String(remaining)
+}
+
+/** True when the company has no campaign left today. */
+function quotaEmpty(campaign) {
+  return campaign.company_quota_remaining === 0
+}
+
 async function load() {
   loading.value = true
   failed.value = false
@@ -174,6 +193,10 @@ async function confirmBlock() {
         <p class="campaigns__body">{{ campaign.body }}</p>
         <p v-if="campaign.image" class="muted mono">{{ campaign.image }}</p>
         <p class="muted">{{ describeAudience(campaign) }}</p>
+
+        <p class="campaigns__quota" :class="{ 'campaigns__quota--warn': quotaEmpty(campaign) }">
+          {{ strings.campaigns.quota }}: {{ quotaText(campaign) }}
+        </p>
 
         <details v-if="isOwner" class="campaigns__condition">
           <summary>{{ strings.campaigns.condition }}</summary>
@@ -316,6 +339,17 @@ async function confirmBlock() {
   padding: 0.4rem;
   margin: 0.35rem 0 0;
   overflow: auto;
+}
+
+.campaigns__quota {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #374151;
+}
+
+.campaigns__quota--warn {
+  color: #b45309;
+  font-weight: 600;
 }
 
 .campaigns__actions {

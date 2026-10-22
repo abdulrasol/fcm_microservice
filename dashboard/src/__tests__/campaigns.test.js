@@ -33,6 +33,7 @@ vi.mock('../session', () => ({
 
 const { default: CampaignsPanel } = await import('../components/CampaignsPanel.vue')
 const { describeAudience, topicText } = await import('../lib/audience')
+const { default: strings } = await import('../strings')
 
 const OWNER = {
   id: 1,
@@ -146,5 +147,58 @@ describe('the queue of the campaigns', () => {
 
     expect(wrapper.vm.isBlocked('company-1')).toBe(true)
     expect(wrapper.html()).toContain('محظورة')
+  })
+
+  it('campaign_card_shows_remaining_quota', async () => {
+    get.mockImplementation((url) => {
+      if (String(url).includes('/blocks')) {
+        return Promise.resolve({ data: [] })
+      }
+      return Promise.resolve({ data: [{ ...CAMPAIGN, company_quota_remaining: 2 }] })
+    })
+
+    const wrapper = mount(CampaignsPanel, { props: { app: 'watt' } })
+    await wrapper.vm.load()
+    await wrapper.vm.$nextTick()
+
+    const quota = wrapper.find('.campaigns__quota')
+    expect(quota.exists()).toBe(true)
+    expect(quota.text()).toContain(strings.campaigns.quota)
+    expect(quota.text()).toContain('2')
+    expect(quota.classes()).not.toContain('campaigns__quota--warn')
+  })
+
+  it('campaign_card_shows_no_quota_label_when_null', async () => {
+    get.mockImplementation((url) => {
+      if (String(url).includes('/blocks')) {
+        return Promise.resolve({ data: [] })
+      }
+      return Promise.resolve({ data: [{ ...CAMPAIGN, company_quota_remaining: null }] })
+    })
+
+    const wrapper = mount(CampaignsPanel, { props: { app: 'watt' } })
+    await wrapper.vm.load()
+    await wrapper.vm.$nextTick()
+
+    const quota = wrapper.find('.campaigns__quota')
+    expect(quota.text()).toContain(strings.campaigns.noQuota)
+    expect(quota.classes()).not.toContain('campaigns__quota--warn')
+  })
+
+  it('campaign_card_warns_when_quota_zero', async () => {
+    get.mockImplementation((url) => {
+      if (String(url).includes('/blocks')) {
+        return Promise.resolve({ data: [] })
+      }
+      return Promise.resolve({ data: [{ ...CAMPAIGN, company_quota_remaining: 0 }] })
+    })
+
+    const wrapper = mount(CampaignsPanel, { props: { app: 'watt' } })
+    await wrapper.vm.load()
+    await wrapper.vm.$nextTick()
+
+    const quota = wrapper.find('.campaigns__quota')
+    expect(quota.text()).toContain('0')
+    expect(quota.classes()).toContain('campaigns__quota--warn')
   })
 })

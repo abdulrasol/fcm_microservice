@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import api from '../api'
 import strings from '../strings'
 
@@ -13,27 +13,38 @@ const failed = ref(false)
 const kind = ref('')
 const status = ref('')
 const refFilter = ref('')
+const since = ref('')
+const until = ref('')
 const limit = ref(20)
 const before = ref(null)
 const detail = ref(null)
 const message = ref('')
+const filterError = ref(false)
 
 const kinds = ['raw', 'template', 'campaign', 'test']
 
 /**
- * The rows of the page, after the filter of the reference.
+ * The end of the selected day, for the `until` filter.
  *
- * The backend filters by the kind and the status, not by the reference, so
- * the reference is filtered here, on the loaded page.
+ * The backend compares the rows with the SQLite `datetime()` function, and a
+ * plain date becomes the midnight of that day. The end of the day keeps the
+ * rows of the chosen day inside the filter.
  */
-const visibleRows = computed(() => {
-  const wanted = refFilter.value.trim()
-  if (!wanted) {
-    return rows.value
+function endOfDay(value) {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return `${value}T23:59:59`
   }
-  return rows.value.filter((row) => String(row.ref || '').includes(wanted))
-})
+  return value
+}
 
+/**
+ * Reads a page of the history.
+ *
+ * The filters are the ones of the backend: the kind, the status, the
+ * reference (an exact match, at most 100 characters), the oldest date and the
+ * newest date. The page is never filtered here, so what is shown is what the
+ * backend answered.
+ */
 async function load(reset = true) {
   if (reset) {
     rows.value = []
@@ -41,6 +52,7 @@ async function load(reset = true) {
   }
   loading.value = true
   failed.value = false
+  filterError.value = false
   try {
     const params = { limit: limit.value }
     if (kind.value) {
@@ -48,6 +60,16 @@ async function load(reset = true) {
     }
     if (status.value) {
       params.status = status.value
+    }
+    const reference = refFilter.value.trim()
+    if (reference) {
+      params.ref = reference
+    }
+    if (since.value) {
+      params.since = since.value
+    }
+    if (until.value) {
+      params.until = endOfDay(until.value)
     }
     if (!reset && before.value) {
       params.before = before.value
@@ -59,6 +81,10 @@ async function load(reset = true) {
     }
   } catch (error) {
     failed.value = true
+    if (error && error.status === 400 && (since.value || until.value)) {
+      // The backend refused one of the dates.
+      filterError.value = true
+    }
   } finally {
     loading.value = false
   }
@@ -95,7 +121,22 @@ async function show(row) {
       </label>
       <label class="field">
         <span>{{ strings.log.ref }}</span>
-        <input v-model="refFilter" type="text" dir="ltr" />
+        <input
+          v-model="refFilter"
+          type="text"
+          dir="ltr"
+          maxlength="100"
+          :title="strings.log.refHint"
+          @change="load()"
+        />
+      </label>
+      <label class="field">
+        <span>{{ strings.log.since }}</span>
+        <input v-model="since" type="date" dir="ltr" @change="load()" />
+      </label>
+      <label class="field">
+        <span>{{ strings.log.until }}</span>
+        <input v-model="until" type="date" dir="ltr" @change="load()" />
       </label>
       <button type="button" class="button button--ghost" :disabled="loading" @click="load()">
         {{ strings.common.retry }}
@@ -103,12 +144,13 @@ async function show(row) {
     </div>
 
     <p v-if="loading" class="muted">{{ strings.common.loading }}</p>
-    <p v-else-if="failed" class="error">{{ strings.errors.server }}</p>
+    <p v-else-if="failed && !filterError" class="error">{{ strings.errors.server }}</p>
+    <p v-if="filterError" class="error">{{ strings.log.badDate }}</p>
     <p v-if="message" class="ok">{{ message }}</p>
-    <p v-if="visibleRows.length === 0 && !loading" class="muted">{{ strings.log.empty }}</p>
+    <p v-if="rows.length === 0 && !loading" class="muted">{{ strings.log.empty }}</p>
 
     <ul v-else class="log__list">
-      <li v-for="row in visibleRows" :key="row.id" class="row log__item">
+      <li v-for="row in rows" :key="row.id" class="row log__item">
         <span class="mono">{{ row.created_at }}</span>
         <span class="badge">{{ row.kind }}</span>
         <span class="mono">{{ row.target }}</span>
