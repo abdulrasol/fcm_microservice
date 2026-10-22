@@ -687,3 +687,69 @@ async fn e2e_blocked_company_cannot_send_via_campaigns_route() {
         "a blocked company must not create a campaign: {body}"
     );
 }
+
+/// Every route of the router must be in the documented table.
+///
+/// `build_router` is built from `public_routes()` and `admin_routes()`, so
+/// comparing those two tables with the static list compares the router. A new
+/// route without a line in `docs/plans/reports/T13A-routes.md` fails the test.
+#[test]
+fn route_table_is_documented() {
+    const DOC: &str = include_str!("../docs/plans/reports/T13A-routes.md");
+    let block = DOC
+        .split("```routes\n")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("the documented route block");
+
+    let mut documented: Vec<(String, String, String)> = Vec::new();
+    for line in block.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let mut fields = line.split('|').map(str::trim);
+        let (Some(method), Some(path), Some(auth)) = (fields.next(), fields.next(), fields.next())
+        else {
+            panic!("the documented line has fewer than three columns: {line}");
+        };
+        assert!(
+            !method.is_empty() && !path.is_empty() && !auth.is_empty(),
+            "the documented line has an empty column: {line}"
+        );
+        documented.push((method.to_string(), path.to_string(), auth.to_string()));
+    }
+
+    let mut actual: Vec<(String, String, String)> = crate::public_route_documentation()
+        .into_iter()
+        .map(|(method, path, auth)| (method, format!("/api/v1{path}"), auth.to_string()))
+        .collect();
+    actual.extend(
+        crate::admin::admin_routes()
+            .into_iter()
+            .map(|(method, path, session, _)| {
+                let auth = if session { "dashboard session" } else { "none" };
+                (
+                    method.to_string(),
+                    format!("/admin{path}"),
+                    auth.to_string(),
+                )
+            }),
+    );
+
+    documented.sort();
+    actual.sort();
+
+    let undocumented: Vec<_> = actual
+        .iter()
+        .filter(|route| !documented.contains(route))
+        .collect();
+    let stale: Vec<_> = documented
+        .iter()
+        .filter(|route| !actual.contains(route))
+        .collect();
+    assert!(
+        undocumented.is_empty() && stale.is_empty(),
+        "undocumented routes: {undocumented:?}; stale document lines: {stale:?}"
+    );
+    assert_eq!(
+        documented, actual,
+        "the documented route table differs from the router"
+    );
+}

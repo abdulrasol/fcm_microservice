@@ -1240,7 +1240,12 @@ mod tests {
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 
         // The test send spent its own budget, never the budget of the failed
-        // authentications.
+        // authentications. The old wiring borrowed the failures limiter with
+        // this exact key, so the check below fails if the wiring comes back.
+        assert!(!harness
+            .state
+            .auth_fail_limiter
+            .is_blocked(&format!("{}{}", TEST_SEND_KEY_PREFIX, harness.user_id)));
         assert!(!harness.state.auth_fail_limiter.is_blocked("ip:127.0.0.1"));
     }
 

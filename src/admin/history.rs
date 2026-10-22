@@ -891,7 +891,12 @@ mod tests {
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 
         // The free send spent its own budget, never the budget of the topics
-        // routes.
+        // routes. The old wiring borrowed the topics limiter with this exact
+        // key, so the check below fails if the wiring comes back.
+        assert!(!harness
+            .state
+            .topics_limiter
+            .is_blocked(&format!("admin:send:{}", harness.user_id)));
         assert!(!harness.state.topics_limiter.is_blocked("ip:127.0.0.1"));
     }
 

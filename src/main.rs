@@ -115,7 +115,7 @@ struct AppState {
     config: Arc<ConfigStore>,
     /// T2: dashboard accounts and sessions.
     tool_auth: Arc<admin::ToolAuth>,
-    /// T6: token ↔ uid registry.
+    /// T6: token <-> uid registry.
     devices: Arc<DeviceStore>,
     /// T6: per-uid registration limit.
     devices_limiter: RateLimiter,
