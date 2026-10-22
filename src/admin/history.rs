@@ -41,6 +41,108 @@ pub struct HistoryQuery {
     pub before: Option<i64>,
     pub kind: Option<String>,
     pub status: Option<String>,
+    /// The reference of the row, matched exactly (T13-A).
+    #[serde(rename = "ref")]
+    pub reference: Option<String>,
+    /// The oldest row of the page, as an RFC 3339 stamp or a plain date.
+    pub since: Option<String>,
+    /// The newest row of the page, as an RFC 3339 stamp or a plain date.
+    pub until: Option<String>,
+}
+
+/// The largest reference a filter accepts.
+const MAX_REFERENCE_CHARS: usize = 100;
+
+/// Checks a reference filter: an exact match, at most 100 characters.
+fn check_reference(value: &str) -> Result<&str, AdminError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok("");
+    }
+    if trimmed.chars().count() > MAX_REFERENCE_CHARS {
+        return Err(AdminError::invalid_request(
+            "the reference filter is longer than 100 characters",
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// Checks a date filter and returns the value to bind.
+///
+/// The value is an RFC 3339 stamp (`2026-01-02T03:04:05Z`, with an offset
+/// too) or a plain date (`2026-01-02`). SQLite reads both and compares them
+/// in UTC.
+fn check_date(value: &str, name: &str) -> Result<String, AdminError> {
+    let text = value.trim();
+    let invalid =
+        || AdminError::invalid_request(&format!("the {} filter is not a valid date", name));
+
+    let (date, rest) = match text.split_once(['T', 't']) {
+        Some((date, rest)) => (date, Some(rest)),
+        None => (text, None),
+    };
+    let mut parts = date.split('-');
+    let (year, month, day) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(year), Some(month), Some(day), None) => (year, month, day),
+        _ => return Err(invalid()),
+    };
+    if !is_digits(year, 4) || !is_digits(month, 2) || !is_digits(day, 2) {
+        return Err(invalid());
+    }
+    let month: u32 = month.parse().unwrap_or(0);
+    let day: u32 = day.parse().unwrap_or(0);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(invalid());
+    }
+
+    match rest {
+        None => Ok(text.to_string()),
+        Some(rest) => {
+            let rest = rest.trim_end_matches('Z').trim_end_matches('z');
+            let (clock, offset) = match rest.split_once(['+', '-']) {
+                Some((clock, offset)) => (clock, Some(offset)),
+                None => (rest, None),
+            };
+            let mut pieces = clock.split(':');
+            let (hour, minute, second) = match (pieces.next(), pieces.next(), pieces.next()) {
+                (Some(hour), Some(minute), Some(second)) => (hour, minute, second),
+                _ => return Err(invalid()),
+            };
+            if pieces.next().is_some() {
+                return Err(invalid());
+            }
+            if !is_digits(hour, 2) || !is_digits(minute, 2) || !is_digits(second, 2) {
+                return Err(invalid());
+            }
+            let hour: u32 = hour.parse().unwrap_or(99);
+            let minute: u32 = minute.parse().unwrap_or(99);
+            let second: u32 = second.parse().unwrap_or(99);
+            if hour > 23 || minute > 59 || second > 60 {
+                return Err(invalid());
+            }
+            if let Some(offset) = offset {
+                let mut pieces = offset.split(':');
+                let (hours, minutes) = match (pieces.next(), pieces.next(), pieces.next()) {
+                    (Some(hours), Some(minutes), None) => (hours, minutes),
+                    _ => return Err(invalid()),
+                };
+                if !is_digits(hours, 2) || !is_digits(minutes, 2) {
+                    return Err(invalid());
+                }
+                if hours.parse::<u32>().unwrap_or(99) > 23
+                    || minutes.parse::<u32>().unwrap_or(99) > 59
+                {
+                    return Err(invalid());
+                }
+            }
+            Ok(text.to_string())
+        }
+    }
+}
+
+/// True when the text is exactly `length` digits.
+fn is_digits(text: &str, length: usize) -> bool {
+    text.len() == length && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// `GET /apps/{app}/history`: the app's notification history.
@@ -62,13 +164,38 @@ pub async fn list_history(
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .clamp(1, MAX_HISTORY_LIMIT);
 
+    let reference = match query.reference.as_deref() {
+        Some(value) => {
+            let trimmed = check_reference(value)?;
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        None => None,
+    };
+    let since = match query.since.as_deref() {
+        Some(value) => Some(check_date(value, "since")?),
+        None => None,
+    };
+    let until = match query.until.as_deref() {
+        Some(value) => Some(check_date(value, "until")?),
+        None => None,
+    };
+
     let rows = db::read_history(
         &state.db,
         &app,
-        kind,
-        query.status.as_deref(),
-        query.before,
-        limit,
+        db::HistoryFilter {
+            kind,
+            status: query.status.as_deref(),
+            reference,
+            since: since.as_deref(),
+            until: until.as_deref(),
+            before: query.before,
+            limit,
+        },
     )
     .await
     .map_err(|error| AdminError::from_db("read the history", error))?;
@@ -814,6 +941,220 @@ mod tests {
                 .await
                 .expect("the history row must exist");
         assert_eq!(row, "failed");
+    }
+
+    /// Writes one history row with its own timestamp and reference.
+    async fn insert_history_at(
+        pool: &SqlitePool,
+        app: &str,
+        kind: &str,
+        status: &str,
+        reference: &str,
+        created_at: &str,
+    ) -> i64 {
+        let result = sqlx::query(
+            "INSERT INTO notifications_history \
+             (app, target, title, status, response, payload, sender_uid, sender_email, kind, \"ref\", created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(app)
+        .bind("topic:news")
+        .bind("A title")
+        .bind(status)
+        .bind("ok")
+        .bind("{}")
+        .bind("sender-uid")
+        .bind("sender@example.com")
+        .bind(kind)
+        .bind(reference)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("the history row must be inserted");
+        result.last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn history_filters_by_ref_exact() {
+        let harness = setup("owner", &[]).await;
+        insert_history_at(
+            &harness.pool,
+            APP,
+            "raw",
+            "success",
+            "ref-1",
+            "2026-01-01 10:00:00",
+        )
+        .await;
+        insert_history_at(
+            &harness.pool,
+            APP,
+            "raw",
+            "success",
+            "ref-2",
+            "2026-01-01 11:00:00",
+        )
+        .await;
+
+        let (status, body) = harness
+            .call(
+                Method::GET,
+                &format!("/apps/{}/history?ref=ref-2", APP),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("an array");
+        assert_eq!(rows.len(), 1, "the reference is matched exactly");
+        assert_eq!(rows[0]["ref"], "ref-2");
+
+        // A reference that is a prefix of another one matches nothing.
+        let (status, body) = harness
+            .call(Method::GET, &format!("/apps/{}/history?ref=ref", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.as_array().expect("an array").is_empty());
+
+        // A reference that is too long is refused.
+        let long = "x".repeat(101);
+        let (status, _) = harness
+            .call(
+                Method::GET,
+                &format!("/apps/{}/history?ref={}", APP, long),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn history_filters_by_date_range() {
+        let harness = setup("owner", &[]).await;
+        insert_history_at(
+            &harness.pool,
+            APP,
+            "raw",
+            "success",
+            "ref-1",
+            "2026-01-01 10:00:00",
+        )
+        .await;
+        insert_history_at(
+            &harness.pool,
+            APP,
+            "raw",
+            "success",
+            "ref-2",
+            "2026-02-01 10:00:00",
+        )
+        .await;
+        insert_history_at(
+            &harness.pool,
+            APP,
+            "raw",
+            "success",
+            "ref-3",
+            "2026-03-01 10:00:00",
+        )
+        .await;
+
+        let (status, body) = harness
+            .call(
+                Method::GET,
+                &format!("/apps/{}/history?since=2026-02-01&until=2026-02-28", APP),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("an array");
+        assert_eq!(rows.len(), 1, "only the row of February answers");
+        assert_eq!(rows[0]["ref"], "ref-2");
+
+        // An RFC 3339 stamp works too.
+        let (status, body) = harness
+            .call(
+                Method::GET,
+                &format!("/apps/{}/history?since=2026-02-01T00:00:00Z", APP),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().expect("an array").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn history_rejects_bad_date_400() {
+        let harness = setup("owner", &[]).await;
+        insert_history(&harness.pool, APP, "raw", "success", "ok", "{}").await;
+
+        for value in [
+            "not-a-date",
+            "2026-13-01",
+            "2026-01-32",
+            "2026-01-01T99:00:00Z",
+        ] {
+            let (status, _) = harness
+                .call(
+                    Method::GET,
+                    &format!("/apps/{}/history?since={}", APP, value),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "the value {} must be refused",
+                value
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn history_filters_compose_with_kind_and_status() {
+        let harness = setup("owner", &[]).await;
+        insert_history_at(
+            &harness.pool,
+            APP,
+            "raw",
+            "success",
+            "ref-1",
+            "2026-02-01 10:00:00",
+        )
+        .await;
+        insert_history_at(
+            &harness.pool,
+            APP,
+            "template",
+            "failed",
+            "ref-1",
+            "2026-02-01 11:00:00",
+        )
+        .await;
+        insert_history_at(
+            &harness.pool,
+            APP,
+            "raw",
+            "failed",
+            "ref-1",
+            "2026-03-01 10:00:00",
+        )
+        .await;
+
+        let (status, body) = harness
+            .call(
+                Method::GET,
+                &format!(
+                    "/apps/{}/history?ref=ref-1&kind=raw&status=failed&since=2026-02-01",
+                    APP
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("an array");
+        assert_eq!(rows.len(), 1, "the filters answer together");
+        assert_eq!(rows[0]["kind"], "raw");
+        assert_eq!(rows[0]["status"], "failed");
     }
 
     #[tokio::test]

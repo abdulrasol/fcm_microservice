@@ -113,9 +113,17 @@ pub async fn list_campaigns(
     .await
     .map_err(|error| AdminError::from_db("read the campaigns", error))?;
 
+    // T13-A: the remaining quota of every company of the page. The count is
+    // the one the creation uses, so the dashboard and the creation never
+    // disagree.
+    let quota = campaign_quota(&state, &app).await?;
+
     let items: Vec<Value> = rows
         .iter()
         .map(|campaign| {
+            let remaining = quota
+                .as_ref()
+                .map(|quota| quota.remaining(&campaign.entity_id));
             json!({
                 "id": campaign.id,
                 "entity_id": campaign.entity_id,
@@ -132,6 +140,7 @@ pub async fn list_campaigns(
                 "created_at": campaign.created_at,
                 "decided_at": campaign.decided_at,
                 "sent_at": campaign.sent_at,
+                "company_quota_remaining": remaining,
                 "fcm_response": campaign
                     .fcm_response
                     .as_deref()
@@ -141,6 +150,57 @@ pub async fn list_campaigns(
         .collect();
 
     Ok(Json(Value::Array(items)))
+}
+
+/// The quota of the app and the campaigns of every company of the page.
+struct CampaignQuota {
+    /// The daily limit of every company.
+    per_day: u32,
+    /// The campaigns of the last day, by company.
+    usage: std::collections::HashMap<String, u64>,
+}
+
+impl CampaignQuota {
+    /// The campaigns left today for a company.
+    fn remaining(&self, entity_id: &str) -> u64 {
+        let used = self.usage.get(entity_id).copied().unwrap_or(0);
+        u64::from(self.per_day).saturating_sub(used)
+    }
+}
+
+/// Reads the quota of the app and the campaigns of every company of the page.
+///
+/// `None` when the app has no campaigns, so the dashboard shows no quota.
+async fn campaign_quota(
+    state: &Arc<AppState>,
+    app: &str,
+) -> Result<Option<CampaignQuota>, AdminError> {
+    let snapshot = match state.config.get(app) {
+        Some(snapshot) => snapshot,
+        None => return Ok(None),
+    };
+    let campaigns = &snapshot.config.campaigns;
+    if !campaigns.enabled {
+        return Ok(None);
+    }
+
+    let entities = db::list_campaign_entities(&state.db, app)
+        .await
+        .map_err(|error| AdminError::from_db("read the campaigns", error))?;
+
+    let now = crate::unix_seconds();
+    let mut usage = std::collections::HashMap::new();
+    for entity in entities {
+        let counted = db::campaign_quota_usage(&state.db, app, &entity, now)
+            .await
+            .map_err(|error| AdminError::from_db("read the campaigns", error))?;
+        usage.insert(entity, counted.in_day);
+    }
+
+    Ok(Some(CampaignQuota {
+        per_day: campaigns.quota.per_entity_per_day,
+        usage,
+    }))
 }
 
 /// The body of an approval: an empty object or an optional note.
@@ -417,6 +477,7 @@ mod tests {
     use axum::Router;
     use serde_json::json;
     use sqlx::SqlitePool;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     /// Inserts a campaign row directly, the way the API route would.
@@ -968,6 +1029,82 @@ mod tests {
             .await
             .expect("the check must run");
         assert!(blocked, "the dashboard block must block the T9 route");
+    }
+
+    /// Enables the campaigns of the app with a daily quota.
+    async fn enable_campaigns(harness: &Harness, per_day: u32) {
+        let snapshot = harness
+            .state
+            .config
+            .get(APP)
+            .expect("the app must be configured");
+        let mut campaigns = snapshot.config.campaigns.clone();
+        campaigns.enabled = true;
+        campaigns.senders = vec!["company".to_string()];
+        campaigns.entity.require = BTreeMap::from([
+            ("status".to_string(), "approved".to_string()),
+            ("user_id".to_string(), "{sender.uid}".to_string()),
+        ]);
+        campaigns.audience.allowed_topics = vec!["company_{p.entity_id}".to_string()];
+        campaigns.content.actions = BTreeMap::from([(
+            "open_company".to_string(),
+            crate::config::Action {
+                data: BTreeMap::from([("action".to_string(), "open_company".to_string())]),
+                ..crate::config::Action::default()
+            },
+        )]);
+        campaigns.quota = Quota {
+            per_entity_per_day: per_day,
+            per_entity_per_week: per_day * 2,
+        };
+        harness
+            .state
+            .config
+            .save_section(
+                APP,
+                "campaigns",
+                serde_json::to_value(&campaigns).expect("the section must serialize"),
+                "tester",
+                snapshot.version,
+            )
+            .await
+            .expect("the section must be saved");
+    }
+
+    #[tokio::test]
+    async fn campaign_list_includes_remaining_quota() {
+        let harness = setup("owner", &[]).await;
+        enable_campaigns(&harness, 3).await;
+        insert_campaign(&harness.pool, APP, "e1", "sent").await;
+
+        let (status, body) = harness
+            .call(Method::GET, &format!("/apps/{}/campaigns", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["company_quota_remaining"], 2,
+            "one campaign of the three of the day is spent"
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_list_quota_null_when_no_quota() {
+        let harness = setup("owner", &[]).await;
+        insert_campaign(&harness.pool, APP, "e1", "sent").await;
+
+        let (status, body) = harness
+            .call(Method::GET, &format!("/apps/{}/campaigns", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("an array");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0]["company_quota_remaining"].is_null(),
+            "an app without campaigns has no quota: {:?}",
+            rows[0]
+        );
     }
 
     #[tokio::test]

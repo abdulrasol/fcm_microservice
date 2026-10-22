@@ -535,7 +535,7 @@ impl Default for Content {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Action {
     #[serde(default)]

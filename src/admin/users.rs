@@ -881,26 +881,25 @@ mod tests {
         let harness = setup("owner", &[]).await;
         harness.reauth().await;
         // T13-A: the administrative writes have their own budget of 30 per
-        // minute and account.
-        for index in 0..30 {
+        // minute and account. The update of a manager is used here because it
+        // is cheap: the creation hashes a password.
+        let (id, _) = create_manager(&harness, "manager@example.com", &[APP]).await;
+        for index in 0..29 {
             let (status, body) = harness
                 .call(
-                    Method::POST,
-                    "/users",
-                    Some(json!({
-                        "email": format!("manager{}@example.com", index),
-                        "apps": [APP]
-                    })),
+                    Method::PUT,
+                    &format!("/users/{}", id),
+                    Some(json!({ "apps": [APP] })),
                 )
                 .await;
-            assert_eq!(status, StatusCode::CREATED, "write {}: {}", index, body);
+            assert_eq!(status, StatusCode::OK, "write {}: {}", index, body);
         }
 
         let (status, body) = harness
             .call(
-                Method::POST,
-                "/users",
-                Some(json!({ "email": "last@example.com", "apps": [APP] })),
+                Method::PUT,
+                &format!("/users/{}", id),
+                Some(json!({ "apps": [APP] })),
             )
             .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);

@@ -352,24 +352,36 @@ pub struct AuditQuery {
     pub before: Option<i64>,
 }
 
-/// `GET /audit`: owners see every app, managers only their own and must filter.
+/// `GET /audit`: owners see every app, managers only the rows of their own
+/// apps.
+///
+/// T13-A: a manager without an `app` parameter sees the rows of the apps
+/// bound to the account; a manager of an app that is not bound to the account
+/// is refused.
 pub async fn audit(
     State(state): State<Arc<AppState>>,
     user: AuthedUser,
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<Value>, AdminError> {
-    if user.role == Role::Manager {
-        let app = query
-            .app
-            .as_deref()
-            .ok_or_else(|| AdminError::forbidden("the app parameter is required"))?;
-        user.require_app(app)?;
-    }
-
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let rows = db::read_audit(&state.db, query.app.as_deref(), limit, query.before)
-        .await
-        .map_err(|error| AdminError::from_db("read the audit log", error))?;
+
+    let rows = if user.role == Role::Manager {
+        match query.app.as_deref() {
+            Some(app) => {
+                user.require_app(app)?;
+                db::read_audit(&state.db, Some(app), limit, query.before)
+                    .await
+                    .map_err(|error| AdminError::from_db("read the audit log", error))?
+            }
+            None => db::read_audit_for_apps(&state.db, &user.apps, limit, query.before)
+                .await
+                .map_err(|error| AdminError::from_db("read the audit log", error))?,
+        }
+    } else {
+        db::read_audit(&state.db, query.app.as_deref(), limit, query.before)
+            .await
+            .map_err(|error| AdminError::from_db("read the audit log", error))?
+    };
 
     let items: Vec<Value> = rows
         .into_iter()
@@ -571,6 +583,84 @@ mod tests {
         let (status, body) = harness.call(Method::GET, "/apps/fresh", None).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "forbidden");
+    }
+
+    /// Writes an audit row of an app.
+    async fn insert_audit(pool: &sqlx::SqlitePool, app: &str, action: &str) {
+        sqlx::query(
+            "INSERT INTO audit_log (actor, app, action, detail) VALUES ('tester', ?, ?, 'detail')",
+        )
+        .bind(app)
+        .bind(action)
+        .execute(pool)
+        .await
+        .expect("the audit row must be inserted");
+    }
+
+    #[tokio::test]
+    async fn audit_manager_without_app_sees_only_own_apps() {
+        let harness = setup("manager", &[APP]).await;
+        insert_audit(&harness.pool, APP, "own.action").await;
+        insert_audit(&harness.pool, OTHER_APP, "foreign.action").await;
+
+        let (status, body) = harness.call(Method::GET, "/audit", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("an array");
+        assert!(!rows.is_empty());
+        for row in rows {
+            let app = row["app"].as_str().unwrap_or_default();
+            assert_eq!(
+                app, APP,
+                "a manager without an app parameter sees only the rows of the apps bound to the account"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_manager_with_foreign_app_is_403() {
+        let harness = setup("manager", &[APP]).await;
+
+        let (status, body) = harness
+            .call(Method::GET, &format!("/audit?app={}", OTHER_APP), None)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "forbidden");
+
+        // The app of the manager is still reachable.
+        let (status, _) = harness
+            .call(Method::GET, &format!("/audit?app={}", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn audit_manager_with_no_apps_gets_empty() {
+        let harness = setup("manager", &[]).await;
+        insert_audit(&harness.pool, APP, "own.action").await;
+
+        let (status, body) = harness.call(Method::GET, "/audit", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.as_array().expect("an array").is_empty(),
+            "a manager without apps sees no row"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_owner_unchanged() {
+        let harness = setup("owner", &[]).await;
+        insert_audit(&harness.pool, APP, "own.action").await;
+        insert_audit(&harness.pool, OTHER_APP, "foreign.action").await;
+
+        let (status, body) = harness.call(Method::GET, "/audit", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("an array");
+        assert!(
+            rows.iter()
+                .any(|row| row["app"].as_str() == Some(OTHER_APP)),
+            "the owner sees every app: {:?}",
+            rows
+        );
     }
 
     #[tokio::test]
@@ -897,9 +987,16 @@ mod tests {
     #[tokio::test]
     async fn audit_manager_scoped_and_requires_app() {
         let harness = setup("manager", &[APP]).await;
-        let (status, _) = harness.call(Method::GET, "/audit", None).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
 
+        // T13-A: without an app parameter the manager sees the rows of the
+        // apps bound to the account.
+        let (status, body) = harness.call(Method::GET, "/audit", None).await;
+        assert_eq!(status, StatusCode::OK);
+        for row in body.as_array().expect("an array") {
+            assert_eq!(row["app"], APP);
+        }
+
+        // An app that is not bound to the account is refused.
         let (status, _) = harness.call(Method::GET, "/audit?app=other", None).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 

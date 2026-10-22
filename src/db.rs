@@ -1,5 +1,5 @@
 use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Executor, Row, SqlitePool};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::path::Path;
@@ -543,6 +543,50 @@ pub struct AuditRow {
     pub detail: Option<String>,
 }
 
+/// The audit rows of several apps, newest first.
+///
+/// A manager without an app filter sees the rows of the apps bound to the
+/// account, and only those.
+pub async fn read_audit_for_apps(
+    pool: &SqlitePool,
+    apps: &[String],
+    limit: i64,
+    before: Option<i64>,
+) -> Result<Vec<AuditRow>, sqlx::Error> {
+    if apps.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+        "SELECT id, actor, app, action, created_at, detail FROM audit_log WHERE app IN (",
+    );
+    {
+        let mut separated = query.separated(", ");
+        for app in apps {
+            separated.push_bind(app.clone());
+        }
+    }
+    query.push(")");
+    if let Some(before) = before {
+        query.push(" AND id < ");
+        query.push_bind(before);
+    }
+    query.push(" ORDER BY id DESC LIMIT ");
+    query.push_bind(limit);
+
+    let rows = query.build().fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AuditRow {
+            id: row.get("id"),
+            actor: row.get("actor"),
+            app: row.try_get("app").unwrap_or_default(),
+            action: row.get("action"),
+            created_at: row.try_get("created_at").unwrap_or_default(),
+            detail: row.try_get("detail").unwrap_or_default(),
+        })
+        .collect())
+}
+
 /// Audit rows, newest first, optionally filtered by app and id cursor.
 pub async fn read_audit(
     pool: &SqlitePool,
@@ -804,6 +848,60 @@ fn campaign_from_row(row: SqliteRow) -> Campaign {
 ///
 /// Counted statuses are `pending_review`, `sending` and `sent`; rejected,
 /// cancelled and failed campaigns never consume quota.
+/// The campaigns of an entity in the last day and the last week.
+///
+/// The count is the one the quota of the creation uses, so the dashboard and
+/// the creation never disagree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuotaUsage {
+    /// The campaigns of the last day.
+    pub in_day: u64,
+    /// The campaigns of the last week.
+    pub in_week: u64,
+}
+
+/// The companies that have campaigns in an app.
+pub async fn list_campaign_entities(
+    pool: &SqlitePool,
+    app: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query_scalar("SELECT DISTINCT entity_id FROM campaigns WHERE app = ?")
+        .bind(app)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// Counts the campaigns of an entity that the quota counts.
+///
+/// The executor is generic, so the creation counts inside its transaction and
+/// the dashboard counts on the pool, with the same query.
+pub async fn campaign_quota_usage<'e, E>(
+    executor: E,
+    app: &str,
+    entity_id: &str,
+    now: i64,
+) -> Result<QuotaUsage, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let timestamps: Vec<i64> = sqlx::query_scalar(
+        "SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM campaigns \
+         WHERE app = ? AND entity_id = ? AND status IN ('pending_review','sending','sent')",
+    )
+    .bind(app)
+    .bind(entity_id)
+    .fetch_all(executor)
+    .await?;
+
+    let day_start = now.saturating_sub(DAY_SECONDS);
+    let week_start = now.saturating_sub(WEEK_SECONDS);
+    Ok(QuotaUsage {
+        in_day: timestamps.iter().filter(|at| **at >= day_start).count() as u64,
+        in_week: timestamps.iter().filter(|at| **at >= week_start).count() as u64,
+    })
+}
+
 pub async fn insert_campaign_checked(
     pool: &SqlitePool,
     new: &NewCampaign,
@@ -813,6 +911,11 @@ pub async fn insert_campaign_checked(
     let _guard = CAMPAIGN_WRITE_LOCK.lock().await;
     let mut tx = pool.begin().await?;
 
+    let usage = campaign_quota_usage(&mut *tx, &new.app, &new.entity_id, now).await?;
+    let in_day = usage.in_day;
+    let in_week = usage.in_week;
+    let day_start = now.saturating_sub(DAY_SECONDS);
+    let week_start = now.saturating_sub(WEEK_SECONDS);
     let timestamps: Vec<i64> = sqlx::query_scalar(
         "SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM campaigns \
          WHERE app = ? AND entity_id = ? AND status IN ('pending_review','sending','sent')",
@@ -821,11 +924,6 @@ pub async fn insert_campaign_checked(
     .bind(&new.entity_id)
     .fetch_all(&mut *tx)
     .await?;
-
-    let day_start = now.saturating_sub(DAY_SECONDS);
-    let week_start = now.saturating_sub(WEEK_SECONDS);
-    let in_day = timestamps.iter().filter(|at| **at >= day_start).count();
-    let in_week = timestamps.iter().filter(|at| **at >= week_start).count();
 
     if in_day as u64 >= u64::from(limits.per_entity_per_day) {
         let oldest = timestamps
@@ -1218,18 +1316,35 @@ fn history_from_row(row: SqliteRow) -> HistoryRow {
     }
 }
 
+/// The filters and the page of one history query.
+pub struct HistoryFilter<'a> {
+    pub kind: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub reference: Option<&'a str>,
+    pub since: Option<&'a str>,
+    pub until: Option<&'a str>,
+    pub before: Option<i64>,
+    pub limit: u32,
+}
+
 /// Reads the history of one app, newest first.
 ///
-/// `before` pages backwards over the id, `kind` and `status` filter the rows
-/// and `limit` caps the page.
+/// `filter.before` pages backwards over the id, `filter.kind` and
+/// `filter.status` filter the rows and `filter.limit` caps the page.
 pub async fn read_history(
     pool: &SqlitePool,
     app: &str,
-    kind: Option<&str>,
-    status: Option<&str>,
-    before: Option<i64>,
-    limit: u32,
+    filter: HistoryFilter<'_>,
 ) -> Result<Vec<HistoryRow>, sqlx::Error> {
+    let HistoryFilter {
+        kind,
+        status,
+        reference,
+        since,
+        until,
+        before,
+        limit,
+    } = filter;
     let mut query =
         sqlx::QueryBuilder::<Sqlite>::new("SELECT * FROM notifications_history WHERE app = ");
     query.push_bind(app.to_string());
@@ -1240,6 +1355,20 @@ pub async fn read_history(
     if let Some(status) = status {
         query.push(" AND status = ");
         query.push_bind(status.to_string());
+    }
+    if let Some(reference) = reference {
+        query.push(" AND \"ref\" = ");
+        query.push_bind(reference.to_string());
+    }
+    if let Some(since) = since {
+        query.push(" AND datetime(created_at) >= datetime(");
+        query.push_bind(since.to_string());
+        query.push(")");
+    }
+    if let Some(until) = until {
+        query.push(" AND datetime(created_at) <= datetime(");
+        query.push_bind(until.to_string());
+        query.push(")");
     }
     if let Some(before) = before {
         query.push(" AND id < ");
