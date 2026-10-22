@@ -1,73 +1,107 @@
-# FCM Microservice & Dashboard
+# خادم FCM المصغّر ولوحة التحكم (FCM Microservice & Dashboard)
 
-> ⚠️ **لا تنشر فرع `my-server` كما هو قبل إكمال خطة `docs/plans/secure-sending-plan.md`.**
-> `/send` فيه صار للأدمن فقط، فيتوقف إرسال المستخدمين والشركات والفنيين في تطبيق واط (تنبيهات الأدمن وإشعارات الطلبات).
+خادم مصغّر عالي الأداء مبني بلغة **Rust** لإدارة وإرسال إشعارات Firebase Cloud Messaging (FCM)
+بسياسات أمان مشددة وقوالب محكمة تمنع التزوير، مع دعم تعدد التطبيقات (Multi-tenant)،
+ولوحة تحكم مدمجة (Vue 3)، ودعم مزودات هوية ومصادر بيانات مرنة (Firebase وJWT المستقل).
 
-A fully integrated, ultra-lightweight Push Notification Management System built in Rust. It serves as both a high-performance REST API for sending Firebase Cloud Messaging (FCM) notifications to multiple projects and a web-based dashboard.
+---
 
-## Features
+## 1. المعمارية العامة (Architecture)
 
-- **Multi-App Support**: Send notifications to multiple Firebase projects dynamically by dropping their `service-account.json` into the `credentials/` folder.
-- **Firebase ID-token authentication**: Admin routes verify Firebase ID tokens (RS256, issuer, audience, expiry, `auth_time`) and read `users/{uid}.role` from Firestore. No client ships a shared secret.
-- **Service-to-service key**: Optional `SERVICE_API_KEY` for trusted backends.
-- **Single Docker Container**: The Rust server handles both the REST API and serves the static Web Dashboard on a single port.
-- **Ultra Lightweight**: Built with `axum` and `tokio`. Minimal RAM and CPU consumption.
-- **Integrated SQLite Database**: Automatically tracks notification history (including sender identity) and saved topics.
-- **Hot-Reloading Credentials**: Automatically detects new credentials added to the folder without a server restart.
-- **Web Dashboard**: An integrated UI with Firebase Auth email/password sign-in, app-scoped admin access, sending and history.
+يعمل الخادم كبوابة وسيطة ذكية وآمنة بين تطبيقات العميل (الهواتف والويب) أو الأنظمة الخلفية وبين خوادم FCM التابعة لـ Google:
 
-## Documentation
+```mermaid
+flowchart LR
+    subgraph Clients["العملاء والأنظمة"]
+        App["تطبيق الهاتف (Flutter)"]
+        Backend["الباك إند (Python/FastAPI)"]
+        Browser["لوحة التحكم (Dashboard)"]
+    end
 
-- [API Documentation](docs.md): Endpoints, authentication, permissions, validation, rate limits and the deployment plan.
-- [Condition Targeting Guide](condition_guide.md): FCM boolean topic expressions (`&&`, `||`, `!`) and the new validation limits.
+    subgraph Microservice["خادم FCM المصغّر (Rust)"]
+        AuthModule["المصادقة وتدقيق الصلاحيات"]
+        Engine["محرك القوالب والحواجز الأمنية"]
+        DeviceStore["سجل الأجهزة ومحددات السرعة"]
+        SQLite[("قاعدة البيانات SQLite")]
+    end
 
-## Getting Started
+    subgraph External["الخدمات الخارجية"]
+        IDP["مزود الهوية (Firebase / JWT)"]
+        DS["مصدر البيانات (Firestore / Resolver API)"]
+        FCM["Google FCM v1 REST API"]
+    end
 
-1. Clone the repository.
-2. Copy `.env.example` to `.env` and fill in your values. `CORS_ALLOWED_ORIGINS` is mandatory; the service refuses to start without it.
-3. **Firebase Setup**:
-   - Go to the [Firebase Console](https://console.firebase.google.com/).
-   - Navigate to **Project Settings** > **Service accounts** and click **Generate new private key**.
-   - Place the JSON file inside `credentials/` and rename it to a short name (e.g. `create_app.json`). **The filename (without `.json`) is the `app` identifier in all requests.**
-   - Grant the service account `roles/datastore.viewer` (or broader) so the admin role lookup can read Firestore.
-   - Make sure admin users have `role: "admin"` in the Firestore `users/{uid}` document.
-4. Run the server using Docker or `cargo run`.
-5. **Dashboard Setup**: read [dashboard/README.md](dashboard/README.md). Copy
-   `dashboard/.env.example` to `dashboard/.env.local`, set the public Firebase Web
-   App config and `VITE_DEFAULT_APP`, then run `npm run build` from `dashboard/`
-   to regenerate the tracked root `dist/` folder. If the dashboard is served from
-   a different origin than the API, add that exact origin to
-   `CORS_ALLOWED_ORIGINS`.
+    App -->|"توكن هوية مستخدم"| AuthModule
+    Backend -->|"مفتاح التطبيق fcm_<app>_..."| AuthModule
+    Browser -->|"جلسة كوكي آمنة"| AuthModule
 
-## Authentication in one paragraph
-
-Send `Authorization: Bearer <firebase_id_token>` for admin endpoints, where the token's
-project contains the requested `app` and the user's Firestore document has
-`role: "admin"`. Server-to-server callers may use `Authorization: Bearer <SERVICE_API_KEY>`.
-`/topics/subscribe` and `/topics/unsubscribe` allow anonymous access to public topics
-(`all`, `country_XX`, `lang_XX`) and require a valid ID token for role topics.
-The legacy `API_KEY` is disabled by default and works only on `/send` while
-`LEGACY_API_KEY_ENABLED=true`.
-
-See [docs.md](docs.md) for the full permission table.
-
-## Docker Deployment
-
-```bash
-docker build -t fcm-microservice .
-docker run -d -p 8080:8080 -v $(pwd)/credentials:/app/credentials -v $(pwd)/data.db:/app/data.db --env-file .env fcm-microservice
+    AuthModule --> Engine
+    Engine <-->|"تحقق وتخزين"| SQLite
+    Engine <--> DeviceStore
+    AuthModule -.->|"تحقق من التوكن"| IDP
+    Engine -.->|"قراءة المستندات والتحقق"| DS
+    Engine -->|"إرسال موثوق"| FCM
 ```
 
-## Deployment plan (short)
+---
 
-1. Deploy with `LEGACY_API_KEY_ENABLED=true` so the existing admin client keeps using `/send`.
-2. Build and deploy the dashboard with its Firebase Web App configuration, then
-   verify admin sign-in and the app-scoped `/apps`, `/history`, `/topics` and
-   `/send` calls.
-3. Set `LEGACY_API_KEY_ENABLED=false`, remove the old `API_KEY`, and generate new
-   `API_KEY` / `SERVICE_API_KEY` values outside any repository or client bundle.
+## 2. المزايا الرئيسية
 
-> The dashboard signs in with Firebase Authentication and sends ID tokens; the
-> old `/auth/login` endpoint and the `fcm_api_key` browser storage key are gone.
-> `CORS_ALLOWED_ORIGINS` remains mandatory and must include the dashboard origin
-> whenever it is not served from the same origin as the API.
+- **إرسال مبني على القوالب والحواجز الأمنية:** تمنع القوالب تزوير الإشعارات عن طريق سحب البيانات من وثائق النظام الموثوقة والتحقق من ملكية المستخدم لها (`require`).
+- **تعدد التطبيقات (Multi-tenant):** إدارة حسابات خدمة Google متعددة لمشاريع مختلفة في خادم واحد عبر مجلد `credentials/` أو رفعها من لوحة التحكم.
+- **استقلالية الهوية ومصادر البيانات:** دعم أصيل لـ Firebase Auth وCloud Firestore، إلى جانب دعم توكنات JWT العامة (HS256/RS256) ومصادر البيانات عبر HTTP Resolver API (مثل FastAPI وSupabase).
+- **لوحة تحكم متكاملة وآمنة:** واجهة ويب حديثة لإدارة التطبيقات، ومحرر قوالب تفاعلي مع معاينة حية وإرسال تجريبي وسجل إصدارات، ومراجعة حملات الشركات، وحسابات محلية مشفرة بـ `Argon2id` وجلسات آمنة تحمي من هجمات CSRF.
+- **سجل الأجهزة ومنع التكرار:** تسجيل tokens الأجهزة مع ربطها بمعرف المستخدم `uid`، وتنظيف تلقائي للأجهزة الملغاة، ومنع تكرار الإرسال `dedupe` بمدة محددة.
+
+---
+
+## 3. البدء السريع (Quick Start)
+
+### 3.1 الإعداد والتثبيت
+1. انسخ ملف متغيرات البيئة وعدّل القيم المطلوبة:
+   ```bash
+   cp .env.example .env
+   ```
+   *ملاحظة:* تأكد من تعيين `CORS_ALLOWED_ORIGINS` بعنوان لوحة التحكم الصريح.
+
+2. شغّل الخادم باستخدام Docker:
+   ```bash
+   docker build -t fcm-microservice .
+   docker run -d -p 8080:8080 \
+     -v $(pwd)/credentials:/app/credentials \
+     -v $(pwd)/data.db:/app/data.db \
+     --env-file .env \
+     fcm-microservice
+   ```
+
+### 3.2 إنشاء حساب المالك الأول (Owner)
+يُنشأ حساب المالك الأول حصراً عبر سطر الأوامر (CLI):
+```bash
+docker exec -it <container_id> fcm_microservice create-owner --email admin@example.com
+```
+سيطبع الأمر كلمة مرور مؤقتة لمرة واحدة. افتح المتصفح على `http://localhost:8080` (أو نطاقك) وسجل الدخول وغير كلمة المرور فوراً.
+
+---
+
+## 4. فهرس الوثائق والمراجع
+
+| المستند | الوصف |
+|---|---|
+| [جدول الصلاحيات الكامل](docs/permissions.md) | جدول الـ 65 مساراً كاملاً ومن يحق له استدعاء كل مسار. |
+| [مرجع القوالب والحواجز](docs/templates-reference.md) | البنية الكاملة لتعريف القوالب، ولغة التعويضات، وقواعد الحواجز، وجدول الرموز التشخيصية. |
+| [دليل النشر والتشغيل](docs/deployment.md) | شرح متغيرات البيئة، وإعدادات Nginx/Caddy، والنسخ الاحتياطي لـ SQLite WAL، وخطوات التحديث والتراجع. |
+| [دليل الربط: Firebase](docs/integration/firebase.md) | ربط تطبيقات Firebase Auth وCloud Firestore (مثل تطبيق واط). |
+| [دليل الربط: JWT + FastAPI](docs/integration/jwt-fastapi.md) | ربط التطبيقات المستقلة مع خادم FastAPI عبر عقد HTTP Resolver. |
+| [دليل الربط: Supabase](docs/integration/supabase.md) | ربط Supabase Auth وقواعد PostgreSQL عبر Supabase Edge Functions. |
+| [أمثلة استدعاء واجهات البرمجة (cURL)](curl_api.md) | أمثلة عملية جاهزة لاستدعاء مسارات الإرسال والتسجيل للمستخدمين والباك إند. |
+| [قائمة الفحص قبل النشر](docs/release-checklist.md) | قائمة تدقيق شاملة للمالك وفريق العمليات قبل النشر للإنتاج وفي حالات الطوارئ. |
+| [الدليل المرجعي العام المحدّث](docs.md) | مرجع المعمارية والسياسات العامة للأداة. |
+| [إرشادات الوكيل الذكي (.agent.md)](.agent.md) | دليل الصيانة والتطوير للوكلاء الأذكياء ومطوري المشروع. |
+
+---
+
+## 5. تحقق منه
+
+- **فحص بناء وتشغيل الاختبارات الأساسية:** `cargo test` (666 اختباراً ناجحاً).
+- **فحص اختبارات واجهة لوحة التحكم:** `cd dashboard && pnpm test` (73 اختباراً ناجحاً).
+- **فحص مطابقة جدول الصلاحيات:** `bash scripts/check_permissions_doc.sh` (65 مساراً مطابقاً).

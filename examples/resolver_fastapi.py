@@ -121,9 +121,79 @@ def create_app():
     return app
 
 
+def run_stdlib(host="127.0.0.1", port=8099):
+    """Fallback server using Python standard library when FastAPI/uvicorn are not installed."""
+    import http.server
+    import json
+    import urllib.parse
+
+    secret = os.environ.get("FCM_RESOLVER_SECRET", "").encode("utf-8")
+    if not secret:
+        print("ERROR: FCM_RESOLVER_SECRET environment variable is required", file=sys.stderr)
+        sys.exit(1)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urllib.parse.urlsplit(self.path)
+            path = parsed.path
+            query = parsed.query
+
+            ts = self.headers.get(TIMESTAMP_HEADER)
+            sig = self.headers.get(SIGNATURE_HEADER)
+
+            if not verify(secret, "GET", path, query, ts, sig):
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "unauthorized"}).encode("utf-8"))
+                return
+
+            params = urllib.parse.parse_qs(query)
+            if path == "/internal/fcm/doc":
+                doc_path = params.get("path", [""])[0]
+                document = resolve_doc(doc_path)
+                if document is None:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "not found"}).encode("utf-8"))
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(document).encode("utf-8"))
+                return
+            elif path == "/internal/fcm/members":
+                col = params.get("collection", [""])[0]
+                field = params.get("field", [""])[0]
+                val = params.get("value", [""])[0]
+                limit = int(params.get("limit", [100])[0])
+                uids = resolve_members(col, field, val, limit)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"uids": uids}).encode("utf-8"))
+                return
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    server = http.server.HTTPServer((host, port), Handler)
+    print(f"Serving Resolver API on http://{host}:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(selftest())
-    import uvicorn
-
-    uvicorn.run(create_app(), host="127.0.0.1", port=8099)
+    try:
+        import uvicorn
+        uvicorn.run(create_app(), host="127.0.0.1", port=8099)
+    except ImportError:
+        run_stdlib(host="127.0.0.1", port=8099)

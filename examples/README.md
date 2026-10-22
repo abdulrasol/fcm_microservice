@@ -50,9 +50,13 @@ signature = f97974c3e1b1706c53e625f9f6b324adab12a0143af3348757cc311771f20813
 ## Run
 
 ```bash
-pip install fastapi uvicorn
 export FCM_RESOLVER_SECRET='replace-with-at-least-32-bytes'
-python3 examples/resolver_fastapi.py            # serves on 127.0.0.1:8099
+python3 examples/resolver_fastapi.py            # serves on 127.0.0.1:8099 (uses FastAPI/uvicorn if available, or falls back to standard library)
+```
+
+Optional FastAPI installation:
+```bash
+pip install fastapi uvicorn
 ```
 
 Self-test of the signature (standard library only):
