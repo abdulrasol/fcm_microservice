@@ -8,6 +8,15 @@ import { withReauth } from '../lib/reauth'
 import { precheckServiceAccount } from '../lib/serviceAccount'
 import JsonEditor from '../components/JsonEditor.vue'
 import ShowOnceModal from '../components/ShowOnceModal.vue'
+import TemplatesPanel from '../components/TemplatesPanel.vue'
+import PreviewPanel from '../components/PreviewPanel.vue'
+import VersionsPanel from '../components/VersionsPanel.vue'
+import ImportExportPanel from '../components/ImportExportPanel.vue'
+import CampaignsPanel from '../components/CampaignsPanel.vue'
+import BlocksPanel from '../components/BlocksPanel.vue'
+import SendLogPanel from '../components/SendLogPanel.vue'
+import FreeSendPanel from '../components/FreeSendPanel.vue'
+import DevicesPanel from '../components/DevicesPanel.vue'
 
 const route = useRoute()
 
@@ -39,6 +48,9 @@ const replaceFileText = ref('')
 const replaceFileName = ref('')
 const replacePrecheck = ref(null)
 let replaceObject = null
+
+// The template the panels work on.
+const templateKey = ref('')
 
 // The keys of the app.
 const keys = ref([])
@@ -321,7 +333,18 @@ onBeforeUnmount(() => {
 
     <nav class="row settings__tabs">
       <button
-        v-for="name in ['overview', ...(owner ? ownerSections : []), 'web_subscribe', 'campaigns']"
+        v-for="name in [
+          'overview',
+          ...(owner ? ownerSections : []),
+          'web_subscribe',
+          'campaigns',
+          'templates',
+          'queue',
+          'blocks',
+          'log',
+          'freeSend',
+          'devices',
+        ]"
         :key="name"
         type="button"
         class="button button--ghost"
@@ -397,6 +420,36 @@ onBeforeUnmount(() => {
           {{ strings.settings.replaceKey }}
         </button>
       </div>
+    </div>
+
+    <div v-else-if="tab === 'templates'" class="card settings__box">
+      <TemplatesPanel :app="app" @message="message = $event" />
+      <PreviewPanel :app="app" :template-key="templateKey" />
+    </div>
+
+    <div v-else-if="tab === 'queue'" class="card settings__box">
+      <CampaignsPanel :app="app" />
+    </div>
+
+    <div v-else-if="tab === 'blocks'" class="card settings__box">
+      <BlocksPanel :app="app" />
+    </div>
+
+    <div v-else-if="tab === 'log'" class="card settings__box">
+      <SendLogPanel :app="app" />
+    </div>
+
+    <div v-else-if="tab === 'freeSend'" class="card settings__box">
+      <FreeSendPanel :app="app" />
+    </div>
+
+    <div v-else-if="tab === 'devices'" class="card settings__box">
+      <DevicesPanel :app="app" />
+    </div>
+
+    <div v-else-if="tab === 'versions'" class="card settings__box">
+      <VersionsPanel :app="app" />
+      <ImportExportPanel :app="app" />
     </div>
 
     <div v-else-if="tab === 'keys'" class="card settings__box">
