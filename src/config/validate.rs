@@ -1689,6 +1689,156 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_param_var_in_require() {
+        // A variable of the template may not be used in a `require` guard: the
+        // guard is compared before the variables exist.
+        let mut require = BTreeMap::new();
+        require.insert("level".to_string(), "{level}".to_string());
+        let mut template = require_template(require);
+        template.vars.insert(
+            "level".to_string(),
+            crate::config::Var {
+                from: "doc.level".to_string(),
+                map: BTreeMap::new(),
+            },
+        );
+
+        let issues = validate_template("t", &template, &example_config());
+        assert!(
+            issues.iter().any(|issue| {
+                issue.path == "templates.t.context.require.level"
+                    && issue.message.contains("may only use")
+            }),
+            "issues: {:?}",
+            issue_codes(&issues)
+        );
+
+        // The same rule holds for the check of an action.
+        let issues = example_check_require("{level}");
+        assert!(
+            issues.iter().any(|issue| {
+                issue.path == "campaigns.content.actions.open_product.check.require.extra"
+            }),
+            "issues: {:?}",
+            issue_codes(&issues)
+        );
+    }
+
+    #[test]
+    fn validate_still_accepts_context_and_sender_in_require() {
+        // The parameters and the sender stay allowed in a `require` guard.
+        let mut require = BTreeMap::new();
+        require.insert("uid".to_string(), "{sender.uid}".to_string());
+        require.insert("order".to_string(), "{p.order_id}".to_string());
+
+        let mut template = require_template(require);
+        template.params.insert(
+            "order_id".to_string(),
+            crate::config::Param::Text { max: 64 },
+        );
+
+        let issues = validate_template("t", &template, &example_config());
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.path.starts_with("templates.t.context.require")),
+            "the parameters and the sender must stay allowed: {:?}",
+            issue_codes(&issues)
+        );
+
+        let issues = example_check_require("{sender.uid}");
+        assert!(
+            !issues.iter().any(|issue| issue
+                .path
+                .starts_with("campaigns.content.actions.open_product.check.require")),
+            "the sender must stay allowed: {:?}",
+            issue_codes(&issues)
+        );
+    }
+
+    #[test]
+    fn validate_dedupe_seconds_bounds() {
+        let mut template = require_template(BTreeMap::new());
+        template.dedupe = Some(crate::config::Dedupe {
+            key: "{p.order_id}".to_string(),
+            seconds: 600,
+        });
+
+        // Inside the range.
+        for seconds in [1_u32, 600, 86_400] {
+            template.dedupe = Some(crate::config::Dedupe {
+                key: "{p.order_id}".to_string(),
+                seconds,
+            });
+            let issues = validate_template("t", &template, &example_config());
+            assert!(
+                !has_code(&issues, "[T7]"),
+                "the value {} must be accepted: {:?}",
+                seconds,
+                issue_codes(&issues)
+            );
+        }
+
+        // Outside the range.
+        for seconds in [0_u32, 86_401, u32::MAX] {
+            template.dedupe = Some(crate::config::Dedupe {
+                key: "{p.order_id}".to_string(),
+                seconds,
+            });
+            let issues = validate_template("t", &template, &example_config());
+            assert!(
+                issues.iter().any(|issue| {
+                    issue.path == "templates.t.dedupe.seconds" && issue.message.contains("[T7]")
+                }),
+                "the value {} must be refused: {:?}",
+                seconds,
+                issue_codes(&issues)
+            );
+        }
+
+        // A value that is not a number never reaches the validation: the
+        // document itself is refused.
+        let raw = serde_json::json!({
+            "description": "t",
+            "enabled": true,
+            "senders": ["admin"],
+            "to": { "role": "admin" },
+            "title": "t",
+            "body": "b",
+            "dedupe": { "key": "k", "seconds": "many" }
+        });
+        let error = serde_json::from_value::<Template>(raw)
+            .expect_err("a value that is not a number must be refused");
+        assert!(
+            error.to_string().contains("u32"),
+            "the error must name the expected type: {error}"
+        );
+    }
+
+    #[test]
+    fn dedupe_seconds_zero_is_rejected_or_documented_by_test() {
+        // The behaviour of the tool today: a window of zero seconds is
+        // refused by the validation with the code [T7].
+        let mut template = require_template(BTreeMap::new());
+        template.dedupe = Some(crate::config::Dedupe {
+            key: "k".to_string(),
+            seconds: 0,
+        });
+
+        let issues = validate_template("t", &template, &example_config());
+        assert!(
+            issues.iter().any(|issue| {
+                issue.path == "templates.t.dedupe.seconds"
+                    && issue
+                        .message
+                        .contains("[T7] dedupe.seconds must be between 1 and 86400")
+            }),
+            "issues: {:?}",
+            issue_codes(&issues)
+        );
+    }
+
+    #[test]
     fn require_rejects_doc_reference() {
         let mut require = BTreeMap::new();
         require.insert("uid".to_string(), "{sender.uid}".to_string());

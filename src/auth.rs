@@ -37,6 +37,10 @@ pub const LEGACY_SIGNED_IN_TOPICS: [&str; 3] = ["users", "companies", "technical
 /// Never verify one token against more than this many candidate apps.
 const MAX_CANDIDATE_APPS: usize = 8;
 
+/// The fingerprint of an app without a stored configuration. The legacy policy
+/// never changes, so one value is enough.
+const LEGACY_FINGERPRINT: &str = "legacy";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminIdentity {
     pub uid: String,
@@ -238,9 +242,11 @@ impl AuthService {
             None => {}
         }
 
-        let (policy, version) = self.policy_for(app);
+        let (policy, fingerprint) = self.policy_for(app);
         let identity = self.verify_identity(headers, app).await?;
-        let role = self.resolve_role(app, version, &policy, &identity).await?;
+        let role = self
+            .resolve_role(app, &fingerprint, &policy, &identity)
+            .await?;
         if !is_admin_role(role.as_deref(), &policy.admin_roles) {
             return Err(AuthError::Forbidden(
                 "the user is not an admin for this app".to_string(),
@@ -398,8 +404,10 @@ impl AuthService {
         app: &str,
         identity: &Identity,
     ) -> Result<bool, AuthError> {
-        let (policy, version) = self.policy_for(app);
-        let role = self.resolve_role(app, version, &policy, identity).await?;
+        let (policy, fingerprint) = self.policy_for(app);
+        let role = self
+            .resolve_role(app, &fingerprint, &policy, identity)
+            .await?;
         Ok(is_admin_role(role.as_deref(), &policy.admin_roles))
     }
 
@@ -412,23 +420,27 @@ impl AuthService {
         app: &str,
         identity: &Identity,
     ) -> Result<Option<String>, AuthError> {
-        let (policy, version) = self.policy_for(app);
-        self.resolve_role(app, version, &policy, identity).await
+        let (policy, fingerprint) = self.policy_for(app);
+        self.resolve_role(app, &fingerprint, &policy, identity)
+            .await
     }
 
     /// The role policy and configuration version of an app, or the legacy policy
     /// for an app that has no stored configuration.
-    fn policy_for(&self, app: &str) -> (IdentityPolicy, i64) {
+    fn policy_for(&self, app: &str) -> (IdentityPolicy, String) {
         match self.config.get(app) {
-            Some(snapshot) => (snapshot.config.identity.clone(), snapshot.version),
-            None => (legacy_policy(), 0),
+            Some(snapshot) => (
+                snapshot.config.identity.clone(),
+                snapshot.config.role_cache_fingerprint(),
+            ),
+            None => (legacy_policy(), LEGACY_FINGERPRINT.to_string()),
         }
     }
 
     async fn resolve_role(
         &self,
         app: &str,
-        version: i64,
+        fingerprint: &str,
         policy: &IdentityPolicy,
         identity: &Identity,
     ) -> Result<Option<String>, AuthError> {
@@ -446,7 +458,7 @@ impl AuthService {
             }
         };
         self.roles
-            .role(app, version, policy, identity, source.as_ref())
+            .role(app, fingerprint, policy, identity, source.as_ref())
             .await
             .map_err(|RoleError::Unavailable(reason)| AuthError::Unavailable(reason))
     }
@@ -1417,7 +1429,7 @@ mod tests {
     async fn unconfigured_app_keeps_legacy_admin_behavior() {
         let service = unconfigured_service().await;
         let (policy, version) = service.policy_for(APP);
-        assert_eq!(version, 0);
+        assert_eq!(version, "legacy");
         assert_eq!(policy, AppConfig::default_firebase().identity);
         assert!(matches!(&policy.provider, ProviderConfig::Firebase));
         assert_eq!(policy.admin_roles, vec!["admin".to_string()]);
@@ -1446,7 +1458,7 @@ mod tests {
         };
         let role = service
             .roles
-            .role(APP, version, &policy, &identity, &admin)
+            .role(APP, &version, &policy, &identity, &admin)
             .await
             .expect("the legacy role document must be read");
         assert!(is_admin_role(role.as_deref(), &policy.admin_roles));
@@ -1463,7 +1475,7 @@ mod tests {
         };
         let role = service
             .roles
-            .role(APP, version, &policy, &other_identity, &missing)
+            .role(APP, &version, &policy, &other_identity, &missing)
             .await
             .expect("a missing legacy document is not an error");
         assert!(!is_admin_role(role.as_deref(), &policy.admin_roles));

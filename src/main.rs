@@ -1578,7 +1578,7 @@ async fn deliver(
                 .devices
                 .tokens_for_role(
                     app,
-                    snapshot.version,
+                    &snapshot.config.role_cache_fingerprint(),
                     Some(role_members),
                     role,
                     &state.role_directory,

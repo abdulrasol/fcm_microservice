@@ -85,6 +85,27 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// The fingerprint of the parts of the configuration the role cache needs.
+    ///
+    /// The members of a role come from the identity and from the data source,
+    /// so a change of the templates does not have to throw the cache away.
+    pub fn role_cache_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(
+            serde_json::to_string(&self.identity)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        hasher.update(b"|");
+        hasher.update(
+            serde_json::to_string(&self.data_source)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        format!("{:x}", hasher.finalize())
+    }
+
     /// The default for a Firebase app: identity from `users/{uid}.role`,
     /// a Firestore data source, and no templates or campaigns.
     pub fn default_firebase() -> Self {

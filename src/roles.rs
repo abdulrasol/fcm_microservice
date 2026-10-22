@@ -2,7 +2,8 @@
 //!
 //! A role comes either from a claim in the verified token or from a document in
 //! the app's data source. Data-source roles are cached per
-//! `(app, config version, uid)` so a configuration change invalidates them.
+//! `(app, configuration fingerprint, uid)`, so a change of the identity or of
+//! the data source invalidates them and a change of the templates does not.
 
 use crate::config::{AppConfig, RoleSource};
 use crate::datasource::{DataError, DataSource, Doc};
@@ -38,7 +39,7 @@ pub enum RoleError {
 /// so it cannot grow without bound.
 const MAX_CACHE_ENTRIES: usize = 4096;
 
-type CacheKey = (String, i64, String);
+type CacheKey = (String, String, String);
 type CacheEntry = (Option<String>, Instant);
 
 pub struct RoleResolver {
@@ -65,7 +66,7 @@ impl RoleResolver {
     pub async fn role(
         &self,
         app: &str,
-        version: i64,
+        fingerprint: &str,
         policy: &IdentityPolicy,
         identity: &Identity,
         source: &dyn DataSource,
@@ -79,7 +80,11 @@ impl RoleResolver {
             } => (doc, field, *cache_seconds),
         };
 
-        let key = (app.to_string(), version, identity.uid.clone());
+        let key = (
+            app.to_string(),
+            fingerprint.to_string(),
+            identity.uid.clone(),
+        );
         let ttl = Duration::from_secs(cache_seconds);
         if !ttl.is_zero() {
             if let Some((role, expires_at)) = lock(&self.cache).get(&key) {
@@ -313,7 +318,7 @@ mod tests {
         let caller = identity("uid-1", json!({ "user": { "role": "admin" } }));
 
         let role = resolver
-            .role("app", 1, &policy, &caller, &source)
+            .role("app", "fp-1", &policy, &caller, &source)
             .await
             .expect("a claim role never fails");
         assert_eq!(role.as_deref(), Some("admin"));
@@ -321,7 +326,7 @@ mod tests {
 
         let top_level = identity("uid-1", json!({ "role": "manager" }));
         let role = resolver
-            .role("app", 1, &claim_policy("role"), &top_level, &source)
+            .role("app", "fp-1", &claim_policy("role"), &top_level, &source)
             .await
             .expect("a claim role never fails");
         assert_eq!(role.as_deref(), Some("manager"));
@@ -342,7 +347,7 @@ mod tests {
             json!({ "other": "admin" }),
         ] {
             let role = resolver
-                .role("app", 1, &policy, &identity("uid-1", claims), &source)
+                .role("app", "fp-1", &policy, &identity("uid-1", claims), &source)
                 .await
                 .expect("a claim role never fails");
             assert_eq!(role, None);
@@ -363,7 +368,13 @@ mod tests {
         );
 
         let role = resolver
-            .role("app", 1, &policy, &identity("uid-1", json!({})), &source)
+            .role(
+                "app",
+                "fp-1",
+                &policy,
+                &identity("uid-1", json!({})),
+                &source,
+            )
             .await
             .expect("the role must be read");
         assert_eq!(role.as_deref(), Some("admin"));
@@ -378,7 +389,7 @@ mod tests {
         let role = resolver
             .role(
                 "app",
-                1,
+                "fp-1",
                 &source_policy(60),
                 &identity("uid-1", json!({})),
                 &source,
@@ -397,7 +408,7 @@ mod tests {
         let error = resolver
             .role(
                 "app",
-                1,
+                "fp-1",
                 &source_policy(60),
                 &identity("uid-1", json!({})),
                 &source,
@@ -411,7 +422,7 @@ mod tests {
         let role = resolver
             .role(
                 "app",
-                1,
+                "fp-1",
                 &source_policy(60),
                 &identity("uid-1", json!({})),
                 &source,
@@ -430,7 +441,13 @@ mod tests {
 
         for _ in 0..3 {
             let role = resolver
-                .role("app", 1, &policy, &identity("uid-1", json!({})), &source)
+                .role(
+                    "app",
+                    "fp-1",
+                    &policy,
+                    &identity("uid-1", json!({})),
+                    &source,
+                )
                 .await
                 .expect("the role must resolve");
             assert_eq!(role.as_deref(), Some("admin"));
@@ -445,12 +462,24 @@ mod tests {
         let policy = source_policy(1);
 
         resolver
-            .role("app", 1, &policy, &identity("uid-1", json!({})), &source)
+            .role(
+                "app",
+                "fp-1",
+                &policy,
+                &identity("uid-1", json!({})),
+                &source,
+            )
             .await
             .expect("the role must resolve");
         tokio::time::sleep(Duration::from_millis(1100)).await;
         resolver
-            .role("app", 1, &policy, &identity("uid-1", json!({})), &source)
+            .role(
+                "app",
+                "fp-1",
+                &policy,
+                &identity("uid-1", json!({})),
+                &source,
+            )
             .await
             .expect("the role must resolve again");
         assert_eq!(source.calls(), 2);
@@ -464,7 +493,13 @@ mod tests {
 
         for _ in 0..2 {
             resolver
-                .role("app", 1, &policy, &identity("uid-1", json!({})), &source)
+                .role(
+                    "app",
+                    "fp-1",
+                    &policy,
+                    &identity("uid-1", json!({})),
+                    &source,
+                )
                 .await
                 .expect("the role must resolve");
         }
@@ -472,6 +507,8 @@ mod tests {
         assert!(lock(&resolver.cache).is_empty());
     }
 
+    /// The name of the test is kept from T5; the key of the cache is now the
+    /// fingerprint of the configuration instead of its version.
     #[tokio::test]
     async fn role_cache_invalidated_by_config_version() {
         let resolver = RoleResolver::new();
@@ -480,15 +517,15 @@ mod tests {
         let user = identity("uid-1", json!({}));
 
         resolver
-            .role("app", 1, &policy, &user, &source)
+            .role("app", "fp-1", &policy, &user, &source)
             .await
             .expect("the role must resolve");
         resolver
-            .role("app", 2, &policy, &user, &source)
+            .role("app", "fp-2", &policy, &user, &source)
             .await
             .expect("a new version must be looked up again");
         resolver
-            .role("app", 1, &policy, &user, &source)
+            .role("app", "fp-1", &policy, &user, &source)
             .await
             .expect("the old version is still cached");
         assert_eq!(source.calls(), 2);
@@ -504,7 +541,7 @@ mod tests {
             resolver
                 .role(
                     "app",
-                    1,
+                    "fp-1",
                     &policy,
                     &identity(&format!("uid-{index}"), json!({})),
                     &source,

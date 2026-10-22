@@ -430,7 +430,13 @@ async fn recipient_count(
                 .map_err(|_| AdminError::unavailable("the data source is unavailable"))?;
             let uids = state
                 .role_directory
-                .uids_for_role(app, snapshot.version, role_members, role, source.as_ref())
+                .uids_for_role(
+                    app,
+                    &snapshot.config.role_cache_fingerprint(),
+                    role_members,
+                    role,
+                    source.as_ref(),
+                )
                 .await
                 .map_err(device_error)?;
             Ok(Some(uids.len()))

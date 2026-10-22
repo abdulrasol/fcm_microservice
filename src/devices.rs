@@ -272,7 +272,7 @@ impl DeviceStore {
     pub async fn tokens_for_role(
         &self,
         app: &str,
-        version: i64,
+        fingerprint: &str,
         role_members: Option<&RoleMembers>,
         role_value: &str,
         directory: &RoleDirectory,
@@ -282,21 +282,25 @@ impl DeviceStore {
             return Err(DeviceError::NotConfigured);
         };
         let uids = directory
-            .uids_for_role(app, version, config, role_value, source)
+            .uids_for_role(app, fingerprint, config, role_value, source)
             .await?;
         self.tokens_for_uids(app, &uids, MAX_ROLE_TOKENS).await
     }
 }
 
-type RoleCacheKey = (String, i64, String);
+type RoleCacheKey = (String, String, String);
 
 struct RoleCacheEntry {
     uids: Vec<String>,
     expires_at: Instant,
 }
 
-/// Cache of role member lookups, keyed by `(app, config version, role value)`
-/// so saving a new configuration invalidates it. Errors are never cached.
+/// Cache of role member lookups, keyed by `(app, configuration fingerprint,
+/// role value)`.
+///
+/// The fingerprint covers the identity and the data source, so a change of
+/// the templates keeps the cache and a change of the identity empties it.
+/// Errors are never cached.
 pub struct RoleDirectory {
     entries: Mutex<HashMap<RoleCacheKey, RoleCacheEntry>>,
 }
@@ -321,14 +325,18 @@ impl RoleDirectory {
     pub async fn uids_for_role(
         &self,
         app: &str,
-        version: i64,
+        fingerprint: &str,
         config: &RoleMembers,
         role_value: &str,
         source: &dyn DataSource,
     ) -> Result<Vec<String>, DeviceError> {
         validate_role_value(role_value)?;
 
-        let key = (app.to_string(), version, role_value.to_string());
+        let key = (
+            app.to_string(),
+            fingerprint.to_string(),
+            role_value.to_string(),
+        );
         if config.cache_seconds > 0 {
             let now = Instant::now();
             let cached = lock(&self.entries)
@@ -412,6 +420,7 @@ mod tests {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use serde_json::{json, Value};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -456,6 +465,72 @@ mod tests {
             cache_seconds,
             max: 50,
         }
+    }
+
+    // ---------- the role cache ----------
+
+    /// A configuration with the role members of an app.
+    fn role_config() -> crate::config::AppConfig {
+        let mut config = crate::config::AppConfig::default_firebase();
+        config.identity.role_members = Some(role_members(300));
+        config
+    }
+
+    #[tokio::test]
+    async fn role_cache_survives_template_edit() {
+        let config = role_config();
+        let fingerprint = config.role_cache_fingerprint();
+
+        // The templates are not part of the configuration, so a change of a
+        // template does not change the fingerprint of the cache.
+        let snapshot = crate::config::store::AppSnapshot {
+            version: 7,
+            config: config.clone(),
+            templates: BTreeMap::new(),
+        };
+        assert_eq!(snapshot.config.role_cache_fingerprint(), fingerprint);
+
+        // The cache keeps the members of the role.
+        let directory = RoleDirectory::new();
+        let source = FakeSource::ok(&["uid-1"]);
+        let members = role_members(300);
+        directory
+            .uids_for_role(APP, &fingerprint, &members, "admin", &source)
+            .await
+            .expect("the first lookup");
+        directory
+            .uids_for_role(APP, &fingerprint, &members, "admin", &source)
+            .await
+            .expect("the cached lookup");
+        assert_eq!(source.calls(), 1, "the cache must be used");
+    }
+
+    #[tokio::test]
+    async fn role_cache_invalidated_on_identity_change() {
+        let config = role_config();
+        let before = config.role_cache_fingerprint();
+
+        let mut changed = config.clone();
+        changed.identity.admin_roles.push("operator".to_string());
+        assert_ne!(
+            changed.role_cache_fingerprint(),
+            before,
+            "a change of the identity must empty the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_cache_invalidated_on_data_source_change() {
+        let config = role_config();
+        let before = config.role_cache_fingerprint();
+
+        let mut changed = config.clone();
+        changed.data_source = crate::config::DataSource::None;
+        assert_ne!(
+            changed.role_cache_fingerprint(),
+            before,
+            "a change of the data source must empty the cache"
+        );
     }
 
     // ---------- store ----------
@@ -935,11 +1010,11 @@ mod tests {
         let config = role_members(300);
 
         let first = directory
-            .uids_for_role(APP, 1, &config, "admin", &source)
+            .uids_for_role(APP, "fp-1", &config, "admin", &source)
             .await
             .expect("the first lookup");
         let second = directory
-            .uids_for_role(APP, 1, &config, "admin", &source)
+            .uids_for_role(APP, "fp-1", &config, "admin", &source)
             .await
             .expect("the cached lookup");
 
@@ -955,7 +1030,7 @@ mod tests {
 
         for _ in 0..2 {
             directory
-                .uids_for_role(APP, 1, &config, "admin", &source)
+                .uids_for_role(APP, "fp-1", &config, "admin", &source)
                 .await
                 .expect("the lookup");
         }
@@ -970,17 +1045,17 @@ mod tests {
         let config = role_members(300);
 
         directory
-            .uids_for_role(APP, 1, &config, "admin", &source)
+            .uids_for_role(APP, "fp-1", &config, "admin", &source)
             .await
             .expect("the first version");
         directory
-            .uids_for_role(APP, 1, &config, "admin", &source)
+            .uids_for_role(APP, "fp-1", &config, "admin", &source)
             .await
             .expect("the cached version");
         assert_eq!(source.calls(), 1);
 
         directory
-            .uids_for_role(APP, 2, &config, "admin", &source)
+            .uids_for_role(APP, "fp-2", &config, "admin", &source)
             .await
             .expect("the second version");
         assert_eq!(source.calls(), 2);
@@ -993,7 +1068,7 @@ mod tests {
         let config = role_members(300);
 
         let error = directory
-            .uids_for_role(APP, 1, &config, "admin", &source)
+            .uids_for_role(APP, "fp-1", &config, "admin", &source)
             .await
             .expect_err("a failing source must fail closed");
         assert!(matches!(error, DeviceError::Unavailable(_)));
@@ -1001,7 +1076,7 @@ mod tests {
 
         source.set(&["uid-1"]);
         let uids = directory
-            .uids_for_role(APP, 1, &config, "admin", &source)
+            .uids_for_role(APP, "fp-1", &config, "admin", &source)
             .await
             .expect("the error must not be cached");
         assert_eq!(uids, vec!["uid-1".to_string()]);
@@ -1023,7 +1098,7 @@ mod tests {
             "admín",
         ] {
             let error = directory
-                .uids_for_role(APP, 1, &config, invalid, &source)
+                .uids_for_role(APP, "fp-1", &config, invalid, &source)
                 .await
                 .expect_err("the value must be rejected");
             assert!(
@@ -1042,7 +1117,7 @@ mod tests {
 
         for number in 0..300 {
             directory
-                .uids_for_role(APP, 1, &config, &format!("role-{number}"), &source)
+                .uids_for_role(APP, "fp-1", &config, &format!("role-{number}"), &source)
                 .await
                 .expect("the lookup");
         }
@@ -1059,7 +1134,7 @@ mod tests {
         let source = FakeSource::ok(&["uid-1"]);
 
         let error = store
-            .tokens_for_role(APP, 1, None, "admin", &directory, &source)
+            .tokens_for_role(APP, "fp-1", None, "admin", &directory, &source)
             .await
             .expect_err("the missing configuration must be reported");
         assert!(matches!(error, DeviceError::NotConfigured));
@@ -1068,7 +1143,7 @@ mod tests {
         let tokens = store
             .tokens_for_role(
                 APP,
-                1,
+                "fp-1",
                 Some(&role_members(300)),
                 "admin",
                 &directory,
