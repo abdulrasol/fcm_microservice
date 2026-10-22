@@ -542,6 +542,16 @@ CREATE TABLE IF NOT EXISTS app_keys (
   created_by TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   last_used_at DATETIME, revoked_at DATETIME
 );
+-- T16: the state of the credential files (no secret is stored here)
+CREATE TABLE IF NOT EXISTS app_disabled (
+  app TEXT PRIMARY KEY, disabled_by TEXT NOT NULL,
+  disabled_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS app_credentials (
+  app TEXT PRIMARY KEY, uploaded_by TEXT NOT NULL,
+  uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, app TEXT, action TEXT NOT NULL,
   detail TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -747,7 +757,7 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
 - **طريقة الفحص:** دخول بلا رمز ⇐ 401 بعد التفعيل. رمز استرجاع يعمل مرة واحدة.
 
 ### T16 — رفع service account وإضافة تطبيق من الداشبورد
-- **الحالة:** ⬜ (بعد T2 وT10 وT12)
+- **الحالة:** 🔄 (الخلفية فقط؛ الواجهة في T12) (بعد T2 وT10 وT12)
 - **الشرح:** إضافة تطبيق جديد أو تدوير مفتاحه من الداشبورد بلا إعادة بناء الحاوية ولا دخول للسيرفر (3.13).
 - **الملفات:** `src/credentials.rs` (`install_credential`: تحقق + كتابة ذرية + تحميل مباشر، `remove_credential`)،
   `src/admin/apps.rs`، `src/admin/auth.rs` (`require_reauth`)، `src/main.rs` (`CREDENTIALS_UPLOAD_ENABLED`)،
@@ -891,3 +901,5 @@ ALTER TABLE notifications_history ADD COLUMN ref TEXT;    -- اسم القالب
 | 2026-10-22 | T10-C — حسابات الأداة وفحوص الاتصال | 🔄 بانتظار المراجعة | `src/admin/users.rs`: `GET/POST /users` و`PUT/DELETE /users/{id}` و`POST /users/{id}/reset-password` (owner فقط؛ **مدير فقط** يُنشأ، والمالك بالـCLI؛ كلمة مرور مؤقتة مرة واحدة مع `Cache-Control: no-store`، ولا تُخزَّن ولا تُدقَّق) + `PUT /auth/test-uid` (على النفس فقط) + `src/admin/diagnostics.rs`: `POST /apps/{app}/identity/test` (أسماء الـclaims فقط، لا قيمها، ولا يُعاد التوكن) و`POST /apps/{app}/data_source/test` (أسماء الحقول وأنواعها، أو عدد الأعضاء) + إصلاح سباق الحظر: `claim_for_sending` فيه `NOT EXISTS` للحظر ذرّياً. 538 اختباراً ناجحاً (41 جديداً)، clippy 0، 5 تجارب سلبية مستعادة بـ`sha256`. التقرير: `docs/plans/reports/T10C-report.md` |
 | 2026-10-22 | T10-C — قرار المراجع | ✅ | (1) `cli.rs` دون تغيير مقبول؛ (2) إعادة استعمال المحدد 20/دقيقة بمفاتيح مميزة مقبول مؤقتاً (متابعة T13 مع بقية المحددات)؛ (3) 400 قبل فحص الدور عند جسم مشوّه مقبول لأن `AuthedUser` يسبق الجسم في الاستخراج، فغير المصادَق عليه يرى 401 دائماً (أُضيف اختبار `malformed_body_unauthenticated_is_401`)؛ (4) إعادة كتابة commit محلي بـrebase غير مدفوع مقبول لمرة واحدة، ولا تكرر |
 | 2026-10-22 | T11 — مفاتيح التطبيقات | 🔄 بانتظار المراجعة | `src/appkeys.rs`: `AppKeyStore` (مفتاح `fcm_<app>_<43>` base64url، sha256 فقط + `hint` من آخر 4 أحرف، حد 20 مفتاحاً حيّاً لكل تطبيق، إلغاء فوري بلا مخبأ، `last_used_at` بخنق دقيقة) + جدول `app_keys` في `migrate`؛ `src/auth.rs`: `trusted_sender` الواحد (مفتاح الخدمة، ثم مفتاح التطبيق: `Valid`/`WrongApp` 403/`Invalid` 401) ومقبول في المسارات التي تحمل `app`: `/send` و`/send/template` و`/campaigns` و`/topics/subscribe|unsubscribe` ولا يُقبل في `/admin/*` ولا `/devices/*` ولا في المسارات بلا `app`؛ `src/admin/keys.rs`: `GET/POST /apps/{app}/keys` و`DELETE /apps/{app}/keys/{id}` (owner فقط، المفتاح يظهر مرة واحدة مع `no-store`)؛ وإصلاح T11-0: `expect` أُزيل من `src/admin/diagnostics.rs`. 578 اختباراً ناجحاً (39 جديداً)، clippy 0، 4 تجارب سلبية مستعادة بـ`sha256`. التقرير: `docs/plans/reports/T11-report.md` |
+| 2026-10-22 | T11 — قرار المراجع | ✅ | (1) غياب حقل `AppState` وبقاء المخزن داخل `AuthService` مقبول؛ (2) `authenticate_admin` يقبل مفتاح التطبيق لمساراته ذات `app` (history/topics القديمة) لتطبيقه فقط: مقبول وسُجّل؛ (3) أضف لمتابعات T13: توحيد `trusted_sender` كطبقة واحدة عند استخراج `build_router` |
+| 2026-10-22 | T16 — رفع service account وإدارة التطبيقات | 🔄 بانتظار المراجعة | `src/credentials.rs`: `CredentialManager` (تحقق صارم للملف، فحص حي عبر `GoogleVerifier`، كتابة ذرية بملف مؤقت بصلاحيات `0600` ثم `rename`، تحميل فوري، إلغاء بلا مخبأ) + `src/admin/credentials.rs` (`POST /apps`, `PUT|GET /apps/{app}/credentials`, `POST /apps/{app}/disable|enable`, `DELETE /apps/{app}`؛ owner فقط + `require_reauth(300)`، والمفتاح يظهر مرة واحدة مع `no-store`) + `ConfigStore::delete_app` + جدولا `app_disabled` و`app_credentials` + `CREDENTIALS_DIR`/`CREDENTIALS_UPLOAD_ENABLED`. 623 اختباراً ناجحاً (45 جديداً)، clippy 0، 5 تجارب سلبية مستعادة بـ`sha256`. التقرير: `docs/plans/reports/T16-report.md` |
