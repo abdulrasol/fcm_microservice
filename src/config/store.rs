@@ -717,6 +717,77 @@ impl ConfigStore {
         })
     }
 
+    /// Deletes an app and its templates in one transaction.
+    ///
+    /// The deleted configuration is kept as a version, so the history of the
+    /// app stays readable. An app that does not exist is `NotFound`.
+    pub async fn delete_app(&self, app: &str, actor: &str) -> Result<(), ConfigError> {
+        let _guard = self.write_lock.lock().await;
+        self.delete_app_locked(app, actor).await
+    }
+
+    async fn delete_app_locked(&self, app: &str, actor: &str) -> Result<(), ConfigError> {
+        let issues = validate_app_name(app);
+        if !issues.is_empty() {
+            return Err(ConfigError::Invalid(issues));
+        }
+        let snapshot = match self.get(app) {
+            Some(snapshot) => snapshot,
+            None => return Err(ConfigError::NotFound),
+        };
+
+        // The deleted document is the last version of the app.
+        let document = snapshot.config.to_document(&snapshot.templates);
+        let content = serde_json::to_string(&document).map_err(|error| {
+            json_issue(
+                "config",
+                format!("the configuration could not be serialized: {}", error),
+            )
+        })?;
+
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM templates WHERE app = ?")
+            .bind(app)
+            .execute(&mut *transaction)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM app_configs WHERE app = ?")
+            .bind(app)
+            .execute(&mut *transaction)
+            .await?;
+        if deleted.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Err(ConfigError::NotFound);
+        }
+        sqlx::query(
+            "INSERT INTO config_versions (app, section, content, changed_by) \
+             VALUES (?, 'deleted', ?, ?)",
+        )
+        .bind(app)
+        .bind(&content)
+        .bind(actor)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("INSERT INTO audit_log (actor, app, action, detail) VALUES (?, ?, ?, ?)")
+            .bind(actor)
+            .bind(app)
+            .bind("config.delete_app")
+            .bind(format!(
+                "the app was deleted at version {}",
+                snapshot.version
+            ))
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+
+        // The cache forgets the app.
+        let mut cache = self
+            .cache
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.remove(app);
+        Ok(())
+    }
+
     /// Imports a whole document: replaces everything in one transaction and
     /// creates the app when it does not exist yet.
     pub async fn import(&self, app: &str, document: Value, actor: &str) -> Result<(), ConfigError> {
@@ -1116,6 +1187,113 @@ mod tests {
             store.app_names(),
             vec!["alpha".to_string(), "watt".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn delete_app_removes_config_and_templates() {
+        let (store, pool) = memory_store().await;
+        store
+            .create_app("watt", "tester")
+            .await
+            .expect("the app must be created");
+        store
+            .save_template(
+                "watt",
+                "news",
+                serde_json::json!({
+                    "enabled": true,
+                    "senders": ["admin"],
+                    "to": { "topic": "news" },
+                    "title": "News",
+                    "body": "Body"
+                }),
+                "tester",
+                None,
+            )
+            .await
+            .expect("the template must be saved");
+
+        store
+            .delete_app("watt", "tester")
+            .await
+            .expect("the app must be deleted");
+
+        assert!(store.get("watt").is_none(), "the app must be gone");
+        let configs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_configs WHERE app = ?")
+            .bind("watt")
+            .fetch_one(&pool)
+            .await
+            .expect("the count must exist");
+        assert_eq!(configs, 0);
+        let templates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM templates WHERE app = ?")
+            .bind("watt")
+            .fetch_one(&pool)
+            .await
+            .expect("the count must exist");
+        assert_eq!(templates, 0);
+
+        // The deletion is a version of the app.
+        let versions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM config_versions WHERE app = ? AND section = 'deleted'",
+        )
+        .bind("watt")
+        .fetch_one(&pool)
+        .await
+        .expect("the count must exist");
+        assert_eq!(versions, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_app_unknown_is_not_found() {
+        let (store, _pool) = memory_store().await;
+        let error = store
+            .delete_app("ghost", "tester")
+            .await
+            .expect_err("the app must not be found");
+        assert!(matches!(error, ConfigError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn delete_app_is_atomic() {
+        let (store, pool) = memory_store().await;
+        store
+            .create_app("watt", "tester")
+            .await
+            .expect("the app must be created");
+        store
+            .save_template(
+                "watt",
+                "news",
+                serde_json::json!({
+                    "enabled": true,
+                    "senders": ["admin"],
+                    "to": { "topic": "news" },
+                    "title": "News",
+                    "body": "Body"
+                }),
+                "tester",
+                None,
+            )
+            .await
+            .expect("the template must be saved");
+
+        store
+            .delete_app("watt", "tester")
+            .await
+            .expect("the app must be deleted");
+
+        // Nothing of the app is left: the templates and the configuration went
+        // in one transaction.
+        let left: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM app_configs WHERE app = ?) \
+             + (SELECT COUNT(*) FROM templates WHERE app = ?)",
+        )
+        .bind("watt")
+        .bind("watt")
+        .fetch_one(&pool)
+        .await
+        .expect("the count must exist");
+        assert_eq!(left, 0, "the app must be gone completely");
     }
 
     #[tokio::test]
