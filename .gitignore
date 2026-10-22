@@ -22,3 +22,10 @@ test.sh
 
 # macOS
 .DS_Store
+
+# Deployment state (deploy/deploy.sh)
+/data/
+/backups/
+*.db
+*.db-wal
+*.db-shm

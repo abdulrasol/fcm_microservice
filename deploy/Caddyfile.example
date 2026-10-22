@@ -1,0 +1,23 @@
+# Example for Caddy running on the host (not in Docker).
+# Copy to /etc/caddy/Caddyfile (or add the block), replace the host name,
+# then: sudo systemctl reload caddy
+
+# Option A - a public name (DDNS/domain), ports 80 and 443 forwarded on the
+# router to this server. Caddy gets and renews the certificate by itself.
+fcm.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8084
+}
+
+# Option B - home network only (no public name). Caddy uses its own local CA;
+# every device must trust that CA, so this is fine for the dashboard from the
+# LAN but not for phones outside the house.
+# fcm.home.arpa {
+#     tls internal
+#     reverse_proxy 127.0.0.1:8084
+# }
+
+# Caddy sets X-Forwarded-For and X-Forwarded-Proto itself, which is what
+# TRUST_PROXY=true and the dashboard CSRF check expect. If Caddy runs in a
+# Docker container instead, point reverse_proxy at the host address
+# (for example host.docker.internal:8084) and set BIND_ADDR=0.0.0.0 in .env.

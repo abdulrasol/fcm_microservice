@@ -3,10 +3,20 @@ services:
     container_name: fcm_microservice
     build: .
     ports:
-      - "8084:8080"
+      # Bound to the loopback by default so that only the reverse proxy
+      # (Caddy) reaches the service. Set BIND_ADDR=0.0.0.0 in .env only if
+      # something on the LAN must reach the port directly.
+      - "${BIND_ADDR:-127.0.0.1}:8084:8080"
     volumes:
       - ./credentials:/app/credentials
-      - ./data.db:/app/data.db
+      # A whole directory, not a single file: SQLite in WAL mode keeps the
+      # -wal and -shm files next to the database, and they must survive a
+      # container re-creation.
+      - ./data:/app/data
     env_file:
       - .env
+    environment:
+      DATABASE_URL: sqlite:///app/data/data.db
+    # A graceful stop lets SQLite checkpoint its WAL.
+    stop_grace_period: 30s
     restart: unless-stopped
