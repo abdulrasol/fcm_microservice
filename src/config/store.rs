@@ -662,6 +662,22 @@ impl ConfigStore {
         };
 
         if section == "full" {
+            // Two shapes of a full version exist: the creation of the app
+            // stores the configuration alone, and an import stores the whole
+            // document, with the templates. Both are read, so a row written by
+            // an older version of the tool still restores.
+            if serde_json::from_str::<ConfigDocument>(&content).is_ok() {
+                let document: Value = serde_json::from_str(&content).map_err(|error| {
+                    json_issue(
+                        "config",
+                        format!("the stored version could not be read: {}", error),
+                    )
+                })?;
+                self.import_locked(app, document, actor).await?;
+                let version = self.get(app).map(|snapshot| snapshot.version).unwrap_or(0);
+                return Ok(version);
+            }
+
             let config: AppConfig = serde_json::from_str(&content).map_err(|error| {
                 json_issue(
                     "config",
@@ -1167,6 +1183,201 @@ mod tests {
             .await
             .expect("the row must exist");
         assert_eq!(count, 1);
+    }
+
+    /// The id of the newest full version of an app.
+    async fn newest_full_version(store: &ConfigStore, app: &str) -> i64 {
+        let rows = store
+            .versions(app, Some("full"), 50)
+            .await
+            .expect("the versions must be readable");
+        rows.first().expect("a full version must exist").id
+    }
+
+    #[tokio::test]
+    async fn cli_import_then_restore_full_version_works() {
+        let (store, _pool) = memory_store().await;
+        let document = example_document();
+        store
+            .import("watt", document.clone(), "cli")
+            .await
+            .expect("the import must work");
+        let version = newest_full_version(&store, "watt").await;
+        let before = store.export("watt").await.expect("the export must work");
+
+        // The configuration changes after the import.
+        let snapshot = store.get("watt").expect("the app must exist");
+        store
+            .save_section(
+                "watt",
+                "identity",
+                section_value(),
+                "tester",
+                snapshot.version,
+            )
+            .await
+            .expect("the section must be saved");
+
+        // The restore of the version of the import works and brings the
+        // document back.
+        store
+            .restore("watt", version, "tester")
+            .await
+            .expect("the restore must work");
+        let exported = store.export("watt").await.expect("the export must work");
+        assert_eq!(exported, before);
+    }
+
+    #[tokio::test]
+    async fn restore_reads_legacy_full_row_written_by_old_import() {
+        let (store, pool) = memory_store().await;
+        store
+            .create_app("watt", "tester")
+            .await
+            .expect("the app must be created");
+
+        // The row of an older version of the tool: the whole document, with
+        // the templates, in the full section.
+        let document = example_document();
+        let content = serde_json::to_string(&document).expect("the document must serialize");
+        sqlx::query(
+            "INSERT INTO config_versions (app, section, content, changed_by) \
+             VALUES (?, 'full', ?, 'cli')",
+        )
+        .bind("watt")
+        .bind(&content)
+        .bind("cli")
+        .execute(&pool)
+        .await
+        .expect("the version row must be inserted");
+        let id: i64 = sqlx::query_scalar(
+            "SELECT id FROM config_versions WHERE app = ? AND section = 'full' ORDER BY id DESC LIMIT 1",
+        )
+        .bind("watt")
+        .fetch_one(&pool)
+        .await
+        .expect("the version row must exist");
+
+        store
+            .restore("watt", id, "tester")
+            .await
+            .expect("the old row must be readable");
+
+        // The same document, imported the usual way, gives the same result.
+        store
+            .import("alpha", document.clone(), "cli")
+            .await
+            .expect("the import must work");
+        let exported = store.export("watt").await.expect("the export must work");
+        let imported = store.export("alpha").await.expect("the export must work");
+        assert_eq!(exported, imported);
+    }
+
+    #[tokio::test]
+    async fn restore_still_rejects_unknown_fields_in_config_sections() {
+        let (store, pool) = memory_store().await;
+        store
+            .create_app("watt", "tester")
+            .await
+            .expect("the app must be created");
+
+        let content = serde_json::json!({
+            "provider": { "type": "firebase" },
+            "unknown_field": 1
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO config_versions (app, section, content, changed_by) \
+             VALUES (?, 'identity', ?, 'tester')",
+        )
+        .bind("watt")
+        .bind(&content)
+        .bind("tester")
+        .execute(&pool)
+        .await
+        .expect("the version row must be inserted");
+        let id: i64 = sqlx::query_scalar(
+            "SELECT id FROM config_versions WHERE app = ? AND section = 'identity' ORDER BY id DESC LIMIT 1",
+        )
+        .bind("watt")
+        .fetch_one(&pool)
+        .await
+        .expect("the version row must exist");
+
+        let error = store
+            .restore("watt", id, "tester")
+            .await
+            .expect_err("an unknown field must be refused");
+        match error {
+            ConfigError::Invalid(issues) => {
+                assert!(
+                    issues
+                        .iter()
+                        .any(|issue| issue.message.contains("unknown field")),
+                    "the issue must name the unknown field: {:?}",
+                    issues
+                );
+            }
+            other => panic!("the restore must refuse the row, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn export_import_restore_roundtrip_is_identical() {
+        let (store, _pool) = memory_store().await;
+        store
+            .create_app("watt", "tester")
+            .await
+            .expect("the app must be created");
+        store
+            .save_template(
+                "watt",
+                "news",
+                serde_json::json!({
+                    "enabled": true,
+                    "senders": ["admin"],
+                    "to": { "topic": "news" },
+                    "title": "News",
+                    "body": "Body"
+                }),
+                "tester",
+                None,
+            )
+            .await
+            .expect("the template must be saved");
+        let document = store.export("watt").await.expect("the export must work");
+
+        store
+            .import("alpha", document.clone(), "cli")
+            .await
+            .expect("the import must work");
+        let version = newest_full_version(&store, "alpha").await;
+        let before = store.export("alpha").await.expect("the export must work");
+
+        // The imported app changes after the import.
+        store
+            .save_template(
+                "alpha",
+                "news",
+                serde_json::json!({
+                    "enabled": false,
+                    "senders": ["admin"],
+                    "to": { "topic": "news" },
+                    "title": "Changed",
+                    "body": "Body"
+                }),
+                "tester",
+                None,
+            )
+            .await
+            .expect("the template must be saved");
+
+        store
+            .restore("alpha", version, "tester")
+            .await
+            .expect("the restore must work");
+        let exported = store.export("alpha").await.expect("the export must work");
+        assert_eq!(exported, before);
     }
 
     #[tokio::test]
