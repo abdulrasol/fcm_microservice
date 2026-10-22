@@ -7,6 +7,7 @@ import { isOwner, session } from '../session'
 import { withReauth } from '../lib/reauth'
 import { precheckServiceAccount } from '../lib/serviceAccount'
 import JsonEditor from '../components/JsonEditor.vue'
+import ShowOnceModal from '../components/ShowOnceModal.vue'
 
 const route = useRoute()
 
@@ -38,6 +39,13 @@ const replaceFileText = ref('')
 const replaceFileName = ref('')
 const replacePrecheck = ref(null)
 let replaceObject = null
+
+// The keys of the app.
+const keys = ref([])
+const keyName = ref('')
+const keySecret = ref('')
+const keySecretOpen = ref(false)
+const keyBusy = ref(false)
 
 // The danger zone.
 const confirmName = ref('')
@@ -74,6 +82,9 @@ async function load() {
     credentials.value = response.data
   } catch (error) {
     credentials.value = null
+  }
+  if (owner.value) {
+    await loadKeys()
   }
   loading.value = false
 }
@@ -195,6 +206,56 @@ async function deleteApp() {
   }
 }
 
+async function loadKeys() {
+  try {
+    const response = await api.get(`/apps/${app.value}/keys`)
+    keys.value = response.data
+  } catch (error) {
+    keys.value = []
+  }
+}
+
+async function createKey() {
+  if (keyBusy.value) {
+    return
+  }
+  keyBusy.value = true
+  errorMessage.value = ''
+  try {
+    const response = await withReauth(() =>
+      api.post(`/apps/${app.value}/keys`, { name: keyName.value }),
+    )
+    keySecret.value = response.data.key
+    keySecretOpen.value = true
+    keyName.value = ''
+    await loadKeys()
+  } catch (error) {
+    if (error && error.code === 'cancelled') {
+      errorMessage.value = ''
+    } else if (error && error.status === 409) {
+      errorMessage.value = strings.errors.tooManyKeys
+    } else {
+      errorMessage.value = strings.keys.createFailed
+    }
+  } finally {
+    keyBusy.value = false
+  }
+}
+
+function closeKeySecret() {
+  keySecret.value = ''
+  keySecretOpen.value = false
+}
+
+async function revokeKey(key) {
+  try {
+    await api.delete(`/apps/${app.value}/keys/${key.id}`)
+    await loadKeys()
+  } catch (error) {
+    errorMessage.value = strings.errors.server
+  }
+}
+
 async function testIdentity() {
   busy.value = true
   identityResult.value = null
@@ -237,6 +298,7 @@ async function testDataSource() {
 onBeforeUnmount(() => {
   clearReplaceFile()
   identityToken.value = ''
+  keySecret.value = ''
 })
 </script>
 
@@ -338,7 +400,50 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-else-if="tab === 'keys'" class="card settings__box">
-      <p class="muted">{{ strings.keys.title }}</p>
+      <h2 class="settings__keysTitle">{{ strings.keys.title }}</h2>
+      <p class="muted">{{ strings.keys.limit }}</p>
+
+      <div class="row settings__keyForm">
+        <label class="field">
+          <span>{{ strings.keys.name }}</span>
+          <input v-model="keyName" type="text" dir="ltr" />
+        </label>
+        <button type="button" class="button" :disabled="keyBusy" @click="createKey">
+          {{ strings.keys.new }}
+        </button>
+      </div>
+
+      <p v-if="keys.length === 0" class="muted">{{ strings.keys.empty }}</p>
+
+      <ul v-else class="settings__keys">
+        <li v-for="key in keys" :key="key.id" class="row settings__key">
+          <strong>{{ key.name }}</strong>
+          <span class="mono">…{{ key.hint }}</span>
+          <span class="muted">{{ strings.keys.createdBy }}: {{ key.created_by }}</span>
+          <span class="muted">{{ strings.keys.createdAt }}: {{ key.created_at }}</span>
+          <span class="muted">
+            {{ strings.keys.lastUsed }}: {{ key.last_used_at || strings.common.none }}
+          </span>
+          <span v-if="key.revoked_at" class="badge badge--warn">{{ strings.keys.revoked }}</span>
+          <span v-else class="badge badge--ok">{{ strings.keys.active }}</span>
+          <button
+            v-if="!key.revoked_at"
+            type="button"
+            class="button button--danger"
+            @click="revokeKey(key)"
+          >
+            {{ strings.keys.revoke }}
+          </button>
+        </li>
+      </ul>
+
+      <ShowOnceModal
+        :open="keySecretOpen"
+        :secret="keySecret"
+        :title="strings.showOnce.title"
+        :warning="strings.showOnce.keyWarning"
+        @close="closeKeySecret"
+      />
     </div>
 
     <div v-else class="card settings__box">
@@ -506,12 +611,55 @@ onBeforeUnmount(() => {
   overflow: auto;
 }
 
+.settings__keysTitle {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.settings__keyForm {
+  align-items: flex-end;
+  gap: 0.75rem;
+}
+
+.settings__keys {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.settings__key {
+  gap: 0.75rem;
+  border-bottom: 1px solid #e5e7eb;
+  padding-bottom: 0.4rem;
+}
+
 .settings__danger {
   border: 1px solid #b91c1c;
   margin-top: 1rem;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+}
+
+.badge {
+  font-size: 0.75rem;
+  border: 1px solid #d1d5db;
+  border-radius: 999px;
+  padding: 0.05rem 0.55rem;
+  color: #374151;
+}
+
+.badge--warn {
+  border-color: #b45309;
+  color: #b45309;
+}
+
+.badge--ok {
+  border-color: #15803d;
+  color: #15803d;
 }
 
 .settings__dangerTitle {

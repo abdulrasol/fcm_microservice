@@ -8,6 +8,9 @@ import ChangePassword from './views/ChangePassword.vue'
 import Apps from './views/Apps.vue'
 import AddApp from './views/AddApp.vue'
 import AppSettings from './views/AppSettings.vue'
+import Users from './views/Users.vue'
+import Audit from './views/Audit.vue'
+import Account from './views/Account.vue'
 import NotFound from './views/NotFound.vue'
 
 const routes = [
@@ -16,6 +19,9 @@ const routes = [
   { path: '/', name: 'apps', component: Apps, meta: { requiresAuth: true } },
   { path: '/apps/new', name: 'app-new', component: AddApp, meta: { requiresAuth: true, owner: true } },
   { path: '/apps/:app', name: 'app-settings', component: AppSettings, meta: { requiresAuth: true } },
+  { path: '/users', name: 'users', component: Users, meta: { requiresAuth: true, owner: true } },
+  { path: '/audit', name: 'audit', component: Audit, meta: { requiresAuth: true } },
+  { path: '/account', name: 'account', component: Account, meta: { requiresAuth: true } },
   { path: '/:pathMatch(.*)*', name: 'not-found', component: NotFound, meta: { requiresAuth: true } },
 ]
 
