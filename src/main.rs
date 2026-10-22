@@ -8,6 +8,8 @@ mod credentials;
 mod datasource;
 mod db;
 mod devices;
+#[cfg(test)]
+mod e2e;
 mod identity;
 mod legacy;
 mod ratelimit;
@@ -169,13 +171,12 @@ async fn main() {
         std::process::exit(code);
     }
 
-    let cors = match build_cors_layer() {
-        Ok(layer) => layer,
-        Err(message) => {
-            tracing::error!("{}", message);
-            std::process::exit(1);
-        }
-    };
+    // The CORS policy is checked before the port is opened: an invalid value
+    // must stop the server.
+    if let Err(message) = build_cors_layer() {
+        tracing::error!("{}", message);
+        std::process::exit(1);
+    }
 
     let service_api_key = env_optional("SERVICE_API_KEY");
     let legacy_api_key = env_optional("API_KEY");
@@ -365,36 +366,8 @@ async fn main() {
         legacy: Arc::new(legacy::LegacyGuard::new(legacy_limit.limit)),
     });
 
-    // Serve static files from "dist", fallback to index.html for SPA routing
-    let serve_dir = ServeDir::new("dist").not_found_service(ServeFile::new("dist/index.html"));
-
-    let api_routes = Router::new()
-        .route("/apps", get(list_apps))
-        .route("/history", get(get_history))
-        .route("/topics", get(get_topics).post(add_topic))
-        .route("/send", post(send_notification))
-        .route("/send/template", post(send_template))
-        .route(
-            "/campaigns",
-            get(list_campaigns_route).post(create_campaign),
-        )
-        .route("/campaigns/:id/cancel", post(cancel_campaign))
-        .route("/topics/subscribe", post(topics::subscribe))
-        .route("/topics/unsubscribe", post(topics::unsubscribe))
-        .route("/devices/register", post(register_device))
-        .route("/devices/unregister", post(unregister_device))
-        .nest("/admin", admin::router(state.clone()))
-        .fallback(api_fallback)
-        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
-        .with_state(state.clone());
-
-    let app = Router::new()
-        .nest("/api/v1", api_routes)
-        .route("/api", axum::routing::any(api_fallback))
-        .route("/api/*path", axum::routing::any(api_fallback))
-        .route("/health", get(|| async { "OK" }))
-        .fallback_service(serve_dir)
-        .layer(cors);
+    let app = build_router(state);
+    tracing::debug!("public routes: {:?}", public_route_documentation());
 
     let addr = format!("0.0.0.0:{}", port);
     let listener = match TcpListener::bind(&addr).await {
@@ -495,6 +468,213 @@ fn build_cors_layer() -> Result<CorsLayer, String> {
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
         .max_age(Duration::from_secs(600)))
+}
+
+/// The authentication a public route accepts.
+///
+/// The table of the public routes uses it, so the documentation of the
+/// permissions never drifts from the code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicAuth {
+    /// A service key, or a user token whose role is an admin role.
+    AdminUserOrService,
+    /// A service key, an application key of the app, or an admin user.
+    AdminUserOrServiceOrAppKey,
+    /// A service key, an application key of the app, or a user with a role.
+    UserOrServiceOrAppKey,
+    /// The same, plus the legacy key (only on `/send`).
+    UserOrServiceOrAppKeyOrLegacy,
+    /// A user token, or nothing at all for a public topic.
+    UserOrPublic,
+    /// A user token.
+    User,
+}
+
+/// One public route of the API.
+pub(crate) struct PublicRoute {
+    /// The method of the route.
+    pub method: &'static str,
+    /// The path of the route, relative to `/api/v1`.
+    pub path: &'static str,
+    /// The authentication the route accepts.
+    pub auth: PublicAuth,
+    /// The handler of the route.
+    pub handler: axum::routing::MethodRouter<Arc<AppState>>,
+}
+
+/// Every public route in one table.
+///
+/// The table is the single source of truth: the router is built from it and
+/// the route table test enumerates it, so a route cannot be added without a
+/// line in the documentation.
+pub(crate) fn public_routes() -> Vec<PublicRoute> {
+    vec![
+        PublicRoute {
+            method: "GET",
+            path: "/apps",
+            auth: PublicAuth::AdminUserOrService,
+            handler: get(list_apps),
+        },
+        PublicRoute {
+            method: "GET",
+            path: "/history",
+            auth: PublicAuth::AdminUserOrServiceOrAppKey,
+            handler: get(get_history),
+        },
+        PublicRoute {
+            method: "GET",
+            path: "/topics",
+            auth: PublicAuth::AdminUserOrServiceOrAppKey,
+            handler: get(get_topics),
+        },
+        PublicRoute {
+            method: "POST",
+            path: "/topics",
+            auth: PublicAuth::AdminUserOrServiceOrAppKey,
+            handler: post(add_topic),
+        },
+        PublicRoute {
+            method: "POST",
+            path: "/send",
+            auth: PublicAuth::UserOrServiceOrAppKeyOrLegacy,
+            handler: post(send_notification),
+        },
+        PublicRoute {
+            method: "POST",
+            path: "/send/template",
+            auth: PublicAuth::UserOrServiceOrAppKey,
+            handler: post(send_template),
+        },
+        PublicRoute {
+            method: "GET",
+            path: "/campaigns",
+            auth: PublicAuth::UserOrServiceOrAppKey,
+            handler: get(list_campaigns_route),
+        },
+        PublicRoute {
+            method: "POST",
+            path: "/campaigns",
+            auth: PublicAuth::UserOrServiceOrAppKey,
+            handler: post(create_campaign),
+        },
+        PublicRoute {
+            method: "POST",
+            path: "/campaigns/:id/cancel",
+            auth: PublicAuth::User,
+            handler: post(cancel_campaign),
+        },
+        PublicRoute {
+            method: "POST",
+            path: "/topics/subscribe",
+            auth: PublicAuth::UserOrPublic,
+            handler: post(topics::subscribe),
+        },
+        PublicRoute {
+            method: "POST",
+            path: "/topics/unsubscribe",
+            auth: PublicAuth::UserOrPublic,
+            handler: post(topics::unsubscribe),
+        },
+        PublicRoute {
+            method: "POST",
+            path: "/devices/register",
+            auth: PublicAuth::User,
+            handler: post(register_device),
+        },
+        PublicRoute {
+            method: "POST",
+            path: "/devices/unregister",
+            auth: PublicAuth::User,
+            handler: post(unregister_device),
+        },
+    ]
+}
+
+/// The documentation of the public routes.
+///
+/// Every entry is the method, the path and the authentication the route
+/// accepts. The route table test compares it with the documented table.
+pub(crate) fn public_route_documentation() -> Vec<(String, String, &'static str)> {
+    public_routes()
+        .into_iter()
+        .map(|route| {
+            let auth = match route.auth {
+                PublicAuth::AdminUserOrService => "service key or admin user",
+                PublicAuth::AdminUserOrServiceOrAppKey => {
+                    "service key, application key of the app or admin user"
+                }
+                PublicAuth::UserOrServiceOrAppKey => {
+                    "service key, application key of the app or user token"
+                }
+                PublicAuth::UserOrServiceOrAppKeyOrLegacy => {
+                    "service key, application key of the app, user token or legacy key"
+                }
+                PublicAuth::UserOrPublic => "user token, or nothing for a public topic",
+                PublicAuth::User => "user token",
+            };
+            (route.method.to_string(), route.path.to_string(), auth)
+        })
+        .collect()
+}
+
+/// The router of the whole server.
+///
+/// It holds the public routes, the admin routes, the static files of the
+/// dashboard and the fallback of the API. The tests build it, so the routes
+/// are exercised the same way the server runs them.
+pub(crate) fn build_router(state: Arc<AppState>) -> Router {
+    // Serve static files from "dist", fallback to index.html for SPA routing
+    let serve_dir = ServeDir::new("dist").not_found_service(ServeFile::new("dist/index.html"));
+
+    let mut api_routes = Router::new();
+    for (path, method_router) in merge_public_routes(public_routes()) {
+        api_routes = api_routes.route(path, method_router);
+    }
+
+    let api_routes = api_routes
+        .nest("/admin", admin::router(state.clone()))
+        .fallback(api_fallback)
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
+        .with_state(state.clone());
+
+    Router::new()
+        .nest("/api/v1", api_routes)
+        .route("/api", axum::routing::any(api_fallback))
+        .route("/api/*path", axum::routing::any(api_fallback))
+        .route("/health", get(|| async { "OK" }))
+        .fallback_service(serve_dir)
+        .layer(cors_layer())
+}
+
+/// Merges the routes of the same path into one router.
+fn merge_public_routes(
+    routes: Vec<PublicRoute>,
+) -> Vec<(&'static str, axum::routing::MethodRouter<Arc<AppState>>)> {
+    let mut merged: Vec<(&'static str, axum::routing::MethodRouter<Arc<AppState>>)> = Vec::new();
+    for route in routes {
+        match merged.iter_mut().find(|(known, _)| *known == route.path) {
+            Some((_, known)) => {
+                let taken = std::mem::replace(known, axum::routing::MethodRouter::new());
+                *known = taken.merge(route.handler);
+            }
+            None => merged.push((route.path, route.handler)),
+        }
+    }
+    merged
+}
+
+/// The CORS layer of the router.
+///
+/// `main` refuses to start when the policy is invalid, so the layer below is
+/// only used by the tests, where no browser is involved.
+fn cors_layer() -> CorsLayer {
+    match build_cors_layer() {
+        Ok(layer) => layer,
+        Err(message) => {
+            tracing::error!("{}", message);
+            CorsLayer::new()
+        }
+    }
 }
 
 async fn api_fallback(uri: axum::http::Uri) -> impl IntoResponse {
