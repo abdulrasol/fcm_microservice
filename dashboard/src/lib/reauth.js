@@ -15,6 +15,15 @@ export const reauth = reactive({
 })
 
 let waiting = null
+let dialogMounted = false
+
+/** Records whether App's re-authentication dialog is available. */
+export function setReauthDialogMounted(value) {
+  dialogMounted = Boolean(value)
+  if (!dialogMounted && waiting) {
+    cancelReauth()
+  }
+}
 
 /** True when the error asks for a password confirmation. */
 export function isReauthError(error) {
@@ -28,6 +37,9 @@ export function withReauth(action) {
     .catch((error) => {
       if (!isReauthError(error)) {
         throw error
+      }
+      if (!dialogMounted) {
+        throw new ApiError({ status: 0, code: 'reauth_unavailable', message: '' })
       }
       return new Promise((resolve, reject) => {
         waiting = { action, resolve, reject }

@@ -1,15 +1,16 @@
 <script setup>
-import { onMounted } from 'vue'
+import { onBeforeUnmount, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Shell from './layouts/Shell.vue'
 import strings from './strings'
 import { load, session } from './session'
-import { cancelReauth, reauth, submitReauth } from './lib/reauth'
+import { cancelReauth, reauth, setReauthDialogMounted, submitReauth } from './lib/reauth'
 
 const route = useRoute()
 const router = useRouter()
 
 onMounted(async () => {
+  setReauthDialogMounted(true)
   if (!session.loaded) {
     await load()
   }
@@ -17,14 +18,17 @@ onMounted(async () => {
     router.replace({ path: '/login' })
   }
 })
+
+onBeforeUnmount(() => {
+  setReauthDialogMounted(false)
+})
 </script>
 
 <template>
-  <Shell>
-    <router-view />
+  <Shell />
 
-    <div v-if="reauth.open" class="modal" role="dialog" aria-modal="true">
-      <div class="modal__box">
+  <div v-if="reauth.open" class="modal" role="dialog" aria-modal="true">
+    <div class="modal__box">
         <h2 class="modal__title">{{ strings.reauth.title }}</h2>
         <p class="modal__hint">{{ strings.reauth.hint }}</p>
         <form @submit.prevent="submitReauth">
@@ -47,9 +51,8 @@ onMounted(async () => {
             </button>
           </div>
         </form>
-      </div>
     </div>
-  </Shell>
+  </div>
 </template>
 
 <style scoped>

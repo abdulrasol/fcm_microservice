@@ -17,7 +17,9 @@ vi.mock('../api', () => ({
   },
 }))
 
-const { cancelReauth, reauth, submitReauth, withReauth } = await import('../lib/reauth')
+const { cancelReauth, reauth, setReauthDialogMounted, submitReauth, withReauth } = await import(
+  '../lib/reauth'
+)
 
 function reauthError() {
   const error = new Error('reauth_required')
@@ -33,6 +35,7 @@ describe('the re-authentication', () => {
     reauth.password = ''
     reauth.error = ''
     reauth.pending = false
+    setReauthDialogMounted(true)
   })
 
   it('reauth_retries_exactly_once', async () => {
@@ -92,5 +95,13 @@ describe('the re-authentication', () => {
     expect(reauth.password).toBe('')
     cancelReauth()
     await promise.catch(() => {})
+  })
+
+  it('reauth_without_a_dialog_rejects_instead_of_hanging', async () => {
+    setReauthDialogMounted(false)
+    const action = vi.fn().mockRejectedValue(reauthError())
+
+    await expect(withReauth(action)).rejects.toMatchObject({ code: 'reauth_unavailable' })
+    expect(reauth.open).toBe(false)
   })
 })
