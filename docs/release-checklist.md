@@ -20,6 +20,7 @@
 - [ ] **مراجعة متغيرات البيئة (`.env`):**
   - [ ] `CORS_ALLOWED_ORIGINS` يحتوي على أصل لوحة التحكم الصريح (مثل `https://admin.example.com`).
   - [ ] `TRUST_PROXY=true` مفعّل إذا كان الخادم خلف Reverse Proxy.
+  - [ ] `CLIENT_IP_HEADER=cf-connecting-ip` مضبوط عند الخدمة عبر Cloudflare Tunnel (أو `x-real-ip` مع Nginx)، وليس فارغاً بلا سبب.
   - [ ] `COOKIE_SECURE=true` مفعّل لبيئة الإنتاج HTTPS.
   - [ ] `LEGACY_API_KEY_ENABLED=true` أثناء مرحلة الانتقال الأولى R1 للتوافق مع التطبيقات القديمة.
   - [ ] `CREDENTIALS_DIR` يشير لمجلد قابل للكتابة من قِبل الحاوية.

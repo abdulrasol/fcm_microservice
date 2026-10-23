@@ -258,6 +258,7 @@ async fn harness(resolver: Option<TestServer>) -> Harness {
         client: reqwest::Client::new(),
         auth,
         trust_proxy: false,
+        client_ip_header: None,
         topics_limiter: RateLimiter::new(30, Duration::from_secs(60)),
         auth_fail_limiter: RateLimiter::new(10, Duration::from_secs(60)),
         devices: Arc::new(DeviceStore::new(pool.clone())),

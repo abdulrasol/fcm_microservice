@@ -109,6 +109,8 @@ struct AppState {
     client: Client,
     auth: AuthService,
     trust_proxy: bool,
+    /// T18: the header of the real client address behind a trusted proxy.
+    client_ip_header: Option<auth::ClientIpHeader>,
     topics_limiter: RateLimiter,
     auth_fail_limiter: RateLimiter,
     /// T1: the configuration store.
@@ -226,6 +228,14 @@ async fn main() {
     let legacy_api_key = env_optional("API_KEY");
     let legacy_enabled = env_flag("LEGACY_API_KEY_ENABLED");
     let trust_proxy = env_flag("TRUST_PROXY");
+    let client_ip_header =
+        match auth::ClientIpHeader::from_value(env_optional("CLIENT_IP_HEADER").as_deref()) {
+            Ok(header) => header,
+            Err(message) => {
+                tracing::error!("{}", message);
+                std::process::exit(1);
+            }
+        };
 
     // The budget of the legacy key. Only this file reads the variable.
     let legacy_limit = {
@@ -395,6 +405,7 @@ async fn main() {
         client,
         auth,
         trust_proxy,
+        client_ip_header,
         topics_limiter: RateLimiter::new(TOPICS_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
         auth_fail_limiter: RateLimiter::new(AUTH_FAILURE_RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW),
         devices: device_store,
@@ -789,7 +800,12 @@ fn auth_error_with_limit(
     if matches!(error, AuthError::Unauthorized(_) | AuthError::Forbidden(_)) {
         let key = format!(
             "ip:{}",
-            auth::client_ip(headers, Some(peer), state.trust_proxy)
+            auth::client_ip(
+                headers,
+                Some(peer),
+                state.trust_proxy,
+                state.client_ip_header
+            )
         );
         if !state.auth_fail_limiter.check(&key) {
             return topics::too_many_requests();
@@ -2450,6 +2466,7 @@ mod tests {
             client,
             auth,
             trust_proxy: false,
+            client_ip_header: None,
             topics_limiter: RateLimiter::new(30, Duration::from_secs(60)),
             auth_fail_limiter: RateLimiter::new(10, Duration::from_secs(60)),
             config: config.clone(),

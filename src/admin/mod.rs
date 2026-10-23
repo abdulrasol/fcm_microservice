@@ -720,6 +720,7 @@ pub(crate) mod tests {
             client,
             auth,
             trust_proxy: false,
+            client_ip_header: None,
             topics_limiter: RateLimiter::new(30, Duration::from_secs(60)),
             auth_fail_limiter: RateLimiter::new(10, Duration::from_secs(60)),
             devices: Arc::new(crate::devices::DeviceStore::new(pool)),

@@ -14,7 +14,8 @@
 |---|---|---|---|
 | `CORS_ALLOWED_ORIGINS` | *إلزامي (لا افتراضي)* | لا | قائمة أصول المتصفح المصرح لها مفصولة بفواصل (مثل `https://admin.example.com`). يمنع الخادم البدء إذا كان فارغاً أو احتوى على `*`. |
 | `PORT` | `8080` | لا | منفذ TCP الذي يستمع عليه الخادم الداخلي. |
-| `TRUST_PROXY` | `false` | لا | تفعيله (`true`) عند العمل خلف Reverse Proxy موثوق لاعتماد عنوان IP الحقيقي من `X-Forwarded-For`. |
+| `TRUST_PROXY` | `false` | لا | تفعيله (`true`) عند العمل خلف Reverse Proxy موثوق لاعتماد عنوان IP الحقيقي من ترويسة البروكسي. |
+| `CLIENT_IP_HEADER` | *فارغ* | لا | اختياري. اسم ترويسة عنوان العميل التي يضبطها البروكسي الموثوق: `cf-connecting-ip` أو `x-real-ip` أو `x-forwarded-for` (حروف صغيرة). قيمة غير معروفة تمنع الإقلاع. عند تركه فارغاً يُعتمد **آخر** عنصر من `X-Forwarded-For` وليس أوله. |
 | `DATABASE_URL` | `sqlite://data.db` | لا | مسار قاعدة بيانات SQLite ومحرك التخزين. |
 | `CREDENTIALS_DIR` | `credentials` | لا | مجلد حفظ ملفات حساب الخدمة Google Service Account. يجب أن يكون قابلاً للكتابة للحاوية. |
 | `CREDENTIALS_UPLOAD_ENABLED` | `true` | لا | السماح برفع واستبدال ملفات الاعتماد من لوحة التحكم للمالك. عند جعله `false` تُرد مسارات الرفع بـ `404`. |
@@ -95,12 +96,32 @@ You must change this password on first login.
 2. حماية ترويسات المصادقة وتوكنات الهوية من التنصت.
 
 ### 4.1 الترويسات الإلزامية وخاصية `TRUST_PROXY`
-عند تفعيل `TRUST_PROXY=true` يعتمد الخادم عنوان IP من ترويسة `X-Forwarded-For` لمحددات السرعة وحماية محاولات الدخول الفاشلة.
+عند تفعيل `TRUST_PROXY=true` يعتمد الخادم عنوان IP العميل لمحددات السرعة وحماية محاولات الدخول الفاشلة.
+القاعدة الفعلية في `src/auth.rs::client_ip`:
+- `TRUST_PROXY=false` (الافتراضي): عنوان اتصال TCP (peer) دائماً، وتُتجاهل كل الترويسات.
+- `TRUST_PROXY=true` مع `CLIENT_IP_HEADER` محدد: تُقرأ **هذه الترويسة فقط**، ويجب أن تحمل عنوان IP واحداً صالحاً.
+  إن كانت مفقودة أو غير صالحة يُستخدم عنوان الـ peer، **ولا** يُعتمد `X-Forwarded-For` بديلاً.
+- `TRUST_PROXY=true` بدون `CLIENT_IP_HEADER`: يُعتمد **آخر** عنصر في `X-Forwarded-For` (الذي أضافه البروكسي الموثوق)،
+  وليس العنصر الأول الذي قد يزوّره العميل. السلسلة الأطول من 1024 بايت تُرفض ويُستخدم عنوان الـ peer.
+
+**Cloudflare Tunnel (الإعداد الموصى به):** Cloudflare تضبط `CF-Connecting-IP` بقيمة العنوان الحقيقي،
+ولا يستطيع العميل تزويرها عبر النفق. استخدم:
+```env
+TRUST_PROXY=true
+CLIENT_IP_HEADER=cf-connecting-ip
+```
+**Nginx:** اجعل Nginx يضبط `X-Real-IP` بنفسه (`proxy_set_header X-Real-IP $remote_addr;`) واستخدم
+`CLIENT_IP_HEADER=x-real-ip`، أو اترك `CLIENT_IP_HEADER` فارغاً مع `X-Forwarded-For` الذي يضيفه Nginx في نهاية السلسلة.
+
 لذلك يجب على الخادم العكسي تمرير:
 - `Host`
 - `X-Real-IP`
 - `X-Forwarded-For`
 - `X-Forwarded-Proto https`
+
+> [!WARNING]
+> لا تضبط `CLIENT_IP_HEADER=x-forwarded-for` إلا إذا كان البروكسي **يستبدل** الترويسة بعنوان واحد.
+> الترويسة التي تحمل قائمة عناوين تُعد غير صالحة في هذا الوضع، ويُستخدم عنوان الـ peer.
 
 ### 4.2 الحماية من هجمات CSRF
 تتحقق الأداة من تطابق ترويسة `Origin` في جميع طلبات تعديل الحالة (`POST`, `PUT`, `DELETE`)

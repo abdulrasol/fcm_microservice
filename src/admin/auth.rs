@@ -327,7 +327,12 @@ pub async fn login(
 ) -> Result<Response, AdminError> {
     let tool_auth = &state.tool_auth;
     let email = request.email.trim().to_lowercase();
-    let ip = client_ip(&headers, Some(peer), state.trust_proxy);
+    let ip = client_ip(
+        &headers,
+        Some(peer),
+        state.trust_proxy,
+        state.client_ip_header,
+    );
     let email_key = format!("login:email:{}", email);
     let ip_key = format!("login:ip:{}", ip);
 

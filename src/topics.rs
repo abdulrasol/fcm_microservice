@@ -84,7 +84,12 @@ async fn manage(
                 && headers.contains_key(header::AUTHORIZATION)
                 && !state.auth_fail_limiter.check(&format!(
                     "ip:{}",
-                    auth::client_ip(&headers, Some(peer), state.trust_proxy)
+                    auth::client_ip(
+                        &headers,
+                        Some(peer),
+                        state.trust_proxy,
+                        state.client_ip_header
+                    )
                 ))
             {
                 return Err(too_many_requests());
@@ -162,7 +167,12 @@ pub(crate) fn check_ip_limit(
     headers: &HeaderMap,
     peer: SocketAddr,
 ) -> Result<(), ApiError> {
-    let ip = auth::client_ip(headers, Some(peer), state.trust_proxy);
+    let ip = auth::client_ip(
+        headers,
+        Some(peer),
+        state.trust_proxy,
+        state.client_ip_header,
+    );
     if state.topics_limiter.check(&format!("ip:{ip}")) {
         Ok(())
     } else {

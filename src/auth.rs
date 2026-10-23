@@ -695,23 +695,107 @@ fn unverified_selection(token: &str) -> Option<TokenSelection> {
     Some(TokenSelection { audience, issuer })
 }
 
-/// Client IP for rate limiting. `X-Forwarded-For` is only trusted behind a proxy.
-pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, trust_proxy: bool) -> String {
+/// The longest client address accepted from a proxy header.
+///
+/// An address is at most 45 bytes; the margin covers brackets and zones.
+const MAX_CLIENT_IP_BYTES: usize = 64;
+
+/// The longest `X-Forwarded-For` chain accepted. A longer value is refused
+/// and the peer address is used, so a header cannot grow without bound.
+const MAX_FORWARDED_FOR_BYTES: usize = 1024;
+
+/// The header a trusted proxy uses for the real client address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientIpHeader {
+    /// Cloudflare: `CF-Connecting-IP`.
+    CfConnectingIp,
+    /// Nginx: `X-Real-IP`.
+    XRealIp,
+    /// The last entry of `X-Forwarded-For`.
+    XForwardedFor,
+}
+
+impl ClientIpHeader {
+    /// The lowercase name of the header.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::CfConnectingIp => "cf-connecting-ip",
+            Self::XRealIp => "x-real-ip",
+            Self::XForwardedFor => "x-forwarded-for",
+        }
+    }
+
+    /// Reads `CLIENT_IP_HEADER`. An empty value keeps the default behavior:
+    /// the last entry of `X-Forwarded-For`.
+    ///
+    /// An unknown value is an error, so a typo stops the server instead of
+    /// silently trusting the wrong header.
+    pub fn from_value(value: Option<&str>) -> Result<Option<Self>, String> {
+        match value.unwrap_or("").trim() {
+            "" => Ok(None),
+            "cf-connecting-ip" => Ok(Some(Self::CfConnectingIp)),
+            "x-real-ip" => Ok(Some(Self::XRealIp)),
+            "x-forwarded-for" => Ok(Some(Self::XForwardedFor)),
+            other => Err(format!(
+                "CLIENT_IP_HEADER '{other}' is not supported; use cf-connecting-ip, x-real-ip or x-forwarded-for"
+            )),
+        }
+    }
+}
+
+/// The value of one header, when it is valid UTF-8.
+fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// Parses one address and returns its canonical form.
+fn parse_client_ip(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > MAX_CLIENT_IP_BYTES {
+        return None;
+    }
+    text.parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_string())
+}
+
+/// The address of the peer of the connection.
+fn peer_ip(peer: Option<SocketAddr>) -> String {
+    peer.map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Client IP for rate limiting.
+///
+/// With `TRUST_PROXY=false` the peer address is always used. With
+/// `TRUST_PROXY=true` only the configured header is trusted, and it must hold
+/// one valid address; otherwise the peer address is used. Without a configured
+/// header the last `X-Forwarded-For` entry is used, because that is the one the
+/// trusted proxy appended, never the first one a client may have forged.
+pub fn client_ip(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    trust_proxy: bool,
+    configured: Option<ClientIpHeader>,
+) -> String {
     if trust_proxy {
-        if let Some(forwarded) = headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-        {
-            if let Some(first) = forwarded.split(',').next() {
-                let candidate = first.trim();
-                if !candidate.is_empty() && candidate.len() <= 64 {
-                    return candidate.to_string();
+        if let Some(configured) = configured {
+            return match header_text(headers, configured.name()).and_then(parse_client_ip) {
+                Some(ip) => ip,
+                None => peer_ip(peer),
+            };
+        }
+        if let Some(forwarded) = header_text(headers, "x-forwarded-for") {
+            if forwarded.len() <= MAX_FORWARDED_FOR_BYTES {
+                if let Some(last) = forwarded.rsplit(',').next() {
+                    if let Some(ip) = parse_client_ip(last) {
+                        return ip;
+                    }
                 }
             }
         }
     }
-    peer.map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    peer_ip(peer)
 }
 
 #[cfg(test)]
@@ -1797,5 +1881,165 @@ mod tests {
         assert!(is_valid_uid("abc"));
         assert!(!is_valid_uid(""));
         assert!(!is_valid_uid(&"a".repeat(MAX_UID_LENGTH + 1)));
+    }
+
+    // ---------- the client IP (T18) ----------
+
+    fn peer() -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, 1], 1234))
+    }
+
+    fn headers_with(name: &'static str, value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            name,
+            axum::http::HeaderValue::from_str(value).expect("a valid header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn client_ip_ignores_headers_without_trust_proxy() {
+        let headers = headers_with("x-forwarded-for", "1.2.3.4, 9.9.9.9");
+        assert_eq!(client_ip(&headers, Some(peer()), false, None), "10.0.0.1");
+        assert_eq!(
+            client_ip(
+                &headers,
+                Some(peer()),
+                false,
+                Some(ClientIpHeader::CfConnectingIp)
+            ),
+            "10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn client_ip_uses_the_last_forwarded_for_behind_proxy() {
+        let headers = headers_with("x-forwarded-for", "203.0.113.7");
+        assert_eq!(client_ip(&headers, Some(peer()), true, None), "203.0.113.7");
+    }
+
+    #[test]
+    fn client_ip_ignores_a_forged_first_forwarded_for() {
+        // The client sends the first entry; the trusted proxy appends the
+        // real address at the end.
+        let headers = headers_with("x-forwarded-for", "1.2.3.4, 9.9.9.9");
+        assert_eq!(client_ip(&headers, Some(peer()), true, None), "9.9.9.9");
+    }
+
+    #[test]
+    fn client_ip_long_forwarded_chain_falls_back_to_peer() {
+        let chain = format!("{}1.1.1.1", "1.1.1.1,".repeat(200));
+        let headers = headers_with("x-forwarded-for", &chain);
+        assert_eq!(client_ip(&headers, Some(peer()), true, None), "10.0.0.1");
+    }
+
+    #[test]
+    fn client_ip_configured_header_wins_over_forwarded_for() {
+        let mut headers = headers_with("x-forwarded-for", "1.2.3.4");
+        headers.insert(
+            "cf-connecting-ip",
+            axum::http::HeaderValue::from_static("203.0.113.9"),
+        );
+        assert_eq!(
+            client_ip(
+                &headers,
+                Some(peer()),
+                true,
+                Some(ClientIpHeader::CfConnectingIp)
+            ),
+            "203.0.113.9"
+        );
+    }
+
+    #[test]
+    fn client_ip_accepts_x_real_ip_when_configured() {
+        let mut headers = headers_with("x-forwarded-for", "1.2.3.4");
+        headers.insert(
+            "x-real-ip",
+            axum::http::HeaderValue::from_static("203.0.113.10"),
+        );
+        assert_eq!(
+            client_ip(&headers, Some(peer()), true, Some(ClientIpHeader::XRealIp)),
+            "203.0.113.10"
+        );
+    }
+
+    #[test]
+    fn client_ip_invalid_configured_header_falls_back_to_peer() {
+        let mut headers = headers_with("x-forwarded-for", "1.2.3.4");
+        headers.insert(
+            "cf-connecting-ip",
+            axum::http::HeaderValue::from_static("not-an-ip"),
+        );
+        assert_eq!(
+            client_ip(
+                &headers,
+                Some(peer()),
+                true,
+                Some(ClientIpHeader::CfConnectingIp)
+            ),
+            "10.0.0.1",
+            "an invalid configured header must never fall back to X-Forwarded-For"
+        );
+    }
+
+    #[test]
+    fn client_ip_missing_configured_header_falls_back_to_peer() {
+        let headers = headers_with("x-forwarded-for", "1.2.3.4");
+        assert_eq!(
+            client_ip(
+                &headers,
+                Some(peer()),
+                true,
+                Some(ClientIpHeader::CfConnectingIp)
+            ),
+            "10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn client_ip_configured_forwarded_for_requires_one_address() {
+        // The configured header is read as one address, never as a list: a
+        // proxy that overwrites the header is the only safe shape.
+        let headers = headers_with("x-forwarded-for", "1.2.3.4, 9.9.9.9");
+        assert_eq!(
+            client_ip(
+                &headers,
+                Some(peer()),
+                true,
+                Some(ClientIpHeader::XForwardedFor)
+            ),
+            "10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn client_ip_without_peer_is_unknown() {
+        assert_eq!(client_ip(&HeaderMap::new(), None, true, None), "unknown");
+    }
+
+    #[test]
+    fn client_ip_header_from_value_accepts_the_supported_names() {
+        assert_eq!(ClientIpHeader::from_value(None), Ok(None));
+        assert_eq!(ClientIpHeader::from_value(Some("")), Ok(None));
+        assert_eq!(
+            ClientIpHeader::from_value(Some("cf-connecting-ip")),
+            Ok(Some(ClientIpHeader::CfConnectingIp))
+        );
+        assert_eq!(
+            ClientIpHeader::from_value(Some("x-real-ip")),
+            Ok(Some(ClientIpHeader::XRealIp))
+        );
+        assert_eq!(
+            ClientIpHeader::from_value(Some("x-forwarded-for")),
+            Ok(Some(ClientIpHeader::XForwardedFor))
+        );
+    }
+
+    #[test]
+    fn client_ip_header_from_value_rejects_unknown_and_uppercase() {
+        assert!(ClientIpHeader::from_value(Some("CF-Connecting-IP")).is_err());
+        assert!(ClientIpHeader::from_value(Some("true-client-ip")).is_err());
     }
 }
