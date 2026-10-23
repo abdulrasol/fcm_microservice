@@ -196,6 +196,7 @@ export const strings = {
     reason: 'السبب',
     disabledBanner: 'هذا التطبيق معطّل: لا تُرسَل إشعاراته.',
     notConfigured: 'هذا التطبيق غير مُعدّ: ابدأ بتهيئته.',
+    ownerMustInit: 'هذا التطبيق غير مُعدّ بعد: يجب على المالك تهيئته أولاً.',
   },
   danger: {
     title: 'منطقة الخطر',

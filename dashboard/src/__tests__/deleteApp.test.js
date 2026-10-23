@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 
+const replace = vi.fn()
+const del = vi.fn(() => Promise.resolve({ data: {} }))
+
 vi.mock('../api', () => ({
   default: {
     get: () => Promise.resolve({ data: {} }),
     post: () => Promise.resolve({ data: {} }),
     put: () => Promise.resolve({ data: {} }),
-    delete: () => Promise.resolve({ data: {} }),
+    delete: (...args) => del(...args),
   },
   setUnauthorizedHandler: () => {},
   ApiError: class ApiError extends Error {
@@ -32,7 +35,7 @@ vi.mock('../session', () => ({
 
 vi.mock('vue-router', () => ({
   useRoute: () => ({ params: { app: 'watt' }, query: {}, fullPath: '/apps/watt' }),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+  useRouter: () => ({ push: vi.fn(), replace }),
 }))
 
 const { default: AppSettings } = await import('../views/AppSettings.vue')
@@ -55,5 +58,23 @@ describe('the deletion of an application', () => {
 
     await confirm.setValue('watt')
     expect(remove().attributes('disabled')).toBeUndefined()
+  })
+
+  it('delete_app_success_redirects_to_root', async () => {
+    replace.mockClear()
+    const wrapper = mount(AppSettings)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    const open = wrapper.findAll('button').find((button) => button.text().includes('حذف التطبيق'))
+    await open.trigger('click')
+
+    const confirm = wrapper.findAll('input[type="text"]').find((input) => input.attributes('dir') === 'ltr')
+    await confirm.setValue('watt')
+
+    const remove = wrapper.findAll('button').find((button) => button.text().includes('حذف التطبيق نهائياً'))
+    await remove.trigger('click')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(replace).toHaveBeenCalledWith('/')
   })
 })

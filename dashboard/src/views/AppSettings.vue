@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import api from '../api'
 import strings from '../strings'
 import { isOwner, session } from '../session'
@@ -19,6 +19,7 @@ import FreeSendPanel from '../components/FreeSendPanel.vue'
 import DevicesPanel from '../components/DevicesPanel.vue'
 
 const route = useRoute()
+const router = useRouter()
 
 const app = computed(() => String(route.params.app || ''))
 
@@ -65,9 +66,34 @@ const confirmOpen = ref(false)
 
 const owner = computed(() => isOwner.value)
 const configured = computed(() => Boolean(info.value))
+const unconfigured = computed(() => !info.value && Boolean(credentials.value))
 const disabled = computed(() => Boolean(credentials.value && credentials.value.disabled))
 const canDelete = computed(() => confirmName.value === app.value)
 const showKeyTab = computed(() => owner.value)
+
+const visibleTabs = computed(() => {
+  if (unconfigured.value) {
+    return ['overview']
+  }
+  return [
+    'overview',
+    ...(owner.value ? ownerSections : []),
+    'web_subscribe',
+    'campaigns',
+    'templates',
+    'queue',
+    'blocks',
+    'log',
+    'freeSend',
+    'devices',
+  ]
+})
+
+watch(unconfigured, (isUnconfigured) => {
+  if (isUnconfigured && tab.value !== 'overview' && tab.value !== 'keys') {
+    tab.value = 'overview'
+  }
+})
 
 async function load() {
   loading.value = true
@@ -75,6 +101,7 @@ async function load() {
   errorMessage.value = ''
   issues.value = []
   conflict.value = false
+  let appError = null
   try {
     const response = await api.get(`/apps/${app.value}`)
     info.value = response.data
@@ -86,16 +113,27 @@ async function load() {
       texts.value.app_check = `${JSON.stringify(response.data.config.app_check, null, 2)}\n`
     }
   } catch (error) {
-    errorMessage.value = error && error.status === 404 ? strings.errors.notFound : strings.errors.server
+    appError = error
     info.value = null
   }
+  let credsError = null
   try {
     const response = await api.get(`/apps/${app.value}/credentials`)
     credentials.value = response.data
   } catch (error) {
+    credsError = error
     credentials.value = null
   }
-  if (owner.value) {
+  if (info.value || credentials.value) {
+    errorMessage.value = ''
+    if (unconfigured.value && tab.value !== 'overview' && tab.value !== 'keys') {
+      tab.value = 'overview'
+    }
+  } else {
+    const bothNotFound = appError && appError.status === 404 && credsError && credsError.status === 404
+    errorMessage.value = bothNotFound ? strings.errors.notFound : strings.errors.server
+  }
+  if (owner.value && (configured.value || unconfigured.value)) {
     await loadKeys()
   }
   loading.value = false
@@ -136,8 +174,8 @@ async function initApp() {
   busy.value = true
   try {
     await api.post(`/apps/${app.value}/init`, {})
-    message.value = strings.settings.initDone
     await load()
+    message.value = strings.settings.initDone
   } catch (error) {
     errorMessage.value = strings.errors.server
   } finally {
@@ -210,7 +248,7 @@ async function deleteApp() {
     await withReauth(() => api.delete(`/apps/${app.value}`, { data: { confirm: confirmName.value } }))
     confirmOpen.value = false
     confirmName.value = ''
-    await load()
+    router.replace('/')
   } catch (error) {
     errorMessage.value = error && error.code === 'cancelled' ? '' : strings.errors.server
   } finally {
@@ -326,25 +364,19 @@ onBeforeUnmount(() => {
     <p v-if="message" class="ok">{{ message }}</p>
 
     <p v-if="disabled" class="settings__banner">{{ strings.settings.disabledBanner }}</p>
-    <p v-if="configured && !configured.configured" class="settings__banner">
-      {{ strings.settings.notConfigured }}
-      <button type="button" class="button" @click="initApp">{{ strings.settings.init }}</button>
+    <p v-if="unconfigured" class="settings__banner">
+      <template v-if="owner">
+        {{ strings.settings.notConfigured }}
+        <button type="button" class="button" @click="initApp">{{ strings.settings.init }}</button>
+      </template>
+      <template v-else>
+        {{ strings.settings.ownerMustInit }}
+      </template>
     </p>
 
-    <nav class="row settings__tabs">
+    <nav v-if="configured || unconfigured" class="row settings__tabs">
       <button
-        v-for="name in [
-          'overview',
-          ...(owner ? ownerSections : []),
-          'web_subscribe',
-          'campaigns',
-          'templates',
-          'queue',
-          'blocks',
-          'log',
-          'freeSend',
-          'devices',
-        ]"
+        v-for="name in visibleTabs"
         :key="name"
         type="button"
         class="button button--ghost"
@@ -364,7 +396,8 @@ onBeforeUnmount(() => {
       </button>
     </nav>
 
-    <div v-if="tab === 'overview'" class="card settings__box">
+    <template v-if="configured || unconfigured">
+      <div v-if="tab === 'overview'" class="card settings__box">
       <dl class="settings__facts">
         <div>
           <dt>{{ strings.settings.projectId }}</dt>
@@ -550,6 +583,7 @@ onBeforeUnmount(() => {
         }}</pre>
       </div>
     </div>
+    </template>
 
     <div v-if="confirmOpen" class="card settings__danger">
       <h2 class="settings__dangerTitle">{{ strings.danger.title }}</h2>
