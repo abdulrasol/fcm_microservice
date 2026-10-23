@@ -2,6 +2,7 @@
 
 | # | البند | المنفّذ | الحالة |
 |---|---|---|---|
+| 0 | T19: نافذة reauth لا تظهر (تعطل إضافة/حذف تطبيق وإضافة مدير) + أسباب فشل الإرسال الحر | منفّذ (الأداة) | أمر جاهز: `execution/T19.md` (أولوية قصوى) |
 | 1 | T18: `CLIENT_IP_HEADER` + `/auth/me` مرة واحدة | منفّذ (الأداة) | أمر جاهز: `execution/T18.md` |
 | 2 | W4-fix: تحقق `seller_user_id` في القواعد + اختبارات Emulator | منفّذ (taqati) | أمر جاهز: `execution/W4-fix.md` |
 | 3 | نشر قواعد Firestore (SEC3 + W4-fix) | المالك | بعد #2: مراجعة `users` التي `role=admin`، ثم `firebase deploy --only firestore:rules` |
