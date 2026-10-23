@@ -160,6 +160,22 @@ pub async fn put_campaigns_section(
     .await
 }
 
+/// `PUT /apps/{app}/devices`: static companion for the diagnostic GET route.
+pub async fn put_devices_section(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(app): Path<String>,
+    AdminJson(request): AdminJson<SectionRequest>,
+) -> Result<Json<Value>, AdminError> {
+    put_section(
+        State(state),
+        user,
+        Path((app, "devices".to_string())),
+        AdminJson(request),
+    )
+    .await
+}
+
 /// `PUT /apps/{app}/{section}`.
 pub async fn put_section(
     State(state): State<Arc<AppState>>,

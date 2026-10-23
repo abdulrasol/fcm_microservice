@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 
-const { issueMessage, issueCode, issueMessages } = await import('../lib/issueCodes')
+const { documentedIssueCodes, issueMessage, issueCode, issueMessages } = await import('../lib/issueCodes')
 
 // The codes that the backend really writes, read from the validators.
 const BACKEND_FILES = [
@@ -14,6 +14,14 @@ const BACKEND_FILES = [
 ]
 
 describe('the map of the issue codes', () => {
+  it('covers every code documented in section 8', () => {
+    expect(documentedIssueCodes).toHaveLength(31)
+    for (const code of documentedIssueCodes) {
+      expect(issueMessage(code), code).toMatch(/[؀-ۿ]/)
+      expect(issueMessage(code).length, code).toBeGreaterThan(20)
+    }
+  })
+
   it('issue_code_map_covers_every_backend_code_used', () => {
     const used = new Set()
     for (const file of BACKEND_FILES) {

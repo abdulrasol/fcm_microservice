@@ -88,6 +88,8 @@ const visibleTabs = computed(() => {
     'devices',
   ]
 })
+const basicTabs = computed(() => visibleTabs.value.filter((name) => !['campaigns', 'templates', 'queue', 'blocks'].includes(name)))
+const advancedTabs = computed(() => visibleTabs.value.filter((name) => ['campaigns', 'templates', 'queue', 'blocks'].includes(name)))
 
 watch(unconfigured, (isUnconfigured) => {
   if (isUnconfigured && tab.value !== 'overview' && tab.value !== 'keys') {
@@ -376,7 +378,7 @@ onBeforeUnmount(() => {
 
     <nav v-if="configured || unconfigured" class="row settings__tabs">
       <button
-        v-for="name in visibleTabs"
+        v-for="name in basicTabs"
         :key="name"
         type="button"
         class="button button--ghost"
@@ -385,6 +387,21 @@ onBeforeUnmount(() => {
       >
         {{ strings.settings.tabs[name] || name }}
       </button>
+      <details v-if="advancedTabs.length" class="settings__advancedTabs">
+        <summary class="button button--ghost">{{ strings.settings.tabs.advancedAddons }}</summary>
+        <div class="row">
+          <button
+            v-for="name in advancedTabs"
+            :key="name"
+            type="button"
+            class="button button--ghost"
+            :class="{ 'button--active': tab === name }"
+            @click="tab = name"
+          >
+            {{ strings.settings.tabs[name] || name }}
+          </button>
+        </div>
+      </details>
       <button
         v-if="showKeyTab"
         type="button"
@@ -618,6 +635,16 @@ onBeforeUnmount(() => {
 
 .settings__tabs {
   margin-bottom: 1rem;
+}
+
+.settings__advancedTabs summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.settings__advancedTabs > .row {
+  gap: 0.35rem;
+  margin-top: 0.35rem;
 }
 
 .settings__box {

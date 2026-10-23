@@ -1313,12 +1313,18 @@ fn log_field(value: &str) -> String {
 /// the client answer does not change. The log carries identifiers and a closed
 /// reason only: no token, no parameter value, no document content. A 400 adds
 /// the validation message, which names the parameter and never its value.
+struct TemplateRejection {
+    error: (StatusCode, String),
+    reason: String,
+    sender: String,
+}
+
 fn reject_template(
     payload: &SendTemplateRequest,
     sender: &str,
     error: (StatusCode, String),
     reason: &str,
-) -> (StatusCode, String) {
+) -> TemplateRejection {
     let detail = if error.0 == StatusCode::BAD_REQUEST {
         format!(
             " detail={}",
@@ -1336,7 +1342,11 @@ fn reject_template(
         reason,
         detail
     );
-    error
+    TemplateRejection {
+        error,
+        reason: reason.to_string(),
+        sender: sender.to_string(),
+    }
 }
 
 /// `POST /api/v1/send/template` (T8).
@@ -1350,21 +1360,61 @@ async fn send_template(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SendTemplateRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    let result = send_template_inner(&headers, peer, &state, &payload).await;
+    if let Err(rejection) = &result {
+        if matches!(
+            rejection.error.0,
+            StatusCode::BAD_REQUEST
+                | StatusCode::FORBIDDEN
+                | StatusCode::NOT_FOUND
+                | StatusCode::TOO_MANY_REQUESTS
+        ) {
+            let detail: String = rejection.error.1.chars().take(160).collect();
+            let response = json!({
+                "reason": rejection.reason,
+                "detail": detail,
+            })
+            .to_string();
+            let _ = db::log_notification_ext(
+                &state.db,
+                &payload.app,
+                "rejected",
+                &payload.template,
+                "failed",
+                &response,
+                "{}",
+                &rejection.sender,
+                None,
+                "template",
+                Some(&payload.template),
+            )
+            .await;
+        }
+    }
+    result.map_err(|rejection| rejection.error)
+}
+
+async fn send_template_inner(
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    state: &Arc<AppState>,
+    payload: &SendTemplateRequest,
+) -> Result<(StatusCode, Json<serde_json::Value>), TemplateRejection> {
     // 1. A known app, then the shared IP limit.
-    ensure_known_app(&state, &payload.app)
+    ensure_known_app(state, &payload.app)
         .await
-        .map_err(|error| reject_template(&payload, "-", error, "unknown_app"))?;
-    topics::check_ip_limit(&state, &headers, peer)
-        .map_err(|error| reject_template(&payload, "-", error, "ip_limited"))?;
+        .map_err(|error| reject_template(payload, "-", error, "unknown_app"))?;
+    topics::check_ip_limit(state, headers, peer)
+        .map_err(|error| reject_template(payload, "-", error, "ip_limited"))?;
 
     // 2. The service key, or a verified identity and its resolved role.
     let (sender, sender_email, is_service) = match state
         .auth
-        .trusted_sender(&headers, &payload.app)
+        .trusted_sender(headers, &payload.app)
         .await
         .map_err(|error| {
             reject_template(
-                &payload,
+                payload,
                 "-",
                 error.into_response(),
                 "unauthenticated_service_key",
@@ -1393,13 +1443,13 @@ async fn send_template(
         None => {
             let identity = state
                 .auth
-                .authenticate_identity(&headers, &payload.app)
+                .authenticate_identity(headers, &payload.app)
                 .await
                 .map_err(|error| {
                     reject_template(
-                        &payload,
+                        payload,
                         "-",
-                        auth_error_with_limit(&state, &headers, peer, error),
+                        auth_error_with_limit(state, headers, peer, error),
                         "identity_rejected_or_unavailable",
                     )
                 })?;
@@ -1409,9 +1459,9 @@ async fn send_template(
                 .await
                 .map_err(|error| {
                     reject_template(
-                        &payload,
+                        payload,
                         &identity.uid,
-                        auth_error_with_limit(&state, &headers, peer, error),
+                        auth_error_with_limit(state, headers, peer, error),
                         "role_lookup_unavailable",
                     )
                 })?;
@@ -1430,7 +1480,7 @@ async fn send_template(
     // 3. A missing or disabled template is a uniform 404.
     let snapshot = state.config.get(&payload.app).ok_or_else(|| {
         reject_template(
-            &payload,
+            payload,
             &sender.uid,
             template_not_found(),
             "app_config_missing",
@@ -1442,7 +1492,7 @@ async fn send_template(
         .filter(|definition| definition.enabled)
         .ok_or_else(|| {
             reject_template(
-                &payload,
+                payload,
                 &sender.uid,
                 template_not_found(),
                 "template_not_found_or_disabled",
@@ -1461,7 +1511,7 @@ async fn send_template(
                 log_field(sender.role.as_deref().unwrap_or("none"))
             );
             return Err(reject_template(
-                &payload,
+                payload,
                 &sender.uid,
                 (StatusCode::FORBIDDEN, "Forbidden".to_string()),
                 &reason,
@@ -1477,7 +1527,7 @@ async fn send_template(
             .allow((&payload.app, &payload.template, &sender.uid), limit)
         {
             return Err(reject_template(
-                &payload,
+                payload,
                 &sender.uid,
                 topics::too_many_requests(),
                 "rate_limited",
@@ -1487,17 +1537,12 @@ async fn send_template(
 
     // 5. Client parameters.
     let params = template::validate_params(definition, &payload.params).map_err(|error| {
-        reject_template(
-            &payload,
-            &sender.uid,
-            template_error(error),
-            "invalid_param",
-        )
+        reject_template(payload, &sender.uid, template_error(error), "invalid_param")
     })?;
 
     // 6. The context document, when the template asks for one.
     let doc = match template::context_path(definition, &params, &sender).map_err(|error| {
-        reject_template(&payload, &sender.uid, template_error(error), "context_path")
+        reject_template(payload, &sender.uid, template_error(error), "context_path")
     })? {
         Some(path) => {
             let source = state
@@ -1506,7 +1551,7 @@ async fn send_template(
                 .await
                 .map_err(|_| {
                     reject_template(
-                        &payload,
+                        payload,
                         &sender.uid,
                         data_source_unavailable(),
                         "context_source_unavailable",
@@ -1516,7 +1561,7 @@ async fn send_template(
                 Ok(doc) => doc,
                 Err(DataError::Unavailable(_)) => {
                     return Err(reject_template(
-                        &payload,
+                        payload,
                         &sender.uid,
                         data_source_unavailable(),
                         "context_unavailable",
@@ -1524,7 +1569,7 @@ async fn send_template(
                 }
                 Err(DataError::InvalidPath(message)) => {
                     return Err(reject_template(
-                        &payload,
+                        payload,
                         &sender.uid,
                         (StatusCode::BAD_REQUEST, message),
                         "context_invalid_path",
@@ -1542,7 +1587,7 @@ async fn send_template(
                 template::RenderError::Forbidden => "context_require_failed",
                 template::RenderError::BadRequest(_) => "render_error",
             };
-            reject_template(&payload, &sender.uid, template_error(error), reason)
+            reject_template(payload, &sender.uid, template_error(error), reason)
         })?;
 
     // 8. The same content limits as `/send`, applied to the rendered output.
@@ -1576,7 +1621,7 @@ async fn send_template(
     )
     .map_err(|error| {
         reject_template(
-            &payload,
+            payload,
             &sender.uid,
             (StatusCode::BAD_REQUEST, error),
             "validation_failed",
@@ -1596,7 +1641,7 @@ async fn send_template(
         .await
         .map_err(|_| {
             reject_template(
-                &payload,
+                payload,
                 &sender.uid,
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1616,12 +1661,12 @@ async fn send_template(
     // 10-11. Recipients and delivery. Every error exit releases the claimed
     // key, so a request that delivered nothing can be retried instead of being
     // swallowed as a duplicate.
-    let delivery = match deliver(&state, &payload.app, &snapshot, &rendered).await {
+    let delivery = match deliver(state, &payload.app, &snapshot, &rendered).await {
         Ok(delivery) => delivery,
         Err(error) => {
-            release_dedupe_key(&state, &payload.app, &payload.template, &rendered).await;
+            release_dedupe_key(state, &payload.app, &payload.template, &rendered).await;
             return Err(reject_template(
-                &payload,
+                payload,
                 &sender.uid,
                 error,
                 "delivery_error",
@@ -1637,7 +1682,7 @@ async fn send_template(
         let _ = db::touch_template_used(&state.db, &payload.app, &payload.template).await;
     } else {
         // Nothing was delivered (all failed, or no devices): free the key.
-        release_dedupe_key(&state, &payload.app, &payload.template, &rendered).await;
+        release_dedupe_key(state, &payload.app, &payload.template, &rendered).await;
     }
 
     if delivery.empty_audience {
@@ -3302,8 +3347,9 @@ mod tests {
         use_http_source(&harness, "http://127.0.0.1:1").await;
         save_template(&harness, "order_new", order_new_template()).await;
 
+        let router = template_router(harness.state.clone());
         let (status, text) = call(
-            &template_router(harness.state),
+            &router,
             template_request(
                 json!({
                     "app": APP,
@@ -3317,6 +3363,22 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(text.contains("order_id"), "unexpected body: {text}");
+
+        let row: (String, String, String, String, String, Option<String>) = sqlx::query_as(
+            "SELECT kind, status, target, response, payload, \"ref\" \
+             FROM notifications_history ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&harness.pool)
+        .await
+        .expect("the rejected send must be recorded");
+        assert_eq!(row.0, "template");
+        assert_eq!(row.1, "failed");
+        assert_eq!(row.2, "rejected");
+        assert!(row.3.contains("\"reason\":\"invalid_param\""));
+        assert!(row.3.contains("order_id"));
+        assert_eq!(row.4, "{}", "parameters must never enter history");
+        assert_eq!(row.5.as_deref(), Some("order_new"));
+        assert!(!row.3.contains("bad id!"));
     }
 
     #[tokio::test]

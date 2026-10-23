@@ -1437,6 +1437,47 @@ pub async fn device_stats(pool: &SqlitePool, app: &str) -> Result<DeviceStats, s
     })
 }
 
+/// One device row exposed to the dashboard. The token is retained only long
+/// enough to derive its four-character hint or inspect its Firebase topics.
+#[derive(Debug, sqlx::FromRow)]
+pub struct AdminDeviceRow {
+    pub id: i64,
+    pub uid: String,
+    pub platform: String,
+    pub token: String,
+    pub last_seen: String,
+}
+
+/// The newest 100 devices of an app for the dashboard diagnostic table.
+pub async fn list_admin_devices(
+    pool: &SqlitePool,
+    app: &str,
+) -> Result<Vec<AdminDeviceRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT rowid AS id, uid, platform, token, last_seen FROM devices \
+         WHERE app = ? ORDER BY last_seen DESC, rowid DESC LIMIT 100",
+    )
+    .bind(app)
+    .fetch_all(pool)
+    .await
+}
+
+/// Looks up one app-scoped device. Callers must never serialize `token`.
+pub async fn admin_device(
+    pool: &SqlitePool,
+    app: &str,
+    id: i64,
+) -> Result<Option<AdminDeviceRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT rowid AS id, uid, platform, token, last_seen FROM devices \
+         WHERE app = ? AND rowid = ?",
+    )
+    .bind(app)
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
 // ---------- T16: the state of the credential files ----------
 
 /// The apps that are disabled. The rows are loaded at startup.

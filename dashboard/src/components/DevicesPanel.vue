@@ -8,8 +8,11 @@ const props = defineProps({
 })
 
 const stats = ref(null)
+const devices = ref([])
 const loading = ref(false)
 const failed = ref(false)
+const topicResults = ref({})
+const checking = ref(null)
 
 const platforms = computed(() => {
   const byPlatform = (stats.value && stats.value.by_platform) || {}
@@ -25,13 +28,32 @@ async function load() {
   loading.value = true
   failed.value = false
   try {
-    const response = await api.get(`/apps/${props.app}/devices/stats`)
-    stats.value = response.data
+    const [statsResponse, devicesResponse] = await Promise.all([
+      api.get(`/apps/${props.app}/devices/stats`),
+      api.get(`/apps/${props.app}/devices`),
+    ])
+    stats.value = statsResponse.data
+    devices.value = devicesResponse.data
+    topicResults.value = {}
   } catch (error) {
     failed.value = true
     stats.value = null
+    devices.value = []
   } finally {
     loading.value = false
+  }
+}
+
+async function inspectTopics(device) {
+  if (checking.value !== null) return
+  checking.value = device.id
+  try {
+    const response = await api.get(`/apps/${props.app}/devices/${device.id}/topics`)
+    topicResults.value = { ...topicResults.value, [device.id]: response.data.topics || [] }
+  } catch (error) {
+    topicResults.value = { ...topicResults.value, [device.id]: null }
+  } finally {
+    checking.value = null
   }
 }
 
@@ -51,7 +73,7 @@ watch(() => props.app, load)
     <p v-if="loading" class="muted">{{ strings.common.loading }}</p>
     <p v-else-if="failed" class="error">{{ strings.errors.server }}</p>
 
-    <table v-else class="devices__table">
+    <table v-else-if="stats" class="devices__table">
       <tbody>
         <tr>
           <th>{{ strings.devices.total }}</th>
@@ -81,6 +103,45 @@ watch(() => props.app, load)
         <span class="devices__barCount">{{ platform.count }}</span>
       </li>
     </ul>
+
+    <p v-if="devices.length === 0 && !loading" class="muted">{{ strings.devices.empty }}</p>
+    <div v-else-if="devices.length > 0" class="devices__listWrap">
+      <table class="devices__list">
+        <thead>
+          <tr>
+            <th>{{ strings.devices.uid }}</th>
+            <th>{{ strings.devices.platform }}</th>
+            <th>{{ strings.devices.tokenHint }}</th>
+            <th>{{ strings.devices.lastSeen }}</th>
+            <th>{{ strings.devices.topics }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="device in devices" :key="device.id">
+            <td class="mono">{{ device.uid }}</td>
+            <td>{{ device.platform }}</td>
+            <td class="mono">••••{{ device.token_hint }}</td>
+            <td class="mono">{{ device.last_seen }}</td>
+            <td>
+              <button
+                type="button"
+                class="button button--ghost"
+                :disabled="checking !== null"
+                @click="inspectTopics(device)"
+              >
+                {{ checking === device.id ? strings.common.loading : strings.devices.inspectTopics }}
+              </button>
+              <span v-if="Array.isArray(topicResults[device.id])" class="devices__topics">
+                {{ topicResults[device.id].join(strings.common.listSeparator) || strings.common.none }}
+              </span>
+              <span v-else-if="topicResults[device.id] === null" class="error">
+                {{ strings.devices.inspectFailed }}
+              </span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </template>
 
@@ -158,5 +219,27 @@ watch(() => props.app, load)
 .devices__barCount {
   width: 2.5rem;
   text-align: end;
+}
+
+.devices__listWrap {
+  overflow-x: auto;
+}
+
+.devices__list {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.82rem;
+}
+
+.devices__list th,
+.devices__list td {
+  text-align: start;
+  padding: 0.4rem;
+  border-bottom: 1px solid #e5e7eb;
+  vertical-align: middle;
+}
+
+.devices__topics {
+  margin-inline-start: 0.5rem;
 }
 </style>

@@ -4,6 +4,7 @@ import api from '../api'
 import strings from '../strings'
 import { issueCode, issueMessage } from '../lib/issueCodes'
 import {
+  applyTemplateKind,
   cursorOf,
   definitionToForm,
   emptyDefinition,
@@ -34,6 +35,7 @@ const errorMessage = ref('')
 const conflict = ref(false)
 const confirmKey = ref('')
 const cloneKey = ref('')
+const advancedOpen = ref(false)
 
 let debounceTimer = null
 let requestId = 0
@@ -57,8 +59,25 @@ function issuesOf(field) {
 /** The form of a saved template. */
 function load(definitionValue) {
   form.value = definitionToForm(definitionValue)
+  advancedOpen.value = false
   jsonText.value = `${JSON.stringify(definitionValue, null, 2)}\n`
   jsonError.value = ''
+}
+
+function changeKind(event) {
+  applyTemplateKind(form.value, event.target.value, form.value.orderSender || 'buyer')
+  advancedOpen.value = event.target.value === 'custom'
+}
+
+function changeOrderSender(event) {
+  applyTemplateKind(form.value, 'order_notice', event.target.value)
+}
+
+function changeSenders(event) {
+  form.value.senders = event.target.value.split(',').map((item) => item.trim()).filter(Boolean)
+  if (!form.value.rate && form.value.senders.some((sender) => sender !== 'admin')) {
+    form.value.rate = { per_uid_per_hour: 30 }
+  }
 }
 
 /** Reads the template again from the backend. */
@@ -332,6 +351,7 @@ onBeforeUnmount(() => {
         <li v-for="(issue, index) in summary" :key="index">
           <span class="mono">{{ issue.path }}</span>
           <span>{{ issue.text || issue.message }}</span>
+          <small v-if="issue.code" class="mono editor__issueCode">{{ issue.code }}</small>
         </li>
       </ul>
     </div>
@@ -343,31 +363,52 @@ onBeforeUnmount(() => {
       </label>
 
       <label class="field">
+        <span>{{ strings.templates.kind }}</span>
+        <select :value="form.templateKind" @change="changeKind">
+          <option value="admin_alert">{{ strings.templates.kindAdminAlert }}</option>
+          <option value="order_notice">{{ strings.templates.kindOrderNotice }}</option>
+          <option value="custom">{{ strings.templates.kindCustom }}</option>
+        </select>
+      </label>
+
+      <label class="field">
         <span>{{ strings.templates.description }}</span>
         <input v-model="form.description" type="text" />
       </label>
 
-      <label class="field">
+      <label v-if="form.templateKind === 'custom'" class="field">
         <span>{{ strings.templates.enabledField }}</span>
         <input v-model="form.enabled" type="checkbox" />
       </label>
 
-      <div class="field">
+      <div v-if="form.templateKind === 'custom'" class="field">
         <span>{{ strings.templates.senders }}</span>
         <input
           :value="form.senders.join(', ')"
           type="text"
           dir="ltr"
-          @input="form.senders = $event.target.value.split(',').map((item) => item.trim()).filter(Boolean)"
+          @input="changeSenders"
         />
       </div>
 
-      <div class="field">
+      <div v-if="form.templateKind !== 'order_notice'" class="field">
         <span>{{ strings.templates.params }}</span>
-        <ParamRows v-model="form.paramRows" />
+        <ParamRows
+          v-model="form.paramRows"
+          :allowed-types="form.templateKind === 'admin_alert' ? ['text', 'enum'] : undefined"
+          :locked-names="form.templateKind === 'order_notice' ? ['order_id'] : []"
+        />
       </div>
 
-      <div class="field">
+      <label v-if="form.templateKind === 'order_notice'" class="field">
+        <span>{{ strings.templates.orderSender }}</span>
+        <select :value="form.orderSender" @change="changeOrderSender">
+          <option value="buyer">{{ strings.templates.orderSenderBuyer }}</option>
+          <option value="seller">{{ strings.templates.orderSenderSeller }}</option>
+        </select>
+      </label>
+
+      <div v-if="form.templateKind === 'custom'" class="field">
         <span>{{ strings.templates.context }}</span>
         <input
           :value="form.context ? form.context.doc : ''"
@@ -378,7 +419,7 @@ onBeforeUnmount(() => {
         />
       </div>
 
-      <div v-if="form.context" class="field">
+      <div v-if="form.templateKind === 'custom' && form.context" class="field">
         <span>{{ strings.templates.require }}</span>
         <KeyValueRows
           v-model="form.context.requireRows"
@@ -387,7 +428,7 @@ onBeforeUnmount(() => {
         />
       </div>
 
-      <div class="field">
+      <div v-if="form.templateKind === 'custom'" class="field">
         <span>{{ strings.templates.vars }}</span>
         <div v-for="(variable, index) in form.varRows" :key="index" class="editor__var">
           <input v-model="variable.name" type="text" dir="ltr" :placeholder="strings.templates.varName" />
@@ -403,7 +444,7 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <label class="field">
+      <label v-if="form.templateKind === 'custom'" class="field">
         <span>{{ strings.templates.target }}</span>
         <select v-model="form.targetKind">
           <option value="topic">topic</option>
@@ -412,12 +453,12 @@ onBeforeUnmount(() => {
           <option value="condition">condition</option>
         </select>
       </label>
-      <label class="field">
+      <label v-if="form.templateKind === 'custom'" class="field">
         <span>{{ strings.templates.targetValue }}</span>
         <input v-model="form.targetValue" type="text" dir="ltr" />
       </label>
 
-      <div class="field">
+      <div v-if="form.templateKind === 'custom'" class="field">
         <span>{{ strings.templates.variables }}</span>
         <div class="row editor__chips">
           <button
@@ -441,6 +482,7 @@ onBeforeUnmount(() => {
       <div v-if="issuesOf('title').length > 0" class="editor__fieldErrors">
         <p v-for="(issue, index) in issuesOf('title')" :key="index" class="error">
           {{ issue.text || issue.message }}
+          <small v-if="issue.code" class="mono editor__issueCode">{{ issue.code }}</small>
         </p>
       </div>
 
@@ -451,15 +493,16 @@ onBeforeUnmount(() => {
       <div v-if="issuesOf('body').length > 0" class="editor__fieldErrors">
         <p v-for="(issue, index) in issuesOf('body')" :key="index" class="error">
           {{ issue.text || issue.message }}
+          <small v-if="issue.code" class="mono editor__issueCode">{{ issue.code }}</small>
         </p>
       </div>
 
-      <label class="field">
+      <label v-if="form.templateKind === 'custom'" class="field">
         <span>{{ strings.templates.image }}</span>
         <input v-model="form.image" type="text" dir="ltr" />
       </label>
 
-      <div class="field">
+      <div v-if="form.templateKind === 'custom'" class="field">
         <span>{{ strings.templates.data }}</span>
         <KeyValueRows
           v-model="form.dataRows"
@@ -468,7 +511,7 @@ onBeforeUnmount(() => {
         />
       </div>
 
-      <div class="row editor__optional">
+      <div v-if="form.templateKind === 'custom'" class="row editor__optional">
         <label class="field">
           <span>{{ strings.templates.dedupeKey }}</span>
           <input
@@ -499,6 +542,38 @@ onBeforeUnmount(() => {
           />
         </label>
       </div>
+
+      <details
+        v-if="form.templateKind !== 'custom'"
+        class="card editor__advanced"
+        :open="advancedOpen"
+        @toggle="advancedOpen = $event.target.open"
+      >
+        <summary>{{ strings.templates.advanced }}</summary>
+        <div class="field">
+          <span>{{ strings.templates.contextRaw }}</span>
+          <input :value="form.context ? form.context.doc : ''" type="text" dir="ltr" @input="onContextInput" />
+          <KeyValueRows v-if="form.context" v-model="form.context.requireRows" />
+        </div>
+        <div class="field">
+          <span>{{ strings.templates.vars }}</span>
+          <div v-for="(variable, index) in form.varRows" :key="index" class="editor__var">
+            <input v-model="variable.name" type="text" dir="ltr" :placeholder="strings.templates.varName" />
+            <input v-model="variable.from" type="text" dir="ltr" :placeholder="strings.templates.varFrom" />
+            <KeyValueRows v-model="variable.mapRows" />
+          </div>
+          <button type="button" class="button button--ghost" @click="form.varRows.push({ name: '', from: '', mapRows: [] })">
+            {{ strings.templates.varAdd }}
+          </button>
+        </div>
+        <label class="field"><span>{{ strings.templates.image }}</span><input v-model="form.image" type="text" dir="ltr" /></label>
+        <div class="field"><span>{{ strings.templates.data }}</span><KeyValueRows v-model="form.dataRows" /></div>
+        <div class="row editor__optional">
+          <label class="field"><span>{{ strings.templates.dedupeKey }}</span><input :value="form.dedupe ? form.dedupe.key : ''" dir="ltr" @input="form.dedupe = { key: $event.target.value, seconds: form.dedupe ? form.dedupe.seconds : 600 }" /></label>
+          <label class="field"><span>{{ strings.templates.dedupeSeconds }}</span><input :value="form.dedupe ? form.dedupe.seconds : ''" type="number" @input="form.dedupe = { key: form.dedupe ? form.dedupe.key : '', seconds: $event.target.value }" /></label>
+          <label class="field"><span>{{ strings.templates.ratePerHour }}</span><input :value="form.rate ? form.rate.per_uid_per_hour : ''" type="number" @input="form.rate = { per_uid_per_hour: $event.target.value }" /></label>
+        </div>
+      </details>
     </div>
 
     <div v-else class="editor__json">
@@ -581,6 +656,22 @@ onBeforeUnmount(() => {
   margin: 0;
   padding-inline-start: 1.25rem;
   font-size: 0.85rem;
+}
+
+.editor__issueCode {
+  color: #6b7280;
+  margin-inline-start: 0.35rem;
+}
+
+.editor__advanced {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.editor__advanced summary {
+  cursor: pointer;
+  font-weight: 700;
 }
 
 .editor__form {

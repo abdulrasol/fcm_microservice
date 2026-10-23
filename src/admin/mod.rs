@@ -181,6 +181,16 @@ impl AdminError {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
     }
 
+    /// A dependency failed while serving an admin diagnostic.
+    pub fn upstream(status: StatusCode, message: &str) -> Self {
+        let status = if status.is_server_error() {
+            status
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        Self::new(status, "upstream", message)
+    }
+
     pub fn too_many_requests() -> Self {
         Self::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -486,6 +496,18 @@ pub(crate) fn admin_routes() -> Vec<AdminRoute> {
             "/apps/:app/devices/stats",
             true,
             get(history::device_stats),
+        ),
+        (
+            "GET",
+            "/apps/:app/devices",
+            true,
+            get(history::list_devices).put(apps::put_devices_section),
+        ),
+        (
+            "GET",
+            "/apps/:app/devices/:id/topics",
+            true,
+            get(history::device_topics),
         ),
         ("GET", "/users", true, get(users::list_users)),
         ("POST", "/users", true, post(users::create_user)),
@@ -2038,6 +2060,8 @@ pub(crate) mod tests {
                 Some(json!({ "title": "Matrix", "topic": "news" })),
             ),
             MatrixCase::new(Method::GET, "/apps/:app/devices/stats", None),
+            MatrixCase::new(Method::GET, "/apps/:app/devices", None),
+            MatrixCase::new(Method::GET, "/apps/:app/devices/:id/topics", None),
             MatrixCase::new(Method::GET, "/users", None),
             MatrixCase::new(
                 Method::POST,
@@ -2257,6 +2281,8 @@ pub(crate) mod tests {
             "/apps/:app/history/:id",
             "/apps/:app/send",
             "/apps/:app/devices/stats",
+            "/apps/:app/devices",
+            "/apps/:app/devices/:id/topics",
         ] {
             assert!(
                 covered.iter().any(|(_, known)| known == pattern),

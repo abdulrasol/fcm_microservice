@@ -73,6 +73,8 @@ GET | /admin/apps/:app/history | dashboard session | owner, manager
 GET | /admin/apps/:app/history/:id | dashboard session | owner, manager
 POST | /admin/apps/:app/send | dashboard session | owner, manager
 GET | /admin/apps/:app/devices/stats | dashboard session | owner, manager
+GET | /admin/apps/:app/devices | dashboard session | owner, manager
+GET | /admin/apps/:app/devices/:id/topics | dashboard session | owner, manager
 GET | /admin/users | dashboard session | owner
 POST | /admin/users | dashboard session | owner
 PUT | /admin/users/:id | dashboard session | owner

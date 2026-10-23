@@ -36,7 +36,7 @@ vi.mock('../session', () => ({
 }))
 
 const { default: TemplateEditor } = await import('../components/TemplateEditor.vue')
-const { definitionToForm, formToDefinition, insertAtCursor, variableChips } = await import(
+const { applyTemplateKind, definitionToForm, detectTemplateKind, formToDefinition, insertAtCursor, variableChips } = await import(
   '../lib/templateForm'
 )
 
@@ -79,6 +79,44 @@ describe('the editor of the templates', () => {
     expect(back.senders).toEqual(['admin'])
     expect(back.params).toEqual({ name: { type: 'text', max: 40 } })
     expect(back.enabled).toBe(true)
+  })
+
+  it('detects the ten current templates and preserves their JSON byte shape', () => {
+    const admin = (description, params = {}) => ({
+      description, enabled: true, senders: ['user', 'company', 'technical', 'admin'], params,
+      to: { role: 'admin' }, title: '{p.title}', body: '{p.body}', data: {}, rate: { per_uid_per_hour: 10 },
+    })
+    const order = (sender) => ({
+      description: sender, enabled: true, senders: ['user', 'company', 'technical'],
+      params: { order_id: { type: 'pattern', pattern: '^[A-Za-z0-9_-]{1,64}$', max: 64 } },
+      context: { doc: 'store_orders/{p.order_id}', require: sender === 'buyer' ? { buyer_id: '{sender.uid}' } : { seller_user_id: '{sender.uid}' } },
+      to: { uid: sender === 'buyer' ? '{doc.seller_user_id}' : '{doc.buyer_id}' },
+      title: 'طلب', body: 'تحديث', data: {}, dedupe: { key: '{p.order_id}', seconds: 600 }, rate: { per_uid_per_hour: 30 },
+    })
+    const definitions = {
+      new_user_alert: admin('new user'), role_change_alert: admin('role change'), brand_request: admin('brand request'),
+      brand_added: admin('brand added'), product_added: admin('product added'), store_product_pending: admin('pending'),
+      seller_review_reminder: admin('review'), order_new: order('buyer'), order_status: order('seller'), order_cancelled: order('buyer'),
+    }
+    for (const [key, definition] of Object.entries(definitions)) {
+      expect(detectTemplateKind(definition), key).toBe(key.startsWith('order_') ? 'order_notice' : 'admin_alert')
+      expect(JSON.stringify(formToDefinition(definitionToForm(definition))), key).toBe(JSON.stringify(definition))
+    }
+  })
+
+  it.each([
+    ['buyer', { buyer_id: '{sender.uid}' }, '{doc.seller_user_id}'],
+    ['seller', { seller_user_id: '{sender.uid}' }, '{doc.buyer_id}'],
+  ])('generates the order notice for %s', (sender, require, target) => {
+    const form = definitionToForm(DEFINITION)
+    applyTemplateKind(form, 'order_notice', sender)
+    const definition = formToDefinition(form)
+    expect(definition.params.order_id).toEqual({ type: 'pattern', pattern: '^[A-Za-z0-9_-]{1,64}$' })
+    expect(definition.context).toEqual({ doc: 'store_orders/{p.order_id}', require })
+    expect(definition.to).toEqual({ uid: target })
+    expect(definition.senders).toEqual(['user', 'company', 'technical'])
+    expect(definition.dedupe).toEqual({ key: '{p.order_id}', seconds: 600 })
+    expect(definition.rate).toEqual({ per_uid_per_hour: 30 })
   })
 
   it('template_json_invalid_blocks_return_to_form', async () => {

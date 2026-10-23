@@ -11,6 +11,32 @@ use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+pub(crate) const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
+
+/// Returns an OAuth access token for one app without exposing credentials.
+/// Admin diagnostics and topic mutation share this exact credential path.
+pub(crate) async fn firebase_access_token(state: &AppState, app: &str) -> Result<String, ApiError> {
+    let auth = {
+        let map = state.auth_map.read().await;
+        map.get(app).cloned()
+    }
+    .ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Service account for this app is not loaded".to_string(),
+    ))?;
+
+    let token = auth.token(&[FCM_SCOPE]).await.map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Could not authenticate with Firebase".into(),
+        )
+    })?;
+    token.token().map(str::to_owned).ok_or((
+        StatusCode::BAD_GATEWAY,
+        "Missing Firebase access token".into(),
+    ))
+}
+
 type ApiError = (StatusCode, String);
 
 #[derive(Deserialize)]
@@ -102,33 +128,12 @@ async fn manage(
         check_uid_limit(&state, &user.uid)?;
     }
 
-    let auth = {
-        let map = state.auth_map.read().await;
-        map.get(&body.app).cloned()
-    }
-    .ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Service account for this app is not loaded".to_string(),
-    ))?;
-
-    let token = auth
-        .token(&["https://www.googleapis.com/auth/firebase.messaging"])
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "Could not authenticate with Firebase".into(),
-            )
-        })?;
-    let access_token = token.token().ok_or((
-        StatusCode::BAD_GATEWAY,
-        "Missing Firebase access token".into(),
-    ))?;
+    let access_token = firebase_access_token(&state, &body.app).await?;
     let response = state
         .client
         .post(format!("https://iid.googleapis.com/iid/v1:{operation}"))
         .timeout(std::time::Duration::from_secs(30))
-        .bearer_auth(access_token)
+        .bearer_auth(&access_token)
         .header("access_token_auth", "true")
         .json(&json!({"to": format!("/topics/{}", body.topic), "registration_tokens": body.tokens}))
         .send()

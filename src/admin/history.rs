@@ -9,6 +9,7 @@ use super::auth::AuthedUser;
 use super::{authorize, AdminError, AdminJson, Need};
 use crate::db;
 use crate::send::{self, DeliveryFailure, FcmOutcome, SendError};
+use crate::topics;
 use crate::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -33,6 +34,8 @@ const MAX_RESPONSE_CHARS: usize = 300;
 /// A `uid` target still needs a syntactically valid destination for the
 /// content checks; the value is never sent.
 const VALIDATION_PLACEHOLDER_TOKEN: &str = "00000000000000000000000000000000";
+
+const IID_INFO_BASE: &str = "https://iid.googleapis.com/iid/info";
 
 /// The filters of the history list.
 #[derive(Deserialize)]
@@ -594,6 +597,95 @@ pub async fn device_stats(
         },
         "active_last_7d": stats.active_last_7d,
         "newest_last_seen": stats.newest_last_seen,
+    })))
+}
+
+/// `GET /apps/{app}/devices`: at most 100 device diagnostics, without tokens.
+pub async fn list_devices(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(app): Path<String>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let rows = db::list_admin_devices(&state.db, &app)
+        .await
+        .map_err(|error| AdminError::from_db("list devices", error))?;
+    Ok(Json(Value::Array(
+        rows.into_iter()
+            .map(|row| {
+                let token_hint: String = row
+                    .token
+                    .chars()
+                    .rev()
+                    .take(4)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                json!({
+                    "id": row.id,
+                    "uid": row.uid,
+                    "platform": row.platform,
+                    "token_hint": token_hint,
+                    "last_seen": row.last_seen,
+                })
+            })
+            .collect(),
+    )))
+}
+
+/// Extracts only topic names from an IID info response.
+fn iid_topics(payload: &Value) -> Vec<String> {
+    let mut topics: Vec<String> = payload
+        .pointer("/rel/topics")
+        .and_then(Value::as_object)
+        .map(|topics| topics.keys().cloned().collect())
+        .unwrap_or_default();
+    topics.sort();
+    topics
+}
+
+async fn fetch_iid_info(
+    client: &reqwest::Client,
+    base_url: &str,
+    device_token: &str,
+    access_token: &str,
+) -> Result<Value, AdminError> {
+    let response = client
+        .get(format!("{base_url}/{device_token}?details=true"))
+        .bearer_auth(access_token)
+        .header("access_token_auth", "true")
+        .send()
+        .await
+        .map_err(|_| AdminError::unavailable("Firebase topic lookup failed"))?;
+    if !response.status().is_success() {
+        return Err(AdminError::unavailable("Firebase topic lookup failed"));
+    }
+    response
+        .json()
+        .await
+        .map_err(|_| AdminError::unavailable("Firebase topic response was invalid"))
+}
+
+/// `GET /apps/{app}/devices/{id}/topics`: Firebase topics for one device.
+pub async fn device_topics(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path((app, id)): Path<(String, i64)>,
+) -> Result<Json<Value>, AdminError> {
+    authorize(&state, &user, &app, Need::AnyMember).await?;
+    let device = db::admin_device(&state.db, &app, id)
+        .await
+        .map_err(|error| AdminError::from_db("read device", error))?
+        .ok_or_else(|| AdminError::not_found("the device does not exist"))?;
+    let access_token = topics::firebase_access_token(&state, &app)
+        .await
+        .map_err(|(status, message)| AdminError::upstream(status, &message))?;
+    let payload =
+        fetch_iid_info(&state.client, IID_INFO_BASE, &device.token, &access_token).await?;
+    Ok(Json(json!({
+        "platform": device.platform,
+        "topics": iid_topics(&payload),
     })))
 }
 
@@ -1522,5 +1614,113 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["total"], 1, "another app is never counted");
         assert_eq!(body["distinct_uids"], 1);
+    }
+
+    #[tokio::test]
+    async fn device_list_is_admin_only_limited_and_never_exposes_tokens() {
+        let harness = setup("owner", &[]).await;
+        for index in 0..105 {
+            sqlx::query("INSERT INTO devices (app, token, uid, platform) VALUES (?, ?, ?, ?)")
+                .bind(APP)
+                .bind(format!("token-{index:04}-0000000000000000000000000000"))
+                .bind(format!("uid-{index}"))
+                .bind("android")
+                .execute(&harness.pool)
+                .await
+                .expect("the device must be inserted");
+        }
+
+        let (anonymous, _) = call(
+            &harness.router,
+            Method::GET,
+            &format!("/apps/{}/devices", APP),
+            None,
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(anonymous, StatusCode::UNAUTHORIZED);
+
+        let (status, body) = harness
+            .call(Method::GET, &format!("/apps/{}/devices", APP), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("the response must be an array");
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows[0]["token_hint"].as_str().map(str::len), Some(4));
+        assert!(rows[0].get("token").is_none());
+        assert!(!body.to_string().contains("token-"));
+    }
+
+    #[tokio::test]
+    async fn device_topics_unknown_device_is_404_before_firebase() {
+        let harness = setup("owner", &[]).await;
+        let (status, body) = harness
+            .call(
+                Method::GET,
+                &format!("/apps/{}/devices/999/topics", APP),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+        assert!(!body.to_string().contains("token"));
+    }
+
+    #[test]
+    fn iid_topic_summary_returns_only_sorted_topic_names() {
+        let topics = iid_topics(&json!({
+            "application": "secret-package",
+            "rel": { "topics": { "zeta": { "addDate": "today" }, "alpha": {} } },
+            "token": "must-not-escape"
+        }));
+        assert_eq!(topics, vec!["alpha", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn iid_topic_request_uses_required_path_and_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the IID stub must bind");
+        let address = listener.local_addr().expect("the stub has an address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("the request must arrive");
+            let mut bytes = vec![0; 4096];
+            let read = socket
+                .read(&mut bytes)
+                .await
+                .expect("the request must read");
+            let request = String::from_utf8_lossy(&bytes[..read]);
+            assert!(request.starts_with(
+                "GET /iid/info/device-token-00000000000000000000?details=true HTTP/1.1"
+            ));
+            let lower = request.to_ascii_lowercase();
+            assert!(lower.contains("authorization: bearer access-token-for-test"));
+            assert!(lower.contains("access_token_auth: true"));
+            let body = r#"{"rel":{"topics":{"news":{}}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("the response must write");
+        });
+
+        let payload = fetch_iid_info(
+            &reqwest::Client::new(),
+            &format!("http://{address}/iid/info"),
+            "device-token-00000000000000000000",
+            "access-token-for-test",
+        )
+        .await
+        .expect("the IID response must parse");
+        server.await.expect("the stub must finish");
+        assert_eq!(iid_topics(&payload), vec!["news"]);
+        assert!(!payload.to_string().contains("device-token"));
     }
 }

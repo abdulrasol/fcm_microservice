@@ -10,11 +10,11 @@ import strings from '../strings'
  */
 const props = defineProps({
   modelValue: { type: Array, default: () => [] },
+  allowedTypes: { type: Array, default: () => ['text', 'pattern', 'enum', 'int'] },
+  lockedNames: { type: Array, default: () => [] },
 })
 
 const emit = defineEmits(['update:modelValue'])
-
-const TYPES = ['text', 'pattern', 'enum', 'int']
 
 function rows() {
   return Array.isArray(props.modelValue) ? props.modelValue : []
@@ -46,12 +46,13 @@ function remove(index) {
           type="text"
           dir="ltr"
           :placeholder="strings.templates.paramName"
+          :disabled="lockedNames.includes(row.name)"
           @input="update(index, 'name', $event.target.value)"
         />
         <select :value="row.type" @change="update(index, 'type', $event.target.value)">
-          <option v-for="type in TYPES" :key="type" :value="type">{{ type }}</option>
+          <option v-for="type in allowedTypes" :key="type" :value="type">{{ type }}</option>
         </select>
-        <button type="button" class="button button--ghost" @click="remove(index)">
+        <button v-if="!lockedNames.includes(row.name)" type="button" class="button button--ghost" @click="remove(index)">
           {{ strings.common.remove }}
         </button>
       </div>
@@ -110,7 +111,7 @@ function remove(index) {
       </div>
     </div>
 
-    <button type="button" class="button button--ghost" @click="add">{{ strings.templates.paramAdd }}</button>
+    <button v-if="allowedTypes.length > 1 || !lockedNames.length" type="button" class="button button--ghost" @click="add">{{ strings.templates.paramAdd }}</button>
   </div>
 </template>
 
