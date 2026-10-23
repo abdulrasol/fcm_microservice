@@ -2,7 +2,8 @@
 
 import { createRouter, createWebHistory } from 'vue-router'
 import { canAccess, isOwner, load, session } from './session'
-import { decideRoute } from './lib/guard'
+import { decideRoute, loginRedirectLoopGuard, resetLoginRedirectGuard } from './lib/guard'
+import { resetRedirectFlag, setRouter } from './api'
 import Login from './views/Login.vue'
 import ChangePassword from './views/ChangePassword.vue'
 import Apps from './views/Apps.vue'
@@ -30,6 +31,9 @@ const router = createRouter({
   routes,
 })
 
+// Wire router to api so 401 interceptor uses router.replace instead of full page reload
+setRouter(router)
+
 router.beforeEach(async (to) => {
   if (!session.loaded) {
     await load()
@@ -43,10 +47,20 @@ router.beforeEach(async (to) => {
   if (!decision) {
     return true
   }
+  if (decision.redirect && decision.redirect.startsWith('/login')) {
+    if (!loginRedirectLoopGuard()) {
+      return to.path === '/login' ? true : false
+    }
+  }
   if (decision.message) {
     router.state.__message = decision.message
   }
   return { path: decision.redirect }
+})
+
+router.afterEach(() => {
+  resetLoginRedirectGuard()
+  resetRedirectFlag()
 })
 
 export default router

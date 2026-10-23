@@ -23,10 +23,10 @@ check "dashboard index is served"       "200" "$(code "$BASE/")"
 check "index contains the app root"     "yes" "$(curl -s --max-time 10 "$BASE/" | grep -q 'id="app"' && echo yes || echo no)"
 check "admin /auth/me without a session" "401" "$(code "$BASE/api/v1/admin/auth/me")"
 check "admin login without CSRF header" "403" "$(code -X POST -H 'Content-Type: application/json' -d '{"email":"x@x.x","password":"x"}' "$BASE/api/v1/admin/auth/login")"
-check "send without credentials"        "401 403" "$(code -X POST -H 'Content-Type: application/json' -d '{}' "$BASE/api/v1/send")"
+check "history without credentials"     "401" "$(code "$BASE/api/v1/history?app=smoke")"
 check "apps without credentials"        "401 403" "$(code "$BASE/api/v1/apps")"
 FAKE_KEY="fcm_smoke_$(printf 'A%.0s' $(seq 1 43))"
-check "unknown app key is rejected"     "401" "$(code -X POST -H "Authorization: Bearer $FAKE_KEY" -H 'Content-Type: application/json' -d '{}' "$BASE/api/v1/send")"
+check "unknown app key is rejected"     "401" "$(code -H "Authorization: Bearer $FAKE_KEY" "$BASE/api/v1/history?app=smoke")"
 check "unknown api path"                "404" "$(code "$BASE/api/v1/nope")"
 
 if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -qx fcm_microservice; then

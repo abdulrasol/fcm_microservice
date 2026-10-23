@@ -12,6 +12,22 @@ export const CSRF_HEADER = 'X-Requested-With'
 export const CSRF_VALUE = 'fcm-dashboard'
 export const LOGIN_PATH = '/login'
 
+/** Endpoints that must never trigger a redirect to login on 401. */
+export const AUTH_ROUTES_WITHOUT_REDIRECT = [
+  '/auth/me',
+  '/auth/login',
+  '/auth/logout',
+  '/auth/reauth',
+]
+
+/** Checks if a request URL belongs to the excluded auth endpoints. */
+export function isAuthUrl(url) {
+  if (!url || typeof url !== 'string') {
+    return false
+  }
+  return AUTH_ROUTES_WITHOUT_REDIRECT.some((path) => url.includes(path))
+}
+
 /** A failure of the admin API, with a stable shape for the views. */
 export class ApiError extends Error {
   constructor({ status = 0, code = 'unknown', message = '', issues = null, currentVersion = null } = {}) {
@@ -39,9 +55,53 @@ export function setUnauthorizedHandler(handler) {
   unauthorizedHandler = handler
 }
 
-// The browser navigation is replaceable, so the tests can watch it.
+// Router instance registration to perform client-side replace instead of page reload.
+let routerInstance = null
+
+/** Registers the Vue Router instance for client-side navigation. */
+export function setRouter(router) {
+  routerInstance = router
+}
+
+export function getRouter() {
+  return routerInstance
+}
+
+// Flag preventing multiple redirects per navigation.
+let redirectingToLogin = false
+
+export function resetRedirectFlag() {
+  redirectingToLogin = false
+}
+
+export function isRedirecting() {
+  return redirectingToLogin
+}
+
+/** Checks whether the client is currently on the login page. */
+export function isLoginPage() {
+  if (routerInstance && routerInstance.currentRoute && routerInstance.currentRoute.value) {
+    const route = routerInstance.currentRoute.value
+    const path = route.path || ''
+    if (route.name === 'login' || path === LOGIN_PATH || path.startsWith(`${LOGIN_PATH}/`)) {
+      return true
+    }
+  }
+  if (typeof window !== 'undefined' && window.location) {
+    const pathname = window.location.pathname || ''
+    return pathname === LOGIN_PATH || pathname.startsWith(`${LOGIN_PATH}/`)
+  }
+  return false
+}
+
+// The navigation function is replaceable so tests can inspect it.
 let navigate = (target) => {
-  window.location.assign(target)
+  if (routerInstance && typeof routerInstance.replace === 'function') {
+    return routerInstance.replace(target)
+  }
+  if (typeof window !== 'undefined' && window.location && typeof window.location.assign === 'function') {
+    window.location.assign(target)
+  }
 }
 
 /** Replaces the navigation of the browser (the tests use it). */
@@ -90,12 +150,26 @@ export function normalizeError(error) {
 export function responseInterceptor(error) {
   const apiError = normalizeError(error)
   const url = (error && error.config && error.config.url) || ''
-  if (apiError.status === 401 && !url.includes('/auth/login')) {
+
+  if (apiError.status === 401) {
     if (unauthorizedHandler) {
       unauthorizedHandler()
     }
-    navigate(loginRedirect({ path: window.location.pathname }))
+    // Never redirect for excluded auth endpoints or if already on /login
+    if (!isAuthUrl(url) && !isLoginPage()) {
+      if (!redirectingToLogin) {
+        redirectingToLogin = true
+        let currentPath = '/'
+        if (routerInstance && routerInstance.currentRoute && routerInstance.currentRoute.value) {
+          currentPath = routerInstance.currentRoute.value.fullPath || routerInstance.currentRoute.value.path || '/'
+        } else if (typeof window !== 'undefined' && window.location) {
+          currentPath = window.location.pathname || '/'
+        }
+        navigate(loginRedirect({ path: currentPath }))
+      }
+    }
   }
+
   return Promise.reject(apiError)
 }
 

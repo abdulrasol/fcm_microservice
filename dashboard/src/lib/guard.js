@@ -9,6 +9,23 @@ import { safeRedirect } from './redirect'
 /** The message shown when an owner-only page is refused. */
 export const OWNER_MESSAGE = 'owner-only'
 
+// Loop guard: limits redirects to /login to at most one per navigation transition.
+let loginRedirectCount = 0
+
+/** Resets the login redirect loop guard flag (called after navigation). */
+export function resetLoginRedirectGuard() {
+  loginRedirectCount = 0
+}
+
+/** Returns true if redirecting to login is allowed in the current navigation. */
+export function loginRedirectLoopGuard() {
+  if (loginRedirectCount >= 1) {
+    return false
+  }
+  loginRedirectCount += 1
+  return true
+}
+
 /**
  * Decides the target of a navigation.
  *
@@ -20,7 +37,7 @@ export function decideRoute({ to, me, owner, canAccess }) {
   const path = to && to.path
   const meta = (to && to.meta) || {}
 
-  if (name === 'login') {
+  if (name === 'login' || path === '/login' || (path && path.startsWith('/login/'))) {
     if (me) {
       return { redirect: safeRedirect(to.query && to.query.redirect) }
     }
@@ -28,7 +45,19 @@ export function decideRoute({ to, me, owner, canAccess }) {
   }
 
   if (!me) {
-    return { redirect: `/login?redirect=${encodeURIComponent(safeRedirect(path))}` }
+    // If destination is /login or begins with /login, render login page once
+    if (path === '/login' || (path && path.startsWith('/login'))) {
+      return null
+    }
+    // If destination is /password, redirect to /login without redirect parameter
+    if (path === '/password' || (path && path.startsWith('/password'))) {
+      return { redirect: '/login' }
+    }
+    const target = safeRedirect(path)
+    if (target === '/') {
+      return { redirect: '/login' }
+    }
+    return { redirect: `/login?redirect=${encodeURIComponent(target)}` }
   }
 
   // The account must change its password before anything else.

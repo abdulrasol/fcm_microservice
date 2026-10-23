@@ -1,14 +1,17 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import api, {
   CSRF_HEADER,
   CSRF_VALUE,
   loginRedirect,
   normalizeError,
   requestInterceptor,
+  resetRedirectFlag,
   responseInterceptor,
   setNavigator,
+  setRouter,
   setUnauthorizedHandler,
 } from '../api'
+import { load, session } from '../session'
 
 describe('the admin API client', () => {
   it('api_sends_csrf_header_on_every_request', () => {
@@ -71,6 +74,8 @@ describe('the admin API client', () => {
   })
 
   it('api_401_clears_session_and_redirects_internal_path_only', async () => {
+    resetRedirectFlag()
+    setRouter(null)
     let cleared = false
     let visited = null
     setUnauthorizedHandler(() => {
@@ -91,6 +96,7 @@ describe('the admin API client', () => {
     expect(visited).toBe('/login')
 
     // An external target never reaches the browser.
+    resetRedirectFlag()
     visited = null
     await responseInterceptor({
       config: { url: '/apps' },
@@ -103,5 +109,117 @@ describe('the admin API client', () => {
     expect(loginRedirect({ path: '/', redirect: '//evil.example' })).toBe('/login')
     expect(loginRedirect({ path: '/', redirect: '//evil.example' })).toBe('/login')
     expect(loginRedirect({ path: '/', redirect: '/apps' })).toBe('/login?redirect=%2Fapps')
+  })
+
+  it('api_401_on_auth_me_does_not_redirect', async () => {
+    resetRedirectFlag()
+    let visited = null
+    setNavigator((target) => {
+      visited = target
+    })
+    const mockRouter = { replace: vi.fn() }
+    setRouter(mockRouter)
+
+    await responseInterceptor({
+      config: { url: '/auth/me' },
+      response: { status: 401, data: { error: 'unauthorized', message: '' } },
+    }).catch(() => {})
+
+    expect(visited).toBeNull()
+    expect(mockRouter.replace).not.toHaveBeenCalled()
+  })
+
+  it('api_401_on_login_does_not_redirect', async () => {
+    resetRedirectFlag()
+    let visited = null
+    setNavigator((target) => {
+      visited = target
+    })
+    const mockRouter = { replace: vi.fn() }
+    setRouter(mockRouter)
+
+    for (const url of ['/auth/login', '/auth/logout', '/auth/reauth']) {
+      await responseInterceptor({
+        config: { url },
+        response: { status: 401, data: { error: 'unauthorized', message: '' } },
+      }).catch(() => {})
+    }
+
+    expect(visited).toBeNull()
+    expect(mockRouter.replace).not.toHaveBeenCalled()
+  })
+
+  it('api_401_while_on_login_page_does_not_redirect', async () => {
+    resetRedirectFlag()
+    let visited = null
+    setNavigator((target) => {
+      visited = target
+    })
+    const mockRouter = {
+      currentRoute: { value: { path: '/login', name: 'login' } },
+      replace: vi.fn(),
+    }
+    setRouter(mockRouter)
+
+    await responseInterceptor({
+      config: { url: '/apps' },
+      response: { status: 401, data: { error: 'unauthorized', message: '' } },
+    }).catch(() => {})
+
+    expect(visited).toBeNull()
+    expect(mockRouter.replace).not.toHaveBeenCalled()
+  })
+
+  it('api_401_on_other_route_redirects_once_via_router', async () => {
+    resetRedirectFlag()
+    const mockRouter = {
+      currentRoute: { value: { path: '/apps/watt', fullPath: '/apps/watt', name: 'app-settings' } },
+      replace: vi.fn(),
+    }
+    setRouter(mockRouter)
+    setNavigator((target) => mockRouter.replace(target))
+
+    // First 401 on /apps
+    await responseInterceptor({
+      config: { url: '/apps' },
+      response: { status: 401, data: { error: 'unauthorized', message: '' } },
+    }).catch(() => {})
+
+    expect(mockRouter.replace).toHaveBeenCalledTimes(1)
+    expect(mockRouter.replace).toHaveBeenCalledWith('/login?redirect=%2Fapps%2Fwatt')
+
+    // Second 401 during same navigation
+    await responseInterceptor({
+      config: { url: '/history' },
+      response: { status: 401, data: { error: 'unauthorized', message: '' } },
+    }).catch(() => {})
+
+    expect(mockRouter.replace).toHaveBeenCalledTimes(1)
+  })
+
+  it('session_load_treats_401_as_no_session', async () => {
+    resetRedirectFlag()
+    let visited = null
+    setNavigator((target) => {
+      visited = target
+    })
+    const mockRouter = { replace: vi.fn() }
+    setRouter(mockRouter)
+
+    const spy = vi.spyOn(api, 'get').mockRejectedValueOnce({
+      config: { url: '/auth/me' },
+      response: { status: 401, data: { error: 'unauthorized', message: 'no session' } },
+    })
+
+    session.me = { id: 1, role: 'owner' }
+    session.loaded = false
+
+    const me = await load()
+    expect(me).toBeNull()
+    expect(session.me).toBeNull()
+    expect(session.loaded).toBe(true)
+    expect(visited).toBeNull()
+    expect(mockRouter.replace).not.toHaveBeenCalled()
+    spy.mockRestore()
   })
 })
