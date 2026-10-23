@@ -30,7 +30,7 @@ export function isAuthUrl(url) {
 
 /** A failure of the admin API, with a stable shape for the views. */
 export class ApiError extends Error {
-  constructor({ status = 0, code = 'unknown', message = '', issues = null, currentVersion = null } = {}) {
+  constructor({ status = 0, code = 'unknown', message = '', issues = null, currentVersion = null, data = null } = {}) {
     super(message || code)
     this.name = 'ApiError'
     this.status = status
@@ -38,6 +38,7 @@ export class ApiError extends Error {
     this.message = message
     this.issues = issues
     this.currentVersion = currentVersion
+    this.data = data
   }
 }
 
@@ -143,7 +144,7 @@ export function normalizeError(error) {
   const message = typeof body.message === 'string' ? body.message : ''
   const issues = Array.isArray(body.issues) ? body.issues : null
   const currentVersion = typeof body.current_version === 'number' ? body.current_version : null
-  return new ApiError({ status: response.status, code, message, issues, currentVersion })
+  return new ApiError({ status: response.status, code, message, issues, currentVersion, data: body })
 }
 
 /** Turns a failure into an ApiError and sends the account back to the login. */

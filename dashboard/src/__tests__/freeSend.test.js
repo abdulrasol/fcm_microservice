@@ -97,4 +97,32 @@ describe('the free send', () => {
     await wrapper.vm.$nextTick()
     expect(wrapper.vm.isPublic).toBe(false)
   })
+
+  it('free_send_502_is_red_and_includes_the_server_reason', async () => {
+    post.mockRejectedValue({ status: 502, data: { reason: 'rejected', http_status: 404 } })
+    const wrapper = mount(FreeSendPanel, { props: { app: 'watt' } })
+    wrapper.vm.title = 'Hello'
+    wrapper.vm.targetValue = 'news'
+
+    await wrapper.vm.send()
+
+    expect(wrapper.find('.error').text()).toContain('فشل التسليم إلى FCM')
+    expect(wrapper.find('.error').text()).toContain('rejected 404')
+    expect(wrapper.vm.result).toBe(null)
+    expect(wrapper.vm.busy).toBe(false)
+    expect(post).toHaveBeenCalledWith('/apps/watt/send', expect.any(Object), { timeout: 40000 })
+  })
+
+  it('free_send_failed_response_is_not_rendered_as_a_success', async () => {
+    post.mockResolvedValue({ data: { status: 'failed', reason: 'network', delivered: 0, failed: 1 } })
+    const wrapper = mount(FreeSendPanel, { props: { app: 'watt' } })
+    wrapper.vm.title = 'Hello'
+    wrapper.vm.targetValue = 'news'
+
+    await wrapper.vm.send()
+
+    expect(wrapper.find('.error').text()).toContain('network')
+    expect(wrapper.vm.result).toBe(null)
+    expect(wrapper.vm.busy).toBe(false)
+  })
 })

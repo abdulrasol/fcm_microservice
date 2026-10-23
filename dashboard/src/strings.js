@@ -482,6 +482,7 @@ export const strings = {
     sent: 'تم الإرسال',
     delivered: 'المسلَّم',
     failed: 'الفاشل',
+    deliveryFailed: 'فشل التسليم إلى FCM',
     confirmTitle: 'تأكيد الإرسال',
     confirmTarget: 'الهدف',
     confirmBody: 'العنوان',

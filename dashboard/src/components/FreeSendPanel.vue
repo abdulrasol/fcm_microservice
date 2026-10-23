@@ -16,6 +16,7 @@ const confirmOpen = ref(false)
 const busy = ref(false)
 const result = ref(null)
 const message = ref('')
+const failed = ref(false)
 
 /**
  * The topics that reach everybody: the send warns about them.
@@ -35,11 +36,19 @@ async function send() {
   }
   busy.value = true
   message.value = ''
+  failed.value = false
   result.value = null
   const payload = { title: title.value, body: body.value || undefined }
   payload[target.value] = targetValue.value
   try {
-    const response = await withReauth(() => api.post(`/apps/${props.app}/send`, payload))
+    const response = await withReauth(() =>
+      api.post(`/apps/${props.app}/send`, payload, { timeout: 40000 }),
+    )
+    if (response.data && response.data.status === 'failed') {
+      failed.value = true
+      message.value = failureMessage(response.data)
+      return
+    }
     result.value = response.data
     confirmOpen.value = false
     message.value = strings.freeSend.sent
@@ -47,13 +56,24 @@ async function send() {
     if (error && error.code === 'cancelled') {
       message.value = ''
     } else if (error && error.status === 429) {
+      failed.value = true
       message.value = strings.errors.tooManyRequests
+    } else if (error && error.status === 502) {
+      failed.value = true
+      message.value = failureMessage(error.data || error)
     } else {
+      failed.value = true
       message.value = error && error.message ? error.message : strings.errors.server
     }
   } finally {
     busy.value = false
   }
+}
+
+function failureMessage(value) {
+  const reason = value && value.reason
+  const suffix = reason ? ` (${reason}${value.http_status ? ` ${value.http_status}` : ''})` : ''
+  return `${strings.freeSend.deliveryFailed}${suffix}`
 }
 </script>
 
@@ -109,7 +129,7 @@ async function send() {
       </div>
     </div>
 
-    <p v-if="message" class="ok">{{ message }}</p>
+    <p v-if="message" :class="failed ? 'error' : 'ok'">{{ message }}</p>
     <p v-if="result" class="muted">
       {{ result.status }} — {{ strings.freeSend.delivered }}: {{ result.delivered }},
       {{ strings.freeSend.failed }}: {{ result.failed }}
