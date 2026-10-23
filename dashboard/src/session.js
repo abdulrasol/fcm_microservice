@@ -12,6 +12,9 @@ export const session = reactive({
   loaded: false,
 })
 
+// The request that is already running, shared by its callers.
+let inflight = null
+
 /** True when the signed-in account is an owner. */
 export const isOwner = computed(() => Boolean(session.me) && session.me.role === 'owner')
 
@@ -26,17 +29,32 @@ export function canAccess(app) {
   return (session.me.apps || []).includes(app)
 }
 
-/** Reads the profile of the signed-in account. */
-export async function load() {
-  try {
-    const response = await api.get('/auth/me')
-    session.me = response.data
-  } catch (error) {
-    session.me = null
-  } finally {
-    session.loaded = true
+/**
+ * Reads the profile of the signed-in account.
+ *
+ * Concurrent callers share one request, and a loaded profile is not fetched
+ * again unless `force` is set (after login or a password change).
+ */
+export async function load({ force = false } = {}) {
+  if (!force && session.loaded && session.me) {
+    return session.me
   }
-  return session.me
+  if (inflight) {
+    return inflight
+  }
+  inflight = (async () => {
+    try {
+      const response = await api.get('/auth/me')
+      session.me = response.data
+    } catch (error) {
+      session.me = null
+    } finally {
+      session.loaded = true
+      inflight = null
+    }
+    return session.me
+  })()
+  return inflight
 }
 
 /** Forgets the account (the cookie of the server expires by itself). */

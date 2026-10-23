@@ -40,7 +40,7 @@ async function submit() {
     newPassword.value = ''
     confirmPassword.value = ''
     done.value = true
-    await load()
+    await load({ force: true })
     router.replace('/')
   } catch (error) {
     currentPassword.value = ''

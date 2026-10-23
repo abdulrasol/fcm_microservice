@@ -22,7 +22,7 @@ async function submit() {
   try {
     await api.post('/auth/login', { email: email.value, password: password.value })
     password.value = ''
-    await load()
+    await load({ force: true })
     const target = route.query.redirect
     const path = typeof target === 'string' && target.startsWith('/') && !target.startsWith('//') ? target : '/'
     router.replace(path)
