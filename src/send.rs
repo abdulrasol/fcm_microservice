@@ -18,6 +18,11 @@ const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 /// Parallel FCM calls used by [`send_to_tokens`] when the caller passes `0`.
 pub const DEFAULT_CONCURRENCY: usize = 10;
 
+/// The budget of an FCM call started from the dashboard (the free send and the
+/// test send). The HTTP client allows 30 s, but the dashboard must answer
+/// quickly instead of holding the button.
+pub const ADMIN_FCM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Why an FCM call could not produce an HTTP response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendError {
@@ -211,6 +216,48 @@ pub struct Delivery {
     pub delivered: usize,
     pub failed: usize,
     pub dead_tokens: Vec<String>,
+    /// One failure of the fan-out, for the diagnostics of the caller. It is the
+    /// first one that finished, not a fixed one: the tasks run in parallel.
+    pub first_failure: Option<DeliveryFailure>,
+}
+
+/// Why an FCM call failed, for the diagnostics of the dashboard routes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryFailure {
+    /// No access token could be obtained for the app.
+    Auth,
+    /// The request to FCM failed (DNS, connection, TLS, timeout).
+    Network,
+    /// FCM rejected the message with an HTTP status.
+    Rejected { http_status: u16 },
+}
+
+impl DeliveryFailure {
+    /// The stable reason the dashboard shows: `auth`, `network` or `rejected`.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Network => "network",
+            Self::Rejected { .. } => "rejected",
+        }
+    }
+
+    /// The HTTP status of a rejection, when there is one.
+    pub fn http_status(self) -> Option<u16> {
+        match self {
+            Self::Rejected { http_status } => Some(http_status),
+            Self::Auth | Self::Network => None,
+        }
+    }
+}
+
+impl From<SendError> for DeliveryFailure {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::Auth => Self::Auth,
+            SendError::Network => Self::Network,
+        }
+    }
 }
 
 /// Sends one message per token with a bounded number of parallel calls.
@@ -251,13 +298,36 @@ pub async fn send_to_tokens(
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok((_, Ok(FcmOutcome::Accepted { .. }))) => delivery.delivered += 1,
-            Ok((token, Ok(FcmOutcome::Rejected { dead_token, .. }))) => {
+            Ok((
+                token,
+                Ok(FcmOutcome::Rejected {
+                    http_status,
+                    dead_token,
+                    ..
+                }),
+            )) => {
                 delivery.failed += 1;
                 if dead_token {
                     delivery.dead_tokens.push(token);
                 }
+                if delivery.first_failure.is_none() {
+                    delivery.first_failure = Some(DeliveryFailure::Rejected { http_status });
+                }
             }
-            Ok((_, Err(_))) | Err(_) => delivery.failed += 1,
+            Ok((_, Err(error))) => {
+                delivery.failed += 1;
+                if delivery.first_failure.is_none() {
+                    delivery.first_failure = Some(error.into());
+                }
+            }
+            Err(_) => {
+                // A panicked task cannot report its error: it counts as a
+                // network failure and is never hidden.
+                delivery.failed += 1;
+                if delivery.first_failure.is_none() {
+                    delivery.first_failure = Some(DeliveryFailure::Network);
+                }
+            }
         }
     }
     delivery

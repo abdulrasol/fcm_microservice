@@ -532,24 +532,37 @@ pub async fn test_send(
     }
     .ok_or_else(|| AdminError::internal("Service account for this app is not loaded"))?;
 
-    let delivery = send::send_to_tokens(
-        &state.fcm,
-        &app,
-        &project_id,
-        &tokens,
-        |token| {
-            send::build_message(
-                &rendered.title,
-                Some(&rendered.body),
-                rendered.image.as_deref(),
-                &rendered.data,
-                None,
-                &send::Destination::Token(token.to_string()),
-            )
-        },
-        send::DEFAULT_CONCURRENCY,
+    let (delivery, timed_out) = match tokio::time::timeout(
+        send::ADMIN_FCM_TIMEOUT,
+        send::send_to_tokens(
+            &state.fcm,
+            &app,
+            &project_id,
+            &tokens,
+            |token| {
+                send::build_message(
+                    &rendered.title,
+                    Some(&rendered.body),
+                    rendered.image.as_deref(),
+                    &rendered.data,
+                    None,
+                    &send::Destination::Token(token.to_string()),
+                )
+            },
+            send::DEFAULT_CONCURRENCY,
+        ),
     )
-    .await;
+    .await
+    {
+        Ok(delivery) => (delivery, false),
+        Err(_) => {
+            tracing::warn!(
+                "admin: test send to {app} failed: FCM timeout after {:?}",
+                send::ADMIN_FCM_TIMEOUT
+            );
+            (send::Delivery::default(), true)
+        }
+    };
 
     for token in &delivery.dead_tokens {
         let _ = state.devices.remove_dead_token(&app, token).await;
@@ -561,11 +574,14 @@ pub async fn test_send(
         "data": rendered.data,
     })
     .to_string();
-    let response = json!({
+    let mut response_body = json!({
         "delivered": delivery.delivered,
         "failed": delivery.failed,
-    })
-    .to_string();
+    });
+    if timed_out {
+        response_body["reason"] = json!("network");
+    }
+    let response = response_body.to_string();
     let _ = db::log_notification_ext(
         &state.db,
         &app,
@@ -585,10 +601,7 @@ pub async fn test_send(
     )
     .await;
 
-    Ok(Json(json!({
-        "delivered": delivery.delivered,
-        "failed": delivery.failed,
-    })))
+    Ok(Json(response_body))
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@
 use super::auth::AuthedUser;
 use super::{authorize, AdminError, AdminJson, Need};
 use crate::db;
-use crate::send::{self, FcmOutcome};
+use crate::send::{self, DeliveryFailure, FcmOutcome, SendError};
 use crate::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -274,6 +274,67 @@ pub struct FreeSendRequest {
     pub uid: Option<String>,
 }
 
+/// Runs one FCM call with the budget of the dashboard.
+///
+/// A timeout is a network failure: the caller answers instead of waiting for
+/// the 30 s of the HTTP client.
+async fn send_with_timeout(
+    transport: &Arc<dyn crate::send::FcmTransport>,
+    app: &str,
+    project_id: &str,
+    message: Value,
+) -> Result<FcmOutcome, SendError> {
+    match tokio::time::timeout(
+        send::ADMIN_FCM_TIMEOUT,
+        transport.send(app, project_id, message),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                "admin: FCM call for {app} failed: timeout after {:?}",
+                send::ADMIN_FCM_TIMEOUT
+            );
+            Err(SendError::Network)
+        }
+    }
+}
+
+/// Classifies one FCM result and logs a failure without any secret.
+///
+/// The log carries the reason and, for a rejection, the first 200 characters of
+/// the FCM body. Never a token, a key or a credential.
+fn classify_failure(
+    app: &str,
+    target: &str,
+    result: &Result<FcmOutcome, SendError>,
+) -> Option<DeliveryFailure> {
+    match result {
+        Ok(FcmOutcome::Accepted { .. }) => None,
+        Ok(FcmOutcome::Rejected {
+            http_status, body, ..
+        }) => {
+            let excerpt: String = body.chars().take(200).collect();
+            tracing::warn!(
+                "admin: free send to {app} ({target}) was rejected by FCM: \
+                 http_status={http_status}, body={excerpt}"
+            );
+            Some(DeliveryFailure::Rejected {
+                http_status: *http_status,
+            })
+        }
+        Err(SendError::Auth) => {
+            tracing::warn!("admin: free send to {app} ({target}) failed: FCM authentication");
+            Some(DeliveryFailure::Auth)
+        }
+        Err(SendError::Network) => {
+            tracing::warn!("admin: free send to {app} ({target}) failed: FCM network");
+            Some(DeliveryFailure::Network)
+        }
+    }
+}
+
 /// `POST /apps/{app}/send`: the dashboard's own send.
 ///
 /// A topic or a condition is one FCM message; a uid is the devices of that
@@ -350,7 +411,7 @@ pub async fn free_send(
         _ => BTreeMap::new(),
     };
 
-    let (target, delivered, failed) = if let Some(topic) = &body.topic {
+    let (target, delivered, failed, failure) = if let Some(topic) = &body.topic {
         let message = send::build_message(
             &body.title,
             body.body.as_deref(),
@@ -359,17 +420,16 @@ pub async fn free_send(
             None,
             &send::Destination::Topic(topic.clone()),
         );
-        let accepted = matches!(
-            state.fcm.send(&app, &project_id, message).await,
-            Ok(FcmOutcome::Accepted { .. })
-        );
-        if accepted {
+        let result = send_with_timeout(&state.fcm, &app, &project_id, message).await;
+        let failure = classify_failure(&app, &format!("topic:{topic}"), &result);
+        if failure.is_none() {
             let _ = db::save_topic(&state.db, &app, topic).await;
         }
         (
             format!("topic:{}", topic),
-            usize::from(accepted),
-            usize::from(!accepted),
+            usize::from(failure.is_none()),
+            usize::from(failure.is_some()),
+            failure,
         )
     } else if let Some(condition) = &body.condition {
         let message = send::build_message(
@@ -380,14 +440,13 @@ pub async fn free_send(
             None,
             &send::Destination::Condition(condition.clone()),
         );
-        let accepted = matches!(
-            state.fcm.send(&app, &project_id, message).await,
-            Ok(FcmOutcome::Accepted { .. })
-        );
+        let result = send_with_timeout(&state.fcm, &app, &project_id, message).await;
+        let failure = classify_failure(&app, "condition", &result);
         (
             "condition".to_string(),
-            usize::from(accepted),
-            usize::from(!accepted),
+            usize::from(failure.is_none()),
+            usize::from(failure.is_some()),
+            failure,
         )
     } else {
         let uid = body.uid.clone().unwrap_or_default();
@@ -396,28 +455,61 @@ pub async fn free_send(
             .tokens_for_uid(&app, &uid)
             .await
             .map_err(|_| AdminError::internal("device storage failed"))?;
-        let delivery = send::send_to_tokens(
-            &state.fcm,
-            &app,
-            &project_id,
-            &tokens,
-            |token| {
-                send::build_message(
-                    &body.title,
-                    body.body.as_deref(),
-                    body.image.as_deref(),
-                    &data,
-                    None,
-                    &send::Destination::Token(token.to_string()),
-                )
-            },
-            send::DEFAULT_CONCURRENCY,
+        let (delivery, timed_out) = match tokio::time::timeout(
+            send::ADMIN_FCM_TIMEOUT,
+            send::send_to_tokens(
+                &state.fcm,
+                &app,
+                &project_id,
+                &tokens,
+                |token| {
+                    send::build_message(
+                        &body.title,
+                        body.body.as_deref(),
+                        body.image.as_deref(),
+                        &data,
+                        None,
+                        &send::Destination::Token(token.to_string()),
+                    )
+                },
+                send::DEFAULT_CONCURRENCY,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(delivery) => (delivery, false),
+            Err(_) => {
+                tracing::warn!(
+                    "admin: free send to {app} (uid:{uid}) failed: FCM timeout after {:?}",
+                    send::ADMIN_FCM_TIMEOUT
+                );
+                (send::Delivery::default(), true)
+            }
+        };
         for token in &delivery.dead_tokens {
             let _ = state.devices.remove_dead_token(&app, token).await;
         }
-        (format!("uid:{}", uid), delivery.delivered, delivery.failed)
+        let failure = if delivery.delivered == 0 {
+            if timed_out {
+                Some(DeliveryFailure::Network)
+            } else {
+                delivery.first_failure
+            }
+        } else {
+            None
+        };
+        if let Some(failure) = failure {
+            tracing::warn!(
+                "admin: free send to {app} (uid:{uid}) failed: {}",
+                failure.reason()
+            );
+        }
+        (
+            format!("uid:{}", uid),
+            delivery.delivered,
+            delivery.failed,
+            failure,
+        )
     };
 
     let payload = json!({
@@ -426,7 +518,16 @@ pub async fn free_send(
         "data": data,
     })
     .to_string();
-    let response = json!({ "delivered": delivered, "failed": failed }).to_string();
+    let mut record = json!({ "delivered": delivered, "failed": failed });
+    if delivered == 0 {
+        if let Some(failure) = failure {
+            record["reason"] = json!(failure.reason());
+            if let Some(status) = failure.http_status() {
+                record["http_status"] = json!(status);
+            }
+        }
+    }
+    let response = record.to_string();
     let _ = db::log_notification_ext(
         &state.db,
         &app,
@@ -456,14 +557,18 @@ pub async fn free_send(
             })),
         ))
     } else {
-        Ok((
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "status": "failed",
-                "delivered": 0,
-                "failed": failed,
-            })),
-        ))
+        let mut body = json!({
+            "status": "failed",
+            "delivered": 0,
+            "failed": failed,
+        });
+        if let Some(failure) = failure {
+            body["reason"] = json!(failure.reason());
+            if let Some(status) = failure.http_status() {
+                body["http_status"] = json!(status);
+            }
+        }
+        Ok((StatusCode::BAD_GATEWAY, Json(body)))
     }
 }
 
@@ -939,6 +1044,9 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["status"], "failed");
         assert_eq!(body["delivered"], 0);
+        // T19: the reason and the status of the rejection travel with the 502.
+        assert_eq!(body["reason"], "rejected");
+        assert_eq!(body["http_status"], 500);
 
         let row: String =
             sqlx::query_scalar("SELECT status FROM notifications_history ORDER BY id DESC LIMIT 1")
@@ -946,6 +1054,184 @@ mod tests {
                 .await
                 .expect("the history row must exist");
         assert_eq!(row, "failed");
+    }
+
+    // ---------- T19: the reason of a failed free send ----------
+
+    /// A router whose FCM answer is programmable, with a logged-in owner and
+    /// its state, so a test can register devices.
+    async fn setup_with_transport(
+        transport: Arc<dyn crate::send::FcmTransport>,
+    ) -> (Router, Arc<AppState>, SqlitePool, String) {
+        let pool = memory_pool().await;
+        let state = test_state_with_env(pool.clone(), None, Some(transport)).await;
+        bind_app(&state, APP, "project-watt").await;
+        insert_user(&pool, "user@example.com", "owner", false).await;
+        let router = admin_router(state.clone());
+        let login = login_request(&router, "user@example.com", PASSWORD).await;
+        let token = session_token(&login);
+        (router, state, pool, token)
+    }
+
+    /// The same harness, for the tests that only need to program the answer.
+    async fn setup_with_reply(
+        reply: impl Fn(&str, &Value) -> Result<FcmOutcome, SendError> + Send + Sync + 'static,
+    ) -> (Router, SqlitePool, String) {
+        let (router, _state, pool, token) =
+            setup_with_transport(crate::send::test_support::FakeTransport::new(reply)).await;
+        (router, pool, token)
+    }
+
+    async fn post_send(router: &Router, token: &str, body: Value) -> (StatusCode, Value) {
+        call(
+            router,
+            Method::POST,
+            &format!("/apps/{}/send", APP),
+            Some(body),
+            Some(token),
+            true,
+        )
+        .await
+    }
+
+    /// The `response` column of the last history row.
+    async fn saved_response(pool: &SqlitePool) -> String {
+        sqlx::query_scalar("SELECT response FROM notifications_history ORDER BY id DESC LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .expect("the history row must exist")
+    }
+
+    #[tokio::test]
+    async fn free_send_auth_failure_reports_auth() {
+        let (router, pool, token) = setup_with_reply(|_, _| Err(SendError::Auth)).await;
+        let (status, body) = post_send(
+            &router,
+            &token,
+            json!({ "title": "A title", "topic": "news" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["reason"], "auth");
+        assert!(body.get("http_status").is_none());
+        assert!(saved_response(&pool).await.contains("\"reason\":\"auth\""));
+    }
+
+    #[tokio::test]
+    async fn free_send_network_failure_reports_network() {
+        let (router, pool, token) = setup_with_reply(|_, _| Err(SendError::Network)).await;
+        let (status, body) = post_send(
+            &router,
+            &token,
+            json!({ "title": "A title", "topic": "news" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["reason"], "network");
+        assert!(saved_response(&pool)
+            .await
+            .contains("\"reason\":\"network\""));
+    }
+
+    #[tokio::test]
+    async fn free_send_rejected_reports_the_status_and_never_the_body() {
+        let (router, pool, token) = setup_with_reply(|_, _| {
+            Ok(FcmOutcome::Rejected {
+                http_status: 404,
+                body: "raw fcm text".to_string(),
+                dead_token: false,
+            })
+        })
+        .await;
+        let (status, body) = post_send(
+            &router,
+            &token,
+            json!({ "title": "A title", "topic": "news" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["reason"], "rejected");
+        assert_eq!(body["http_status"], 404);
+        assert!(!body.to_string().contains("raw fcm text"));
+
+        let saved = saved_response(&pool).await;
+        assert!(saved.contains("\"reason\":\"rejected\""));
+        assert!(saved.contains("\"http_status\":404"));
+        assert!(!saved.contains("raw fcm text"));
+    }
+
+    #[tokio::test]
+    async fn free_send_rejected_400_reports_the_status() {
+        let (router, _pool, token) = setup_with_reply(|_, _| {
+            Ok(FcmOutcome::Rejected {
+                http_status: 400,
+                body: "invalid argument".to_string(),
+                dead_token: false,
+            })
+        })
+        .await;
+        let (status, body) = post_send(
+            &router,
+            &token,
+            json!({ "title": "A title", "condition": "'news' in topics" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["reason"], "rejected");
+        assert_eq!(body["http_status"], 400);
+    }
+
+    // The whole batch times out at 10 s; the test waits for that real time,
+    // not for the 30 s the HTTP client would otherwise allow.
+    #[tokio::test]
+    async fn free_send_timeout_reports_network() {
+        let transport = crate::send::test_support::FakeTransport::with_delay(
+            |_, _| {
+                Ok(FcmOutcome::Accepted {
+                    body: "{}".to_string(),
+                })
+            },
+            std::time::Duration::from_secs(11),
+        );
+        let (router, _state, pool, token) = setup_with_transport(transport).await;
+        let (status, body) = post_send(
+            &router,
+            &token,
+            json!({ "title": "A title", "topic": "news" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["reason"], "network");
+        assert!(saved_response(&pool)
+            .await
+            .contains("\"reason\":\"network\""));
+    }
+
+    #[tokio::test]
+    async fn free_send_uid_batch_reports_the_first_failure() {
+        let transport =
+            crate::send::test_support::FakeTransport::new(|_, _| Err(SendError::Network));
+        let (router, state, pool, token) = setup_with_transport(transport).await;
+        for value in [
+            "token-a-000000000000000000000000000000",
+            "token-b-000000000000000000000000000000",
+        ] {
+            state
+                .devices
+                .register(APP, "u1", value, crate::devices::Platform::Android, 20)
+                .await
+                .expect("the device must register");
+        }
+
+        let (status, body) =
+            post_send(&router, &token, json!({ "title": "A title", "uid": "u1" })).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["failed"], 2);
+        assert_eq!(body["reason"], "network");
+        assert!(saved_response(&pool)
+            .await
+            .contains("\"reason\":\"network\""));
     }
 
     /// Writes one history row with its own timestamp and reference.
