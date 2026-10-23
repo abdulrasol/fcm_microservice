@@ -11,4 +11,4 @@
 | 7 | R5: `LEGACY_API_KEY_ENABLED=false` وتدوير `API_KEY` (سُرّب بلصق `.env`) وحذفه من ملفات Bruno في taqati | المالك | قبل أي إعلان عام |
 | 8 | MariaDB على `0.0.0.0:3306` ⇒ اجعله loopback أو خلف جدار ناري | المالك | يُفضّل الآن |
 | 9 | T15 (TOTP) قبل فتح اللوحة للعموم | منفّذ | اختياري |
-| 10 | نسخ احتياطي مجدول لـ `data/` و`credentials/` (cron على `deploy.sh backup` أو ما يعادله) | المالك | مهم |
+| 10 | نسخ احتياطي مجدول لـ `data/` و`credentials/` (النسخ الحالي يحدث فقط عند `deploy`؛ يلزم cron يستخدم `sqlite3 data/data.db ".backup ..."` أو خطوة جديدة في deploy.sh) | المالك | مهم |
