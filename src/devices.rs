@@ -1491,4 +1491,208 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(!body.to_string().contains(&token));
     }
+
+    #[tokio::test]
+    async fn concurrent_register_on_cold_service_both_succeed() {
+        use crate::identity::firebase::FirebaseVerifier;
+        use crate::identity::jwks::{FetchedJwks, JwkProvider, JwksCache};
+        use jsonwebtoken::DecodingKey;
+        use rand::rngs::OsRng;
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        use rsa::RsaPrivateKey;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SlowJwks {
+            keys: HashMap<String, DecodingKey>,
+            delay: Duration,
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl JwkProvider for SlowJwks {
+            async fn fetch_keys(&self) -> Result<FetchedJwks, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(self.delay).await;
+                Ok(FetchedJwks {
+                    keys: self.keys.clone(),
+                    max_age: Duration::from_secs(3600),
+                })
+            }
+        }
+
+        let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("generate RSA key");
+        let private_pem = private
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("private key PEM")
+            .to_string();
+        let public_pem = private
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .expect("public key PEM");
+        let decoding = DecodingKey::from_rsa_pem(public_pem.as_bytes()).expect("decoding key");
+
+        let slow_jwks = Arc::new(SlowJwks {
+            keys: HashMap::from([("k1".to_string(), decoding)]),
+            delay: Duration::from_millis(100),
+            calls: AtomicUsize::new(0),
+        });
+
+        // Cold service: empty cache
+        let cold_cache = Arc::new(Mutex::new(JwksCache::new()));
+        let verifier = Arc::new(FirebaseVerifier::with_cache(slow_jwks.clone(), cold_cache));
+
+        let pool = memory_pool(1).await;
+        let config = Arc::new(
+            ConfigStore::new(pool.clone())
+                .await
+                .expect("the config store must open"),
+        );
+        config
+            .create_app(APP, "tester")
+            .await
+            .expect("the app must be created");
+        config
+            .save_section(
+                APP,
+                "identity",
+                json!({
+                    "provider": { "type": "firebase" },
+                    "role": { "source": "claim", "claim": "role" }
+                }),
+                "tester",
+                1,
+            )
+            .await
+            .expect("the identity must be saved");
+
+        let project_map: ProjectIdMap = Arc::new(RwLock::new(HashMap::from([(
+            APP.to_string(),
+            "demo-project".to_string(),
+        )])));
+        let auth_map: AuthMap = Arc::new(RwLock::new(HashMap::new()));
+        let client = reqwest::Client::builder().build().expect("client");
+        let env: Arc<dyn EnvSource> = Arc::new(FakeEnv);
+        let identity = Arc::new(IdentityRegistry::with_firebase(
+            config.clone(),
+            project_map.clone(),
+            client.clone(),
+            env.clone(),
+            verifier,
+        ));
+        let datasource = Arc::new(crate::datasource::registry::DataSourceRegistry::new(
+            config.clone(),
+            project_map.clone(),
+            auth_map.clone(),
+            client.clone(),
+            env,
+        ));
+        let auth = AuthService::new(
+            project_map.clone(),
+            identity.clone(),
+            datasource.clone(),
+            config.clone(),
+            AuthConfig {
+                service_api_key: None,
+                legacy_api_key: None,
+                legacy_enabled: false,
+            },
+        );
+        let tool_auth = Arc::new(ToolAuth {
+            pool: pool.clone(),
+            cookie: CookieConfig::with_hours(true, 12),
+            login_limiter: RateLimiter::new(5, Duration::from_secs(900)),
+            dummy_hash: "unused".to_string(),
+            allowed_origins: Vec::new(),
+        });
+        let fcm = Arc::new(crate::send::HttpFcm::new(client.clone(), auth_map.clone()));
+        let credentials = Arc::new(crate::credentials::CredentialManager::new(
+            std::env::temp_dir().join("fcm-device-cold-test-credentials"),
+            auth_map.clone(),
+            project_map.clone(),
+            Arc::new(RwLock::new(std::collections::HashSet::new())),
+            Arc::new(crate::credentials::GoogleVerifier),
+            true,
+        ));
+
+        let state = Arc::new(AppState {
+            devices: Arc::new(DeviceStore::new(pool.clone())),
+            devices_limiter: RateLimiter::new(20, Duration::from_secs(60)),
+            db: pool,
+            auth_map,
+            project_map,
+            client,
+            auth,
+            trust_proxy: false,
+            topics_limiter: RateLimiter::new(30, Duration::from_secs(60)),
+            auth_fail_limiter: RateLimiter::new(10, Duration::from_secs(60)),
+            config,
+            tool_auth,
+            identity,
+            datasource,
+            fcm,
+            role_directory: Arc::new(crate::devices::RoleDirectory::new()),
+            template_rate: Arc::new(crate::db::TemplateRateLimiter::new()),
+            credentials,
+            legacy: Arc::new(crate::legacy::LegacyGuard::new(
+                crate::legacy::DEFAULT_LEGACY_RATE_LIMIT_PER_MINUTE,
+            )),
+            admin_limiters: crate::AdminLimiters::new(),
+        });
+        let router = test_router(state);
+
+        let make_token = |uid: &str| -> String {
+            let now = jsonwebtoken::get_current_timestamp();
+            let payload = json!({
+                "sub": uid,
+                "aud": "demo-project",
+                "iss": "https://securetoken.google.com/demo-project",
+                "exp": now + 3600,
+                "iat": now - 10,
+                "auth_time": now - 10,
+            });
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some("k1".to_string());
+            encode(
+                &header,
+                &payload,
+                &EncodingKey::from_rsa_pem(private_pem.as_bytes()).expect("encoding key"),
+            )
+            .expect("encode token")
+        };
+
+        let token_1 = token(1);
+        let token_2 = token(2);
+        let auth_1 = make_token("uid-1");
+        let auth_2 = make_token("uid-2");
+
+        let router_clone = router.clone();
+        let handle1 = tokio::spawn(async move {
+            call(
+                &router_clone,
+                request("/devices/register", register_body(&token_1), Some(&auth_1)),
+            )
+            .await
+        });
+        let handle2 = tokio::spawn(async move {
+            call(
+                &router,
+                request("/devices/register", register_body(&token_2), Some(&auth_2)),
+            )
+            .await
+        });
+
+        let (res1, res2) = tokio::join!(handle1, handle2);
+        let (status1, body1) = res1.expect("join handle 1");
+        let (status2, body2) = res2.expect("join handle 2");
+
+        assert_eq!(status1, StatusCode::OK, "first request must succeed");
+        assert_eq!(status2, StatusCode::OK, "second request must succeed");
+        assert_eq!(body1["registered"], json!(true));
+        assert_eq!(body2["registered"], json!(true));
+        assert_eq!(
+            slow_jwks.calls.load(Ordering::SeqCst),
+            1,
+            "slow JWKS provider must be called only once on cold start"
+        );
+    }
 }

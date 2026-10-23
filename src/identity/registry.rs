@@ -39,6 +39,16 @@ impl IdentityRegistry {
             Arc::new(GoogleJwkProvider::new(client.clone())),
             Arc::new(Mutex::new(JwksCache::new())),
         ));
+        Self::with_firebase(config, project_map, client, env, firebase)
+    }
+
+    pub fn with_firebase(
+        config: Arc<ConfigStore>,
+        project_map: ProjectIdMap,
+        client: reqwest::Client,
+        env: Arc<dyn EnvSource>,
+        firebase: Arc<FirebaseVerifier>,
+    ) -> Self {
         Self {
             config,
             project_map,
@@ -47,6 +57,28 @@ impl IdentityRegistry {
             firebase,
             providers: Mutex::new(HashMap::new()),
             warned: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Warms the shared Firebase JWKS cache if any app is configured with
+    /// the Firebase provider or defaults to it.
+    pub async fn warmup_firebase_if_needed(&self) {
+        let has_firebase_in_config = self.config.app_names().iter().any(|app| {
+            self.config
+                .get(app)
+                .map(|s| matches!(s.config.identity.provider, ProviderConfig::Firebase))
+                .unwrap_or(false)
+        });
+        let has_firebase_in_creds = {
+            let map = self.project_map.read().await;
+            !map.is_empty()
+        };
+        if has_firebase_in_config || has_firebase_in_creds {
+            if let Err(error) = self.firebase.warmup().await {
+                tracing::warn!("Failed to warm up Firebase JWKS: {:?}", error);
+            } else {
+                tracing::info!("Firebase JWKS warmed up successfully");
+            }
         }
     }
 

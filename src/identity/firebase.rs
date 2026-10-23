@@ -4,7 +4,7 @@
 //! service account private key never signs user tokens. The rules are the ones
 //! the service used before the identity module existed; only the code moved.
 
-use super::jwks::{cached_key, JwkProvider, JwksCache, JwksError, MAX_KID_LENGTH};
+use super::jwks::{cached_key, warmup_cache, JwkProvider, JwksCache, JwksError, MAX_KID_LENGTH};
 use super::{is_valid_uid, Identity, IdentityError, MAX_TOKEN_LENGTH};
 use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
 use serde::Deserialize;
@@ -44,6 +44,11 @@ impl FirebaseVerifier {
     /// one downloaded Google key set.
     pub fn with_cache(jwks: Arc<dyn JwkProvider>, cache: Arc<Mutex<JwksCache>>) -> Self {
         Self { jwks, cache }
+    }
+
+    /// Warms the shared Google JWKS cache if it is cold or expired.
+    pub async fn warmup(&self) -> Result<(), JwksError> {
+        warmup_cache(&self.cache, self.jwks.as_ref()).await
     }
 
     pub async fn verify(&self, token: &str, project_id: &str) -> Result<Identity, IdentityError> {

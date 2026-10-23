@@ -9,8 +9,9 @@ use async_trait::async_trait;
 use jsonwebtoken::jwk::{JwkSet, KeyAlgorithm};
 use jsonwebtoken::DecodingKey;
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Google's public keys for Firebase Auth ID tokens.
 pub const GOOGLE_JWK_URL: &str =
@@ -41,6 +42,7 @@ pub struct JwksCache {
     pub keys: HashMap<String, DecodingKey>,
     pub expires_at: Instant,
     pub last_refresh: Instant,
+    pub refresh_gate: Arc<AsyncMutex<()>>,
 }
 
 impl JwksCache {
@@ -49,6 +51,7 @@ impl JwksCache {
             keys: HashMap::new(),
             expires_at: Instant::now(),
             last_refresh: Instant::now() - MIN_JWK_REFRESH,
+            refresh_gate: Arc::new(AsyncMutex::new(())),
         }
     }
 }
@@ -78,6 +81,23 @@ pub async fn cached_key(
     kid: Option<&str>,
 ) -> Result<Option<DecodingKey>, JwksError> {
     let now = Instant::now();
+    let (cached, expired, gate) = {
+        let cache = lock(cache);
+        (
+            lookup(&cache, kid),
+            now >= cache.expires_at,
+            Arc::clone(&cache.refresh_gate),
+        )
+    };
+    if !expired && cached.is_some() {
+        return Ok(cached);
+    }
+
+    let _guard = gate.lock().await;
+
+    // Double-check the cache under the single-flight gate in case a concurrent
+    // fetch completed while this task was waiting.
+    let now = Instant::now();
     let (cached, expired) = {
         let cache = lock(cache);
         (lookup(&cache, kid), now >= cache.expires_at)
@@ -106,6 +126,50 @@ pub async fn cached_key(
 
     let cache = lock(cache);
     Ok(lookup(&cache, kid))
+}
+
+/// Warms the cache by fetching keys if expired or empty, respecting the
+/// single-flight gate and refresh throttle.
+pub async fn warmup_cache(
+    cache: &Mutex<JwksCache>,
+    provider: &dyn JwkProvider,
+) -> Result<(), JwksError> {
+    let now = Instant::now();
+    let (is_fresh, gate) = {
+        let cache = lock(cache);
+        (
+            now < cache.expires_at && !cache.keys.is_empty(),
+            Arc::clone(&cache.refresh_gate),
+        )
+    };
+    if is_fresh {
+        return Ok(());
+    }
+
+    let _guard = gate.lock().await;
+
+    let now = Instant::now();
+    let is_fresh = {
+        let cache = lock(cache);
+        now < cache.expires_at && !cache.keys.is_empty()
+    };
+    if is_fresh {
+        return Ok(());
+    }
+
+    let may_refresh = {
+        let cache = lock(cache);
+        now.duration_since(cache.last_refresh) >= MIN_JWK_REFRESH
+    };
+    if !may_refresh {
+        return Err(JwksError::Expired);
+    }
+
+    {
+        let mut cache = lock(cache);
+        cache.last_refresh = now;
+    }
+    refresh(cache, provider).await
 }
 
 /// Downloads a new key set and stores it. The fetch happens without holding the
@@ -282,4 +346,151 @@ pub(crate) fn parse_cache_max_age(value: &str) -> Option<Duration> {
         }
         value.trim().parse::<u64>().ok().map(Duration::from_secs)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SlowMockProvider {
+        keys: HashMap<String, DecodingKey>,
+        delay: Duration,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl JwkProvider for SlowMockProvider {
+        async fn fetch_keys(&self) -> Result<FetchedJwks, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(FetchedJwks {
+                keys: self.keys.clone(),
+                max_age: Duration::from_secs(3600),
+            })
+        }
+    }
+
+    struct FailingMockProvider {
+        delay: Duration,
+        calls: AtomicUsize,
+        error_message: String,
+    }
+
+    #[async_trait]
+    impl JwkProvider for FailingMockProvider {
+        async fn fetch_keys(&self) -> Result<FetchedJwks, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Err(self.error_message.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn eight_concurrent_calls_on_cold_cache_all_succeed_and_provider_called_once() {
+        let key = DecodingKey::from_secret(b"test-secret-for-jwks-single-flight");
+        let provider = Arc::new(SlowMockProvider {
+            keys: HashMap::from([("k1".to_string(), key)]),
+            delay: Duration::from_millis(200),
+            calls: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(Mutex::new(JwksCache::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let provider = provider.clone();
+            handles.push(tokio::spawn(async move {
+                cached_key(&cache, provider.as_ref(), Some("k1")).await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            let res = handle.await.expect("join handle must succeed");
+            results.push(res);
+        }
+
+        assert_eq!(results.len(), 8);
+        for res in results {
+            assert!(res.is_ok(), "every concurrent call must succeed");
+            assert!(res.unwrap().is_some(), "key k1 must be found");
+        }
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "provider must be called exactly once for single-flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_failure_all_concurrent_callers_fail_provider_called_once_and_throttles() {
+        let provider = Arc::new(FailingMockProvider {
+            delay: Duration::from_millis(50),
+            calls: AtomicUsize::new(0),
+            error_message: "jwks endpoint down".to_string(),
+        });
+        let cache = Arc::new(Mutex::new(JwksCache::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let provider = provider.clone();
+            handles.push(tokio::spawn(async move {
+                cached_key(&cache, provider.as_ref(), Some("k1")).await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            let res = handle.await.expect("join handle must succeed");
+            results.push(res);
+        }
+
+        assert_eq!(results.len(), 8);
+        for res in results {
+            assert!(
+                res.is_err(),
+                "every concurrent call must fail when fetch fails"
+            );
+        }
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "provider must be called exactly once during concurrent failed fetch"
+        );
+
+        // Subsequent call within 60s must be throttled and NOT call the provider again.
+        let subsequent = cached_key(&cache, provider.as_ref(), Some("k1")).await;
+        assert!(matches!(subsequent, Err(JwksError::Expired)));
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "provider must not be called again within the throttle window"
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_cache_fetches_once_and_subsequent_call_skips() {
+        let key = DecodingKey::from_secret(b"warmup-test-secret");
+        let provider = Arc::new(SlowMockProvider {
+            keys: HashMap::from([("k1".to_string(), key)]),
+            delay: Duration::from_millis(10),
+            calls: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(Mutex::new(JwksCache::new()));
+
+        warmup_cache(&cache, provider.as_ref())
+            .await
+            .expect("warmup must succeed");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        // Second warmup call on warm cache must be a no-op.
+        warmup_cache(&cache, provider.as_ref())
+            .await
+            .expect("second warmup must succeed");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
 }

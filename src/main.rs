@@ -411,6 +411,12 @@ async fn main() {
         admin_limiters: AdminLimiters::new(),
     });
 
+    // T17: Warm up Firebase JWKS in the background without delaying /health or listener binding.
+    let identity_warmup = state.identity.clone();
+    tokio::spawn(async move {
+        identity_warmup.warmup_firebase_if_needed().await;
+    });
+
     let app = build_router(state);
     tracing::debug!("public routes: {:?}", public_route_documentation());
 
