@@ -1293,6 +1293,52 @@ fn unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Makes a value safe for one log line: control characters are replaced and
+/// the length is capped. Parameter values and tokens are never passed here.
+fn log_field(value: &str) -> String {
+    value
+        .chars()
+        .take(64)
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+/// Logs why a template send was refused and returns the error unchanged, so
+/// the client answer does not change. The log carries identifiers and a closed
+/// reason only: no token, no parameter value, no document content. A 400 adds
+/// the validation message, which names the parameter and never its value.
+fn reject_template(
+    payload: &SendTemplateRequest,
+    sender: &str,
+    error: (StatusCode, String),
+    reason: &str,
+) -> (StatusCode, String) {
+    let detail = if error.0 == StatusCode::BAD_REQUEST {
+        format!(
+            " detail={}",
+            log_field(&error.1.chars().take(120).collect::<String>())
+        )
+    } else {
+        String::new()
+    };
+    tracing::warn!(
+        "template send rejected: app={} template={} sender={} status={} reason={}{}",
+        log_field(&payload.app),
+        log_field(&payload.template),
+        log_field(sender),
+        error.0.as_u16(),
+        reason,
+        detail
+    );
+    error
+}
+
 /// `POST /api/v1/send/template` (T8).
 ///
 /// The numbered steps match the plan and are kept in this order on purpose:
@@ -1305,16 +1351,25 @@ async fn send_template(
     Json(payload): Json<SendTemplateRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     // 1. A known app, then the shared IP limit.
-    ensure_known_app(&state, &payload.app).await?;
-    topics::check_ip_limit(&state, &headers, peer)?;
+    ensure_known_app(&state, &payload.app)
+        .await
+        .map_err(|error| reject_template(&payload, "-", error, "unknown_app"))?;
+    topics::check_ip_limit(&state, &headers, peer)
+        .map_err(|error| reject_template(&payload, "-", error, "ip_limited"))?;
 
     // 2. The service key, or a verified identity and its resolved role.
     let (sender, sender_email, is_service) = match state
         .auth
         .trusted_sender(&headers, &payload.app)
         .await
-        .map_err(|error| error.into_response())?
-    {
+        .map_err(|error| {
+            reject_template(
+                &payload,
+                "-",
+                error.into_response(),
+                "unauthenticated_service_key",
+            )
+        })? {
         Some(appkeys::TrustedSender::Service) => (
             template::Sender {
                 uid: "service".to_string(),
@@ -1340,12 +1395,26 @@ async fn send_template(
                 .auth
                 .authenticate_identity(&headers, &payload.app)
                 .await
-                .map_err(|error| auth_error_with_limit(&state, &headers, peer, error))?;
+                .map_err(|error| {
+                    reject_template(
+                        &payload,
+                        "-",
+                        auth_error_with_limit(&state, &headers, peer, error),
+                        "identity_rejected_or_unavailable",
+                    )
+                })?;
             let role = state
                 .auth
                 .resolve_sender_role(&payload.app, &identity)
                 .await
-                .map_err(|error| auth_error_with_limit(&state, &headers, peer, error))?;
+                .map_err(|error| {
+                    reject_template(
+                        &payload,
+                        &identity.uid,
+                        auth_error_with_limit(&state, &headers, peer, error),
+                        "role_lookup_unavailable",
+                    )
+                })?;
             (
                 template::Sender {
                     uid: identity.uid,
@@ -1359,15 +1428,26 @@ async fn send_template(
     };
 
     // 3. A missing or disabled template is a uniform 404.
-    let snapshot = state
-        .config
-        .get(&payload.app)
-        .ok_or_else(template_not_found)?;
+    let snapshot = state.config.get(&payload.app).ok_or_else(|| {
+        reject_template(
+            &payload,
+            &sender.uid,
+            template_not_found(),
+            "app_config_missing",
+        )
+    })?;
     let definition = snapshot
         .templates
         .get(&payload.template)
         .filter(|definition| definition.enabled)
-        .ok_or_else(template_not_found)?;
+        .ok_or_else(|| {
+            reject_template(
+                &payload,
+                &sender.uid,
+                template_not_found(),
+                "template_not_found_or_disabled",
+            )
+        })?;
 
     // 4. A role must be listed literally, then the per-uid hourly limit.
     if !is_service {
@@ -1376,7 +1456,16 @@ async fn send_template(
             .as_deref()
             .is_some_and(|role| definition.senders.iter().any(|sender| sender == role));
         if !listed {
-            return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
+            let reason = format!(
+                "role_not_listed(role={})",
+                log_field(sender.role.as_deref().unwrap_or("none"))
+            );
+            return Err(reject_template(
+                &payload,
+                &sender.uid,
+                (StatusCode::FORBIDDEN, "Forbidden".to_string()),
+                &reason,
+            ));
         }
         let limit = definition
             .rate
@@ -1387,26 +1476,59 @@ async fn send_template(
             .template_rate
             .allow((&payload.app, &payload.template, &sender.uid), limit)
         {
-            return Err(topics::too_many_requests());
+            return Err(reject_template(
+                &payload,
+                &sender.uid,
+                topics::too_many_requests(),
+                "rate_limited",
+            ));
         }
     }
 
     // 5. Client parameters.
-    let params = template::validate_params(definition, &payload.params).map_err(template_error)?;
+    let params = template::validate_params(definition, &payload.params).map_err(|error| {
+        reject_template(
+            &payload,
+            &sender.uid,
+            template_error(error),
+            "invalid_param",
+        )
+    })?;
 
     // 6. The context document, when the template asks for one.
-    let doc = match template::context_path(definition, &params, &sender).map_err(template_error)? {
+    let doc = match template::context_path(definition, &params, &sender).map_err(|error| {
+        reject_template(&payload, &sender.uid, template_error(error), "context_path")
+    })? {
         Some(path) => {
             let source = state
                 .datasource
                 .source_for(&payload.app)
                 .await
-                .map_err(|_| data_source_unavailable())?;
+                .map_err(|_| {
+                    reject_template(
+                        &payload,
+                        &sender.uid,
+                        data_source_unavailable(),
+                        "context_source_unavailable",
+                    )
+                })?;
             match source.get_doc(&path).await {
                 Ok(doc) => doc,
-                Err(DataError::Unavailable(_)) => return Err(data_source_unavailable()),
+                Err(DataError::Unavailable(_)) => {
+                    return Err(reject_template(
+                        &payload,
+                        &sender.uid,
+                        data_source_unavailable(),
+                        "context_unavailable",
+                    ));
+                }
                 Err(DataError::InvalidPath(message)) => {
-                    return Err((StatusCode::BAD_REQUEST, message));
+                    return Err(reject_template(
+                        &payload,
+                        &sender.uid,
+                        (StatusCode::BAD_REQUEST, message),
+                        "context_invalid_path",
+                    ));
                 }
             }
         }
@@ -1414,8 +1536,14 @@ async fn send_template(
     };
 
     // 7. Render the final notification.
-    let rendered = template::render(definition, &params, &sender, doc.as_ref(), None)
-        .map_err(template_error)?;
+    let rendered =
+        template::render(definition, &params, &sender, doc.as_ref(), None).map_err(|error| {
+            let reason = match &error {
+                template::RenderError::Forbidden => "context_require_failed",
+                template::RenderError::BadRequest(_) => "render_error",
+            };
+            reject_template(&payload, &sender.uid, template_error(error), reason)
+        })?;
 
     // 8. The same content limits as `/send`, applied to the rendered output.
     let data_value = if rendered.data.is_empty() {
@@ -1446,7 +1574,14 @@ async fn send_template(
         rendered.image.as_deref(),
         data_value.as_ref(),
     )
-    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    .map_err(|error| {
+        reject_template(
+            &payload,
+            &sender.uid,
+            (StatusCode::BAD_REQUEST, error),
+            "validation_failed",
+        )
+    })?;
 
     // 9. A claimed dedupe key never sends twice.
     if let Some(key) = &rendered.dedupe_key {
@@ -1460,9 +1595,14 @@ async fn send_template(
         )
         .await
         .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not record the dedupe key".to_string(),
+            reject_template(
+                &payload,
+                &sender.uid,
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not record the dedupe key".to_string(),
+                ),
+                "dedupe_error",
             )
         })?;
         if !claimed {
@@ -1480,7 +1620,12 @@ async fn send_template(
         Ok(delivery) => delivery,
         Err(error) => {
             release_dedupe_key(&state, &payload.app, &payload.template, &rendered).await;
-            return Err(error);
+            return Err(reject_template(
+                &payload,
+                &sender.uid,
+                error,
+                "delivery_error",
+            ));
         }
     };
 
@@ -1496,6 +1641,13 @@ async fn send_template(
     }
 
     if delivery.empty_audience {
+        tracing::warn!(
+            "template send had no recipients: app={} template={} sender={} target={}",
+            log_field(&payload.app),
+            log_field(&payload.template),
+            log_field(&sender.uid),
+            log_field(&delivery.target)
+        );
         return Ok((
             StatusCode::OK,
             Json(json!({ "status": "no_devices", "delivered": 0, "failed": 0 })),
@@ -1531,6 +1683,15 @@ async fn send_template(
     .await;
 
     // 13. The result.
+    tracing::info!(
+        "template sent: app={} template={} sender={} target={} delivered={} failed={}",
+        log_field(&payload.app),
+        log_field(&payload.template),
+        log_field(&sender.uid),
+        log_field(&target_label),
+        delivered,
+        failed
+    );
     if delivered > 0 {
         Ok((
             StatusCode::OK,
@@ -3474,6 +3635,166 @@ mod tests {
             json!({ "status": "no_devices", "delivered": 0, "failed": 0 })
         );
         assert_eq!(harness.fcm.message_count(), 0);
+    }
+
+    /// Captures the log lines of the current test thread (T20).
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the log buffer must lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("the log buffer must lock")).to_string()
+        }
+    }
+
+    fn capture_logs() -> (LogBuffer, tracing::subscriber::DefaultGuard) {
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(buffer.clone())
+            .finish();
+        (buffer, tracing::subscriber::set_default(subscriber))
+    }
+
+    fn note_template(senders: &[&str]) -> Value {
+        json!({
+            "enabled": true,
+            "senders": senders,
+            "params": { "note": { "type": "text", "max": 20 } },
+            "to": { "uid": "{sender.uid}" },
+            "rate": { "per_uid_per_hour": 120 },
+            "title": "Note",
+            "body": "{p.note}"
+        })
+    }
+
+    #[tokio::test]
+    async fn template_log_names_the_role_that_was_not_listed() {
+        let (logs, _guard) = capture_logs();
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        save_template(&harness, "admin_note", note_template(&["admin"])).await;
+        let token = jwt("uid-1", "user");
+
+        let (status, _) = call(
+            &template_router(harness.state),
+            template_request(
+                json!({
+                    "app": APP,
+                    "template": "admin_note",
+                    "params": { "note": "SECRET-VALUE" }
+                }),
+                Some(&token),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let text = logs.text();
+        assert!(text.contains("template send rejected"), "log: {text}");
+        assert!(text.contains("template=admin_note"), "log: {text}");
+        assert!(text.contains("sender=uid-1"), "log: {text}");
+        assert!(text.contains("status=403"), "log: {text}");
+        assert!(text.contains("role_not_listed(role=user)"), "log: {text}");
+        assert!(!text.contains("SECRET-VALUE"), "log: {text}");
+        assert!(!text.contains(&token), "log: {text}");
+    }
+
+    #[tokio::test]
+    async fn template_log_names_the_empty_parameter_but_not_its_value() {
+        let (logs, _guard) = capture_logs();
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        save_template(&harness, "note", note_template(&["user"])).await;
+
+        let (status, _) = call(
+            &template_router(harness.state),
+            template_request(
+                json!({ "app": APP, "template": "note", "params": { "note": "" } }),
+                Some(&jwt("uid-1", "user")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let text = logs.text();
+        assert!(text.contains("reason=invalid_param"), "log: {text}");
+        assert!(
+            text.contains("parameter 'note' must not be empty"),
+            "log: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn template_log_reports_a_missing_template() {
+        let (logs, _guard) = capture_logs();
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+
+        let (status, _) = call(
+            &template_router(harness.state),
+            template_request(
+                json!({ "app": APP, "template": "ghost_template" }),
+                Some(&jwt("uid-1", "user")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let text = logs.text();
+        assert!(text.contains("template=ghost_template"), "log: {text}");
+        assert!(
+            text.contains("reason=template_not_found_or_disabled"),
+            "log: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn template_log_reports_an_audience_without_devices() {
+        let (logs, _guard) = capture_logs();
+        let harness = harness(FakeTransport::accepting()).await;
+        save_section(&harness, "identity", jwt_identity(false)).await;
+        save_template(&harness, "hello", uid_template(&["user"], Some(120))).await;
+
+        let (status, _) = call(
+            &template_router(harness.state),
+            template_request(
+                json!({ "app": APP, "template": "hello" }),
+                Some(&jwt("uid-1", "user")),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let text = logs.text();
+        assert!(
+            text.contains("template send had no recipients"),
+            "log: {text}"
+        );
+        assert!(text.contains("target=uid:uid-1"), "log: {text}");
     }
 
     #[tokio::test]
